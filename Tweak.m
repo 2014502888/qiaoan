@@ -1,5 +1,5 @@
 // JoolinkSDReplay — 乔安智联 4.4.67 报警消息 → 直达本地 SD 卡录像
-// v1.3 重复注入修复版（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
+// v1.4 时间戳修复版（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
 //
 // 实测问题链：
 //   v1：闪退（设备对象未传入，JALiveManager.myCamera=nil → MYOpenSDK 异常）
@@ -9,18 +9,32 @@
 //         v1.2 后 exchange 时 class_addMethod 发现 _jasd_ 已存在不覆盖，再 exchange
 //         又把 clickCloudRecordAction: 交换回【原实现】→ hook 被还原 → 弹云存储。
 //   v1.3 修复：改 method_setImplementation 直接覆盖（幂等），原 IMP 存全局变量兜底。
-//         重复注入只检测到"已是本 hook"就跳过，绝不破坏已有 hook。
+//         重复注入只检测到"已是本 hook"就跳过，绝不破坏已有 hook。防抖修双 push。
+//   v1.4 修复（本版）：用户实测跳转成功但"回放画面定位错 / 只能看实时"——
+//         根因：时间戳单位错。报警事件时间戳是【秒】（event_file_url 文件名
+//         2310111541-1792304458.jpg 内嵌 1792304458 秒 = 2026-10-18 14:20:58 本地），
+//         v1.3 传了毫秒（1792304458000）→ SDPlayer.getCurrentEventWithTimeStamp:
+//         用 eventTime 与时间戳直接整数比较 → 匹配不到事件 → timeline 无法定位。
+//         本版改为秒：优先从 event_file_url 正则提取内嵌秒，兜底 event_date+event_time 拼秒。
 //
 // v1.2 逆向结论（设备来源）：
 //   * AI 人脸报警详情页 myCamera 是父类 JABasicViewController 普通属性，恒 nil
 //   * JAGroupManager（设备/分组管理单例）：getMyCameraWithUid: = myCameraMap[eid] 直查；
 //     getAllMyCamera = 全部设备；报警模型 eid 即设备唯一标识
 //
+// v1.4 逆向结论（SD 回放自包含，无需额外模式标志）：
+//   * JANewSDPlayerViewController viewDidLoad 自己会：
+//       JALiveManager.sharedInstance setMyCamera:/setCurrentCamera:/setIsSDPlayer:YES
+//     viewDidAppear → ja_ReallySetupLiveDelegate → delegateCamera:isSDCardPage:YES
+//     → JALiveManager 建链（P2P/ims）→ 设备回传 SD 事件/记录列表 → timeline
+//   * 我们 push 前只需 setMyCamera: + currentEvent + currentTimeStamp(秒) + eventList
+//
 // 官方关键桩（arm64）：
 //   0x103462da0 = myCamera getter   0x103510b20 = setMyCamera:
 //   0x10348b360 = pushViewController:animated:
 //   0x10354f880 = sharedInstance    0x1033cee40 = delegateCamera:isSDCardPage:
 //   0x10344d000 = live              0x10357efa0 = uid
+//   0x1034fd080 = setIsSDPlayer:（SDPlayer viewDidLoad 自己设，无需我们设）
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
@@ -209,16 +223,39 @@ static id JAFindCamera(UIViewController *detailVC, id warn, NSString **src) {
 
 // ---------- 时间戳 ----------
 
-// eventTimeUTC 为 nil 时用 event_date + event_time 拼接，返回毫秒 NSNumber
+// 报警事件时间戳：秒（NSNumber）
+// 优先级：① event_file_url 文件名内嵌秒（服务器权威，如 -1792304458.jpg）
+//         ② eventTimeUTC（字符串直接取秒，NSNumber 原样）
+//         ③ event_date + event_time 拼本地秒
 static NSNumber *JABuildTimestamp(id warn) {
+    // ① event_file_url 文件名内嵌秒：xxx/2310111541-1792304458.jpg
+    id url = JAVal(warn, @"event_file_url");
+    if ([url isKindOfClass:NSString.class]) {
+        NSString *u = url;
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"-(\\d{10})\\."
+                                                                            options:0 error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:u options:0
+                                                   range:NSMakeRange(0, u.length)];
+        if (m && m.numberOfRanges > 1) {
+            NSString *sec = [u substringWithRange:[m rangeAtIndex:1]];
+            JALog(@"时间戳来源: event_file_url 内嵌秒 %@", sec);
+            return @(sec.longLongValue);
+        }
+    }
+    // ② eventTimeUTC
     id t = JAVal(warn, @"eventTimeUTC");
     if (t) {
-        if ([t isKindOfClass:NSNumber.class]) return t;
+        if ([t isKindOfClass:NSNumber.class]) {
+            JALog(@"时间戳来源: eventTimeUTC NSNumber %@", t);
+            return t; // 原样（秒）
+        }
         if ([t isKindOfClass:NSString.class]) {
-            return @((long long)([t doubleValue] * 1000.0)); // 秒字符串 → 毫秒
+            JALog(@"时间戳来源: eventTimeUTC 字符串 %@", t);
+            return @((long long)[t doubleValue]); // 秒字符串（不再 ×1000）
         }
         return nil;
     }
+    // ③ event_date + event_time 拼秒（本地时区）
     NSString *d = JAVal(warn, @"event_date");
     NSString *tm = JAVal(warn, @"event_time");
     if (d.length && tm.length) {
@@ -228,7 +265,11 @@ static NSNumber *JABuildTimestamp(id warn) {
         fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
         fmt.timeZone = [NSTimeZone localTimeZone];
         NSDate *date = [fmt dateFromString:s];
-        if (date) return @((long long)([date timeIntervalSince1970] * 1000.0));
+        if (date) {
+            long long sec = (long long)[date timeIntervalSince1970];
+            JALog(@"时间戳来源: event_date+event_time 拼秒 %lld", sec);
+            return @(sec);
+        }
     }
     return nil;
 }
@@ -287,7 +328,11 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
         JASet(vc, @"currentEvent", warn);
         NSNumber *ts = JABuildTimestamp(warn);
         if (ts) JASet(vc, @"currentTimeStamp", ts);
-        JALog(@"currentTimeStamp=%@", ts);
+        // 校验秒范围：10 位秒级（1.0e9 ~ 9.9e9），防止再传毫秒
+        long long tv = ts ? ts.longLongValue : 0;
+        JALog(@"currentTimeStamp=%@ (%lld 秒 → %@)", ts, tv,
+              tv >= 1000000000LL && tv < 10000000000LL
+              ? @"秒级 ✓" : @"⚠ 非秒级！");
         id evtList = JAVal(detailVC, @"warnInfoListArr");
         if (evtList) JASet(vc, @"eventList", evtList);
         JALog(@"已设置 currentEvent/currentTimeStamp/eventList");
@@ -440,7 +485,7 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.3 injected");
+    JALog(@"JoolinkSDReplay v1.4 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")) {
         JAHook();
         return;
