@@ -1,5 +1,5 @@
 // JoolinkSDReplay — 乔安智联 4.4.67 报警消息 → 直达本地 SD 卡录像
-// v1.7 跨天定位修复版（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
+// v1.8 定位消费诊断版（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
 //
 // 实测问题链：
 //   v1：闪退（设备对象未传入，JALiveManager.myCamera=nil → MYOpenSDK 异常）
@@ -295,12 +295,16 @@ static void ja_sd_viewWillAppear(id self, SEL _cmd);
 static void ja_sd_viewDidAppear(id self, SEL _cmd);
 static void ja_sd_respDeviceSdEventList(id self, SEL _cmd, id arg);  // v1.6 诊断
 static void ja_getEventList(id self, SEL _cmd, id day, id type);     // v1.6 诊断
+static id ja_sd_getCurrentEventWithTimeStamp(id self, SEL _cmd, long long ts);  // v1.8
+static void ja_sd_seekTo_duration(id self, SEL _cmd, long long sec, double dur);  // v1.8
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
 static BOOL JASDHooked = NO;
 static IMP g_orig_sd_vwa = NULL;  // JANewSDPlayerViewController viewWillAppear: 原 IMP
 static IMP g_orig_sd_vda = NULL;  // JANewSDPlayerViewController viewDidAppear: 原 IMP
 static IMP g_orig_sd_respEventList = NULL;  // v1.6：respDeviceSdEventList: 原 IMP
 static IMP g_orig_getEventList = NULL;      // v1.6：getEventListWithSelectiontDay:detectionType: 原 IMP
+static IMP g_orig_getCurrentEvent = NULL;   // v1.8：getCurrentEventWithTimeStamp: 原 IMP
+static IMP g_orig_seekTo = NULL;            // v1.8：seekTo:duration: 原 IMP
 
 // v1.5：从秒级时间戳算"报警日 0 点秒"（UTC 语义 = 本地 00:00）
 // ts - (ts % 86400)：对 epoch 秒取 UTC 当天 0 点。例：1792339861 → 1792281600
@@ -329,6 +333,10 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
         JASetImp(cls, @selector(viewDidAppear:), (IMP)ja_sd_viewDidAppear, &g_orig_sd_vda);
         JASetImp(cls, @selector(respDeviceSdEventList:), (IMP)ja_sd_respDeviceSdEventList,
                  &g_orig_sd_respEventList);
+        JASetImp(cls, @selector(getCurrentEventWithTimeStamp:), (IMP)ja_sd_getCurrentEventWithTimeStamp,
+                 &g_orig_getCurrentEvent);
+        JASetImp(cls, @selector(seekTo:duration:), (IMP)ja_sd_seekTo_duration,
+                 &g_orig_seekTo);
         JASDHooked = YES;
         JALog(@"点看录像时补装 SDPlayer 生命周期 hook（轮询错过场景兜底）");
     }
@@ -536,7 +544,25 @@ static void JASDForcePullEventList(long long dayStart, double delaySec) {
     });
 }
 
-// v1.6 诊断：拦截设备回传事件列表回调，确认设备到底回没回列表、时间戳是否被消费
+// v1.8 诊断：dump MYEventModel 真实属性与值（前几条）
+static void JADumpEventModel(id item, NSUInteger idx) {
+    if (!item) return;
+    unsigned int pc = 0;
+    objc_property_t *props = class_copyPropertyList([item class], &pc);
+    NSMutableString *line = [NSMutableString stringWithFormat:@"事件[%lu] class=%@ ",
+                             (unsigned long)idx, NSStringFromClass([item class])];
+    for (unsigned int i = 0; i < pc; i++) {
+        const char *name = property_getName(props[i]);
+        NSString *pn = [NSString stringWithUTF8String:name];
+        id v = nil;
+        @try { v = [item valueForKey:pn]; } @catch (NSException *e) { v = @"<异常>"; }
+        if (v) [line appendFormat:@"%@=%@ ", pn, v];
+    }
+    free(props);
+    JALog(@"  %@", line);
+}
+
+// v1.8 诊断：拦截设备回传事件列表回调，确认设备到底回没回列表、时间戳是否被消费
 // v1.7：调用原实现前强制 sdSelectiontDay=报警日0点 —— 铁证：官方 viewWillAppear
 // 会把设备 sdSelectiontDay 覆盖为"今天 0 点"，跨天报警（报警日≠今天）时定位偏移
 // currentTimeStamp - sdSelectiontDay 会落到"今天"的错误时段（无录像）。
@@ -558,17 +584,44 @@ static void ja_sd_respDeviceSdEventList(id self, SEL _cmd, id arg) {
     JALog(@"  SDPlayer.currentTimeStamp=%@ cam.sdSelectiontDay=%@", ts, sd);
     if ([arg isKindOfClass:NSArray.class]) {
         NSUInteger n = [arg count];
-        for (NSUInteger i = 0; i < n && i < 8; i++) {
-            id item = [arg objectAtIndex:i];
-            JALog(@"    事件[%lu] eid=%@ time=%@ date=%@ ts=%@ url=%@",
-                  (unsigned long)i, JAVal(item, @"eid"), JAVal(item, @"event_time"),
-                  JAVal(item, @"event_date"), JAVal(item, @"eventTimeUTC"),
-                  JAVal(item, @"event_file_url"));
+        for (NSUInteger i = 0; i < n && i < 3; i++) {
+            // v1.8：全量 dump 属性（前 3 条），MYEventModel 字段名与报警模型不同
+            JADumpEventModel([arg objectAtIndex:i], i);
         }
     } else if ([arg isKindOfClass:NSDictionary.class]) {
         JALog(@"  字典 keys=%@", [arg allKeys]);
     }
     if (g_orig_sd_respEventList) ((void(*)(id, SEL, id))g_orig_sd_respEventList)(self, _cmd, arg);
+}
+
+// v1.8 诊断：官方按时间戳在 eventList 里找事件（respDeviceSdEventList: 消费链关键一步）
+static id ja_sd_getCurrentEventWithTimeStamp(id self, SEL _cmd, long long ts) {
+    id ret = g_orig_getCurrentEvent
+        ? ((id(*)(id, SEL, long long))g_orig_getCurrentEvent)(self, _cmd, ts)
+        : nil;
+    JALog(@"[getCurrentEventWithTimeStamp:] ts=%lld 返回=%@ (%@)",
+          ts, ret, ret ? NSStringFromClass([ret class]) : @"nil");
+    if (ret) {
+        unsigned int pc = 0;
+        objc_property_t *props = class_copyPropertyList([ret class], &pc);
+        NSMutableString *line = [NSMutableString stringWithFormat:@"  命中事件属性: "];
+        for (unsigned int i = 0; i < pc && i < 20; i++) {
+            const char *name = property_getName(props[i]);
+            NSString *pn = [NSString stringWithUTF8String:name];
+            id v = nil;
+            @try { v = [ret valueForKey:pn]; } @catch (NSException *e) { v = @"<异常>"; }
+            if (v) [line appendFormat:@"%@=%@ ", pn, v];
+        }
+        free(props);
+        JALog(@"  %@", line);
+    }
+    return ret;
+}
+
+// v1.8 诊断：seekTo:duration: —— 定位播放是否执行（官方消费链最后一步）
+static void ja_sd_seekTo_duration(id self, SEL _cmd, long long sec, double dur) {
+    JALog(@"[seekTo:duration:] sec=%lld duration=%.1f (定位执行 ✓)", sec, dur);
+    if (g_orig_seekTo) ((void(*)(id, SEL, long long, double))g_orig_seekTo)(self, _cmd, sec, dur);
 }
 
 // v1.5：viewWillAppear hook —— 原实现后强制打开"拉取开关"
@@ -701,6 +754,11 @@ static void JAHook(void) {
             // v1.6 诊断：hook 设备回传事件列表回调
             JASetImp(sdCls, @selector(respDeviceSdEventList:), (IMP)ja_sd_respDeviceSdEventList,
                      &g_orig_sd_respEventList);
+            // v1.8 诊断：hook 定位消费链（找事件 + seekTo 播放）
+            JASetImp(sdCls, @selector(getCurrentEventWithTimeStamp:), (IMP)ja_sd_getCurrentEventWithTimeStamp,
+                     &g_orig_getCurrentEvent);
+            JASetImp(sdCls, @selector(seekTo:duration:), (IMP)ja_sd_seekTo_duration,
+                     &g_orig_seekTo);
             JASDHooked = YES;
         } else {
             JALog(@"!! JANewSDPlayerViewController 尚未加载（轮询重试）");
@@ -711,7 +769,7 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.7 injected");
+    JALog(@"JoolinkSDReplay v1.8 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewSDPlayerViewController")) {
         JAHook();
