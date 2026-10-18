@@ -1,5 +1,5 @@
 // JoolinkSDReplay — 乔安智联 4.4.67 报警消息 → 直达本地 SD 卡录像
-// v1 诊断版（TrollStore 兼容：纯 runtime swizzle，不依赖 CydiaSubstrate）
+// v1 诊断版（TrollStore 兼容：纯 runtime swizzle + C IMP，零类依赖，可直接 clang 编译）
 //
 // 逆向定位（Joolink 4.4.67, arm64, cryptid=0）：
 //   报警详情页     JANewsWarnInfoDetailVC
@@ -144,59 +144,50 @@ static void JADumpWarnInfo(UIViewController *detailVC, NSString *from) {
     free(props);
 }
 
-// ---------- hook 实现（Category + swizzle） ----------
+// ---------- hook 实现（C IMP，无类依赖） ----------
 
-@interface JANewsWarnInfoDetailVC (JASDReplay)
-- (void)ja_swz_clickCloudRecordAction:(id)sender;
-- (void)ja_swz_handleJumpToOpenCloud;
-@end
-
-@implementation JANewsWarnInfoDetailVC (JASDReplay)
-
-- (void)ja_swz_clickCloudRecordAction:(id)sender {
+// 原 selector：clickCloudRecordAction:
+static void ja_clickCloudRecordAction(id self, SEL _cmd, id sender) {
     JADumpWarnInfo(self, @"clickCloudRecordAction: 已拦截（不再弹云存储）");
     JATryOpenSDReplay(self, JAVal(self, @"warnInfoEntityModelEx"));
 }
 
-- (void)ja_swz_handleJumpToOpenCloud {
+// 原 selector：handleJumpToOpenCloud
+static void ja_handleJumpToOpenCloud(id self, SEL _cmd) {
     JADumpWarnInfo(self, @"handleJumpToOpenCloud: 已拦截");
     JATryOpenSDReplay(self, JAVal(self, @"warnInfoEntityModelEx"));
 }
 
-@end
+// ---------- swizzle 工具 ----------
 
-// ---------- 注入入口 ----------
+static void JASwz(Class cls, SEL orig, IMP newImp, const char *types) {
+    NSString *newSelName = [NSString stringWithFormat:@"_jasd_%@", NSStringFromSelector(orig)];
+    SEL newSel = NSSelectorFromString(newSelName);
+    class_addMethod(cls, newSel, newImp, types);
+    Method m1 = class_getInstanceMethod(cls, orig);
+    Method m2 = class_getInstanceMethod(cls, newSel);
+    if (m1 && m2) {
+        method_exchangeImplementations(m1, m2);
+        JALog(@"swizzle %@ OK", NSStringFromSelector(orig));
+    } else {
+        JALog(@"swizzle %@ 失败 m1=%p m2=%p", NSStringFromSelector(orig), m1, m2);
+    }
+}
 
 static BOOL JAHooked = NO;
 
 static void JAHook(void) {
     if (JAHooked) return;
-
     Class detailCls = NSClassFromString(@"JANewsWarnInfoDetailVC");
     if (!detailCls) return;
 
-    Method m1 = class_getInstanceMethod(detailCls, @selector(clickCloudRecordAction:));
-    Method m2 = class_getInstanceMethod(detailCls, @selector(ja_swz_clickCloudRecordAction:));
-    if (m1 && m2) {
-        method_exchangeImplementations(m1, m2);
-        JALog(@"hook clickCloudRecordAction: OK");
-    } else {
-        JALog(@"hook clickCloudRecordAction: 失败 m1=%p m2=%p", m1, m2);
-    }
-
-    Method m3 = class_getInstanceMethod(detailCls, @selector(handleJumpToOpenCloud));
-    Method m4 = class_getInstanceMethod(detailCls, @selector(ja_swz_handleJumpToOpenCloud));
-    if (m3 && m4) {
-        method_exchangeImplementations(m3, m4);
-        JALog(@"hook handleJumpToOpenCloud OK");
-    } else {
-        JALog(@"hook handleJumpToOpenCloud 失败 m3=%p m4=%p", m3, m4);
-    }
+    JASwz(detailCls, @selector(clickCloudRecordAction:), (IMP)ja_clickCloudRecordAction, "v@:@");
+    JASwz(detailCls, @selector(handleJumpToOpenCloud), (IMP)ja_handleJumpToOpenCloud, "v@:");
 
     JAHooked = YES;
 }
 
-// 类可能还没加载：等 App 启动完成后再尝试，最多 20 次，每次 0.5s
+// 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
     JALog(@"JoolinkSDReplay v1.0 injected");
@@ -206,13 +197,13 @@ static void JASDReplayInit(void) {
     }
     __block int tries = 0;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        while (tries < 20 && !JAHooked) {
+        while (tries < 30 && !JAHooked) {
             [NSThread sleepForTimeInterval:0.5];
             tries++;
             dispatch_async(dispatch_get_main_queue(), ^{ JAHook(); });
         }
         if (!JAHooked) {
-            JALog(@"!! 20 次重试后仍未找到 JANewsWarnInfoDetailVC");
+            JALog(@"!! 30 次重试后仍未找到 JANewsWarnInfoDetailVC");
         }
     });
 }
