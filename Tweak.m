@@ -1,5 +1,5 @@
 // JoolinkSDReplay — 乔安智联 4.4.67 报警消息 → 直达本地 SD 卡录像
-// v1.1 崩溃修复版（TrollStore 兼容：纯 runtime swizzle + C IMP，零类依赖，可直接 clang 编译）
+// v1.2 设备来源补全版（TrollStore 兼容：纯 runtime swizzle + C IMP，零类依赖，可直接 clang 编译）
 //
 // v1 实测结论（用户回传 jasdreplay.log + 崩溃报告 Joolink-2026-10-18-132645.ips）：
 //   * hook 生效：不弹云存储、SDPlayer alloc/init + push 成功
@@ -10,18 +10,29 @@
 //   * eventTimeUTC = nil（时间在 event_date=2026-10-18 + event_time=13:26:10）
 //   * 详情页 self.deviceId/devicePwd = nil；viewModel = JAAIFaceViewModel（AI 人脸报警）
 //
-// v1.1 修复：
-//   1) 【崩溃修复】创建 SDPlayer 后调用官方配置 [SDPlayer setMyCamera:<MyCamera>]，
-//      并同步 JALiveManager.sharedInstance.myCamera（官方 JANewCloudRecordListVC
-//      toSDReplayTopView 的完整创建流程 = alloc + init + setMyCamera: + pushViewController:animated:）
-//   2) 【camera 获取】多级获取设备对象：
-//        a. detailVC.myCamera（官方属性，viewDidLoad 内 [self myCamera] 确认存在）
-//        b. JALiveManager.sharedInstance.myCamera（最近直播/回放设备）
-//        c. 导航栈回溯各 VC 的 myCamera
-//   3) 【时间戳】eventTimeUTC 为 nil 时用 event_date + event_time 拼 "yyyy-MM-dd HH:mm:ss"
-//      → 本地时区解析 → 毫秒 NSNumber 设给 currentTimeStamp
-//   4) 【兜底】拿不到 camera → 恢复官方逻辑（调原实现，保留云存储引导），不再强行 push（防崩）
-//   5) 【handleJumpToOpenCloud】不再全拦截，改为转发原实现
+// v1.1 修复（用户实测：仍弹云存储 → 说明 camera 没拿到，走了兜底）：
+//   1) 创建 SDPlayer 后官方配置 [SDPlayer setMyCamera:]，并同步 JALiveManager.myCamera
+//   2) camera 三级获取：detailVC.myCamera / JALiveManager.myCamera / 导航栈
+//   3) 时间戳：eventTimeUTC=nil 时用 event_date+event_time 拼本地毫秒
+//   4) 无设备兜底调原实现（保留云存储引导防崩）
+//
+// v1.2 修复（新逆向结论）：
+//   1) 【根因】AI 人脸报警详情页 JANewsWarnInfoDetailVC 的 myCamera 是父类
+//      JABasicViewController 的普通属性（纯 ivar getter @0x100d9524c），AI 报警场景
+//      没人设置 → 恒为 nil。官方详情页该场景本来就无设备（云存储引导是官方行为）。
+//   2) 【设备来源】JAGroupManager（设备/分组管理单例，81 方法）：
+//        - getMyCameraWithUid:   @0x1006f7e7c = myCameraMap[eid] 直查（dict）
+//        - getAllMyCamera        @0x1006f33e8 = myCameraMap.allValues copy
+//        - myCameraMap           @0x1006f8060（设备 uid → MyCamera 映射）
+//      报警模型 JAEMWarnInfoEntityModel.eid（@0x10003f390）即设备唯一标识
+//      （event_file_url 华为 obs 路径内嵌设备 ID WY5NT5B3ANSDAGV1111A 佐证）。
+//      JAGroupManager 的 +shared 不在自身 meta（父类链），用运行时探测 common 单例名。
+//   3) 【新 camera 获取顺序】
+//        a. detailVC.myCamera（官方属性）
+//        b. JAGroupManager 按 eid 匹配（getMyCameraWithUid:eid → 遍历 getAllMyCamera 比对 uid）
+//        c. JALiveManager.sharedInstance.myCamera（最近直播/回放设备）
+//        d. 导航栈回溯各 VC 的 myCamera
+//   4) 【日志增强】myCameraMap count、warn.eid、uid 匹配过程、设备 uid 列表 → 确认匹配逻辑
 //
 // 官方关键桩（arm64）：
 //   0x103462da0 = myCamera getter   0x103510b20 = setMyCamera:
@@ -83,18 +94,112 @@ static UIViewController *JATopVC(void) {
     return vc;
 }
 
+// ---------- JAGroupManager 单例（设备/分组管理核心） ----------
+
+static id JAGroupManagerShared(void) {
+    Class cls = NSClassFromString(@"JAGroupManager");
+    if (!cls) return nil;
+    NSArray *names = @[@"shared", @"sharedInstance", @"shareManager",
+                       @"defaultManager", @"getInstance", @"sharedManager",
+                       @"defaultInstance", @"shareInstance", @"manager"];
+    for (NSString *sn in names) {
+        SEL s = NSSelectorFromString(sn);
+        if (class_respondsToSelector(cls, s)) {
+            id obj = ((id(*)(id, SEL))objc_msgSend)((id)cls, s);
+            if (obj) {
+                JALog(@"JAGroupManager 单例命中: +[JAGroupManager %@] -> %@", sn, obj);
+                return obj;
+            }
+        }
+    }
+    JALog(@"!! JAGroupManager 单例未找到（common 单例名均无响应）");
+    return nil;
+}
+
+// eid / uid 归一化比较（NSNumber / NSString 兼容）
+static NSString *JANormId(id v) {
+    if (!v) return nil;
+    if ([v isKindOfClass:NSNumber.class]) {
+        return [v stringValue];
+    }
+    if ([v isKindOfClass:NSString.class]) {
+        return [v stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    }
+    return [v description];
+}
+
+// 从 JAGroupManager 按报警模型 eid 匹配设备 MyCamera
+static id JAFindCameraFromGroupManager(id warn, NSString **src) {
+    id gm = JAGroupManagerShared();
+    if (!gm) return nil;
+
+    id map = JAVal(gm, @"myCameraMap");
+    JALog(@"myCameraMap=%@ count=%lu", map, (unsigned long)[map count]);
+
+    NSString *eid = JANormId(JAVal(warn, @"eid"));
+    JALog(@"warn.eid=%@", eid);
+
+    // 1) getMyCameraWithUid:eid 直查（myCameraMap[eid]）
+    if (eid) {
+        id cam = nil;
+        @try {
+            cam = [gm performSelector:NSSelectorFromString(@"getMyCameraWithUid:")
+                           withObject:JAVal(warn, @"eid")];
+        } @catch (NSException *e) {
+            JALog(@"!! getMyCameraWithUid: 异常: %@", e);
+        }
+        if (cam) {
+            *src = [NSString stringWithFormat:@"JAGroupManager.getMyCameraWithUid(eid=%@)", eid];
+            return cam;
+        }
+        JALog(@"getMyCameraWithUid(eid=%@) 未命中", eid);
+    }
+
+    // 2) 遍历 getAllMyCamera 比对 uid
+    id all = nil;
+    @try {
+        all = [gm performSelector:NSSelectorFromString(@"getAllMyCamera")];
+    } @catch (NSException *e) {
+        JALog(@"!! getAllMyCamera 异常: %@", e);
+    }
+    if ([all isKindOfClass:NSArray.class]) {
+        NSUInteger n = [all count];
+        JALog(@"getAllMyCamera 共 %lu 台设备", (unsigned long)n);
+        for (NSUInteger i = 0; i < n; i++) {
+            id cam = [all objectAtIndex:i];
+            NSString *uid = JANormId(JAVal(cam, @"uid"));
+            if (i < 5) JALog(@"  设备[%lu] uid=%@ class=%@", (unsigned long)i, uid, NSStringFromClass([cam class]));
+            if (eid && uid && [uid isEqualToString:eid]) {
+                *src = [NSString stringWithFormat:@"getAllMyCamera uid==eid(%@)", eid];
+                return cam;
+            }
+        }
+        JALog(@"getAllMyCamera 未匹配到 eid=%@", eid);
+    } else {
+        JALog(@"!! getAllMyCamera 返回非数组: %@", all);
+    }
+    return nil;
+}
+
 // ---------- camera（设备对象 MyCamera）获取 ----------
 
-// 多级获取设备对象：详情页官方属性 → JALiveManager 单例 → 导航栈
-static id JAFindCamera(UIViewController *detailVC, NSString **src) {
-    // a. 详情页官方属性 myCamera（viewDidLoad 内 [self myCamera] 确认存在）
+// 多级获取设备对象：详情页官方属性 → JAGroupManager 按 eid → JALiveManager → 导航栈
+static id JAFindCamera(UIViewController *detailVC, id warn, NSString **src) {
+    // a. 详情页官方属性 myCamera（父类 JABasicViewController 普通属性）
     id cam = JAVal(detailVC, @"myCamera");
     if (cam) {
         *src = @"detailVC.myCamera";
         return cam;
     }
 
-    // b. JALiveManager 单例
+    // b. JAGroupManager 按 eid 匹配设备列表（AI 报警场景主路径）
+    cam = JAFindCameraFromGroupManager(warn, src);
+    if (cam) {
+        *src = [NSString stringWithFormat:@"%@ (+%@)", *src, @"JAGroupManager"];
+        return cam;
+    }
+
+    // c. JALiveManager 单例（最近直播/回放设备）
     Class lmCls = NSClassFromString(@"JALiveManager");
     if (lmCls) {
         id lm = JAVal(lmCls, @"sharedInstance");
@@ -107,7 +212,7 @@ static id JAFindCamera(UIViewController *detailVC, NSString **src) {
         }
     }
 
-    // c. 导航栈回溯
+    // d. 导航栈回溯
     UINavigationController *nav = detailVC.navigationController;
     for (UIViewController *v in nav.viewControllers) {
         id c = JAVal(v, @"myCamera");
@@ -228,6 +333,8 @@ static void JADumpWarnInfo(UIViewController *detailVC, NSString *from) {
               JAVal(warn, @"warn_record_type"), JAVal(warn, @"cs_status"), JAVal(warn, @"isAli"));
         JALog(@"  event_file_url=%@  eventPicThumbUrl=%@  rowKey=%@",
               JAVal(warn, @"event_file_url"), JAVal(warn, @"eventPicThumbUrl"), JAVal(warn, @"rowKey"));
+        JALog(@"  event_id=%@  bucket_name=%@  end_point=%@",
+              JAVal(warn, @"event_id"), JAVal(warn, @"bucket_name"), JAVal(warn, @"end_point"));
     }
 
     id vm = JAVal(detailVC, @"viewModel");
@@ -259,7 +366,7 @@ static void JADumpWarnInfo(UIViewController *detailVC, NSString *from) {
 static void ja_clickCloudRecordAction(id self, SEL _cmd, id sender) {
     JADumpWarnInfo(self, @"clickCloudRecordAction: 已拦截（不再弹云存储）");
     NSString *src = nil;
-    id cam = JAFindCamera(self, &src);
+    id cam = JAFindCamera(self, JAVal(self, @"warnInfoEntityModelEx"), &src);
     JALog(@"camera 来源: %@  camera=%@", src, cam);
     if (cam) {
         JATryOpenSDReplay(self, JAVal(self, @"warnInfoEntityModelEx"), cam);
@@ -312,7 +419,7 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.1 injected");
+    JALog(@"JoolinkSDReplay v1.2 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")) {
         JAHook();
         return;
