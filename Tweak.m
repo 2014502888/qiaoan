@@ -354,13 +354,18 @@ static void JADumpWarnInfo(UIViewController *detailVC, NSString *from) {
 
 // ---------- hook 实现（C IMP，无类依赖） ----------
 
+// 原实现保存（兜底用）—— 必须在使用前定义
+static IMP g_orig_clickCloudRecordAction = NULL;
+static IMP g_orig_handleJumpToOpenCloud = NULL;
+
 // 防抖：同一详情页实例 2 秒内只 push 一次 SDPlayer（官方可能触发两次点击事件 → 双 push 闪烁）
-static __unsafe_unretained id g_lastDetailVC = nil;
+// 裸指针存地址，不持有对象
+static void *g_lastDetailVC = NULL;
 static NSTimeInterval g_lastPushTime = 0;
 
 static BOOL JADebounce(UIViewController *detailVC) {
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
-    if (g_lastDetailVC == detailVC && (now - g_lastPushTime) < 2.0) {
+    if ((__bridge void *)detailVC == g_lastDetailVC && (now - g_lastPushTime) < 2.0) {
         JALog(@"!! 2 秒内重复触发（防抖拦截，避免双 push 闪烁）");
         return YES;
     }
@@ -376,7 +381,7 @@ static void ja_clickCloudRecordAction(id self, SEL _cmd, id sender) {
     JALog(@"camera 来源: %@  camera=%@", src, cam);
     if (cam) {
         JATryOpenSDReplay(self, JAVal(self, @"warnInfoEntityModelEx"), cam);
-        g_lastDetailVC = self;
+        g_lastDetailVC = (__bridge void *)self;
         g_lastPushTime = [NSDate timeIntervalSinceReferenceDate];
     } else {
         JALog(@"!! 无可用 camera，恢复官方逻辑（保留云存储引导，防崩溃）");
@@ -395,9 +400,6 @@ static void ja_handleJumpToOpenCloud(id self, SEL _cmd) {
 
 // ---------- hook 安装（幂等：method_setImplementation 直接覆盖，防重复注入破坏） ----------
 
-static IMP g_orig_clickCloudRecordAction = NULL;
-static IMP g_orig_handleJumpToOpenCloud = NULL;
-
 // 幂等安装：method_setImplementation 直接覆盖；重复注入不会把 hook 交换回原实现
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved) {
     Method m = class_getInstanceMethod(cls, sel);
@@ -412,7 +414,7 @@ static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved) {
     }
     if (saved && !*saved) *saved = cur;
     method_setImplementation(m, newImp);
-    JALog(@"hook %@ OK (old=%p new=%p)", NSStringFromSelector(sel), cur, newImp);
+    JALog(@"hook %@ OK (old=%p new=%p)", NSStringFromSelector(sel), (void *)cur, (void *)newImp);
 }
 
 static BOOL JAHooked = NO;
