@@ -1,0 +1,28 @@
+name: Build JoolinkSDReplay dylib
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build dylib (xcrun clang)
+        run: |
+          xcrun -sdk iphoneos clang -arch arm64 -dynamiclib -fobjc-arc \
+            -miphoneos-version-min=13.0 \
+            -framework UIKit -framework Foundation \
+            Tweak.m -o JoolinkSDReplay-v1.0.dylib
+          ls -la JoolinkSDReplay-v1.0.dylib
+          file JoolinkSDReplay-v1.0.dylib
+
+      - name: Upload dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: JoolinkSDReplay-v1.0
+          path: JoolinkSDReplay-v1.0.dylib
