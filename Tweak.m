@@ -1,5 +1,5 @@
 // JoolinkSDReplay — 乔安智联 4.4.67 报警消息 → 直达本地 SD 卡录像
-// v1.6 诊断增强版（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
+// v1.7 跨天定位修复版（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
 //
 // 实测问题链：
 //   v1：闪退（设备对象未传入，JALiveManager.myCamera=nil → MYOpenSDK 异常）
@@ -537,9 +537,18 @@ static void JASDForcePullEventList(long long dayStart, double delaySec) {
 }
 
 // v1.6 诊断：拦截设备回传事件列表回调，确认设备到底回没回列表、时间戳是否被消费
+// v1.7：调用原实现前强制 sdSelectiontDay=报警日0点 —— 铁证：官方 viewWillAppear
+// 会把设备 sdSelectiontDay 覆盖为"今天 0 点"，跨天报警（报警日≠今天）时定位偏移
+// currentTimeStamp - sdSelectiontDay 会落到"今天"的错误时段（无录像）。
+// 在设备回传消费点前强设回报警日，官方 respDeviceSdEventList: 内部即可正确 seekTo。
 static void ja_sd_respDeviceSdEventList(id self, SEL _cmd, id arg) {
-    id ts = JAVal(self, @"currentTimeStamp");
+    NSNumber *ts = JAVal(self, @"currentTimeStamp");
+    long long dayStart = JADayStartSec(ts);
     id cam = JAVal(self, @"myCamera");
+    if (dayStart > 0 && cam) {
+        JASet(cam, @"sdSelectiontDay", @(dayStart));
+        JALog(@"[respDeviceSdEventList:] 消费前强制设回 cam.sdSelectiontDay=%lld", dayStart);
+    }
     id sd = cam ? JAVal(cam, @"sdSelectiontDay") : nil;
     JALog(@"[respDeviceSdEventList:] self=%p class=%@ arg=%@ (%@)",
           self, NSStringFromClass([self class]), arg,
@@ -576,6 +585,13 @@ static void ja_sd_viewWillAppear(id self, SEL _cmd) {
     }
     JASet(self, @"pendingReloadTodaySDSelectiontDay", @(dayStart));
     JALog(@"SDPlayer viewWillAppear: 强制 pendingReloadTodaySDSelectiontDay=%lld (报警日0点UTC)", dayStart);
+    // v1.7 双保险：官方 viewWillAppear 原实现已把设备 sdSelectiontDay 覆盖为"今天 0 点"，
+    // 这里设回报警日 0 点，保证后续 reloadTimeLine / 消费偏移都按报警日算
+    id cam = JAVal(self, @"myCamera");
+    if (cam) {
+        JASet(cam, @"sdSelectiontDay", @(dayStart));
+        JALog(@"SDPlayer viewWillAppear: 设回 myCamera.sdSelectiontDay=%lld (防官方覆盖为今天)", dayStart);
+    }
 }
 
 // v1.5：viewDidAppear hook —— 原实现后延迟 3s 主动补拉一次
@@ -695,7 +711,7 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.6 injected");
+    JALog(@"JoolinkSDReplay v1.7 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewSDPlayerViewController")) {
         JAHook();
