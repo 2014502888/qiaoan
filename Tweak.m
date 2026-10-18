@@ -1,38 +1,20 @@
 // JoolinkSDReplay — 乔安智联 4.4.67 报警消息 → 直达本地 SD 卡录像
-// v1.2 设备来源补全版（TrollStore 兼容：纯 runtime swizzle + C IMP，零类依赖，可直接 clang 编译）
+// v1.3 重复注入修复版（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
 //
-// v1 实测结论（用户回传 jasdreplay.log + 崩溃报告 Joolink-2026-10-18-132645.ips）：
-//   * hook 生效：不弹云存储、SDPlayer alloc/init + push 成功
-//   * 闪退根因（已符号化）：SIGABRT + ObjC 异常
-//       viewDidAppear: → ja_ReallySetupLiveDelegate → JALiveManager delegateCamera:isSDCardPage:
-//       → connectionDevice → MYP2PChannel connectionDeviceCamera: → MYOpenSDK 抛 NSException
-//   * 设备对象（MyCamera）未传入：JALiveManager.sharedInstance.myCamera == nil
-//   * eventTimeUTC = nil（时间在 event_date=2026-10-18 + event_time=13:26:10）
-//   * 详情页 self.deviceId/devicePwd = nil；viewModel = JAAIFaceViewModel（AI 人脸报警）
+// 实测问题链：
+//   v1：闪退（设备对象未传入，JALiveManager.myCamera=nil → MYOpenSDK 异常）
+//   v1.1：仍弹云存储（AI 报警详情页 myCamera 恒 nil，走兜底）
+//   v1.2：仍弹云存储 —— 根因：TrollFools 里旧 dylib（v1.0）未删除，新旧 dylib 同时加载。
+//         v1.0 先 exchange（clickCloudRecordAction: → v1.0 hook，原实现挪到 _jasd_），
+//         v1.2 后 exchange 时 class_addMethod 发现 _jasd_ 已存在不覆盖，再 exchange
+//         又把 clickCloudRecordAction: 交换回【原实现】→ hook 被还原 → 弹云存储。
+//   v1.3 修复：改 method_setImplementation 直接覆盖（幂等），原 IMP 存全局变量兜底。
+//         重复注入只检测到"已是本 hook"就跳过，绝不破坏已有 hook。
 //
-// v1.1 修复（用户实测：仍弹云存储 → 说明 camera 没拿到，走了兜底）：
-//   1) 创建 SDPlayer 后官方配置 [SDPlayer setMyCamera:]，并同步 JALiveManager.myCamera
-//   2) camera 三级获取：detailVC.myCamera / JALiveManager.myCamera / 导航栈
-//   3) 时间戳：eventTimeUTC=nil 时用 event_date+event_time 拼本地毫秒
-//   4) 无设备兜底调原实现（保留云存储引导防崩）
-//
-// v1.2 修复（新逆向结论）：
-//   1) 【根因】AI 人脸报警详情页 JANewsWarnInfoDetailVC 的 myCamera 是父类
-//      JABasicViewController 的普通属性（纯 ivar getter @0x100d9524c），AI 报警场景
-//      没人设置 → 恒为 nil。官方详情页该场景本来就无设备（云存储引导是官方行为）。
-//   2) 【设备来源】JAGroupManager（设备/分组管理单例，81 方法）：
-//        - getMyCameraWithUid:   @0x1006f7e7c = myCameraMap[eid] 直查（dict）
-//        - getAllMyCamera        @0x1006f33e8 = myCameraMap.allValues copy
-//        - myCameraMap           @0x1006f8060（设备 uid → MyCamera 映射）
-//      报警模型 JAEMWarnInfoEntityModel.eid（@0x10003f390）即设备唯一标识
-//      （event_file_url 华为 obs 路径内嵌设备 ID WY5NT5B3ANSDAGV1111A 佐证）。
-//      JAGroupManager 的 +shared 不在自身 meta（父类链），用运行时探测 common 单例名。
-//   3) 【新 camera 获取顺序】
-//        a. detailVC.myCamera（官方属性）
-//        b. JAGroupManager 按 eid 匹配（getMyCameraWithUid:eid → 遍历 getAllMyCamera 比对 uid）
-//        c. JALiveManager.sharedInstance.myCamera（最近直播/回放设备）
-//        d. 导航栈回溯各 VC 的 myCamera
-//   4) 【日志增强】myCameraMap count、warn.eid、uid 匹配过程、设备 uid 列表 → 确认匹配逻辑
+// v1.2 逆向结论（设备来源）：
+//   * AI 人脸报警详情页 myCamera 是父类 JABasicViewController 普通属性，恒 nil
+//   * JAGroupManager（设备/分组管理单例）：getMyCameraWithUid: = myCameraMap[eid] 直查；
+//     getAllMyCamera = 全部设备；报警模型 eid 即设备唯一标识
 //
 // 官方关键桩（arm64）：
 //   0x103462da0 = myCamera getter   0x103510b20 = setMyCamera:
@@ -275,18 +257,28 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
 
     // 2) 同步 JALiveManager 单例（delegateCamera:/connectionDevice 内部从它取 myCamera）
     Class lmCls = NSClassFromString(@"JALiveManager");
+    id lm = nil;
     if (lmCls) {
-        id lm = JAVal(lmCls, @"sharedInstance");
-        if (lm) {
-            @try {
-                [lm setValue:cam forKey:@"myCamera"];
-                id chk = [lm valueForKey:@"myCamera"];
-                JALog(@"已同步 JALiveManager.myCamera=%@ uid=%@", chk, JAVal(chk, @"uid"));
-            } @catch (NSException *e) {
-                JALog(@"!! 同步 JALiveManager.myCamera 失败: %@", e);
+        NSArray *sels = @[@"sharedInstance", @"shared", @"shareManager", @"defaultManager"];
+        for (NSString *sn in sels) {
+            SEL s = NSSelectorFromString(sn);
+            if (class_respondsToSelector(lmCls, s)) {
+                lm = ((id(*)(id, SEL))objc_msgSend)((id)lmCls, s);
+                if (lm) {
+                    JALog(@"JALiveManager 单例命中: +[JALiveManager %@]", sn);
+                    break;
+                }
             }
-        } else {
-            JALog(@"!! JALiveManager sharedInstance 为 nil");
+        }
+        if (!lm) JALog(@"!! JALiveManager 单例未找到（%lu 个 common 名均无响应）", (unsigned long)sels.count);
+    }
+    if (lm) {
+        @try {
+            [lm setValue:cam forKey:@"myCamera"];
+            id chk = [lm valueForKey:@"myCamera"];
+            JALog(@"已同步 JALiveManager.myCamera=%@ uid=%@", chk, JAVal(chk, @"uid"));
+        } @catch (NSException *e) {
+            JALog(@"!! 同步 JALiveManager.myCamera 失败: %@", e);
         }
     }
 
@@ -362,45 +354,65 @@ static void JADumpWarnInfo(UIViewController *detailVC, NSString *from) {
 
 // ---------- hook 实现（C IMP，无类依赖） ----------
 
+// 防抖：同一详情页实例 2 秒内只 push 一次 SDPlayer（官方可能触发两次点击事件 → 双 push 闪烁）
+static __unsafe_unretained id g_lastDetailVC = nil;
+static NSTimeInterval g_lastPushTime = 0;
+
+static BOOL JADebounce(UIViewController *detailVC) {
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (g_lastDetailVC == detailVC && (now - g_lastPushTime) < 2.0) {
+        JALog(@"!! 2 秒内重复触发（防抖拦截，避免双 push 闪烁）");
+        return YES;
+    }
+    return NO;
+}
+
 // 原 selector：clickCloudRecordAction:
 static void ja_clickCloudRecordAction(id self, SEL _cmd, id sender) {
     JADumpWarnInfo(self, @"clickCloudRecordAction: 已拦截（不再弹云存储）");
+    if (JADebounce(self)) return;
     NSString *src = nil;
     id cam = JAFindCamera(self, JAVal(self, @"warnInfoEntityModelEx"), &src);
     JALog(@"camera 来源: %@  camera=%@", src, cam);
     if (cam) {
         JATryOpenSDReplay(self, JAVal(self, @"warnInfoEntityModelEx"), cam);
+        g_lastDetailVC = self;
+        g_lastPushTime = [NSDate timeIntervalSinceReferenceDate];
     } else {
         JALog(@"!! 无可用 camera，恢复官方逻辑（保留云存储引导，防崩溃）");
-        SEL orig = NSSelectorFromString(@"_jasd_clickCloudRecordAction:");
-        if ([self respondsToSelector:orig]) {
-            ((void(*)(id, SEL, id))objc_msgSend)(self, orig, sender);
+        if (g_orig_clickCloudRecordAction) {
+            ((void(*)(id, SEL, id))g_orig_clickCloudRecordAction)(self, _cmd, sender);
         }
     }
 }
 
 // 原 selector：handleJumpToOpenCloud —— 不再拦截，转发原实现
 static void ja_handleJumpToOpenCloud(id self, SEL _cmd) {
-    SEL orig = NSSelectorFromString(@"_jasd_handleJumpToOpenCloud");
-    if ([self respondsToSelector:orig]) {
-        ((void(*)(id, SEL))objc_msgSend)(self, orig);
+    if (g_orig_handleJumpToOpenCloud) {
+        ((void(*)(id, SEL))g_orig_handleJumpToOpenCloud)(self, _cmd);
     }
 }
 
-// ---------- swizzle 工具 ----------
+// ---------- hook 安装（幂等：method_setImplementation 直接覆盖，防重复注入破坏） ----------
 
-static void JASwz(Class cls, SEL orig, IMP newImp, const char *types) {
-    NSString *newSelName = [NSString stringWithFormat:@"_jasd_%@", NSStringFromSelector(orig)];
-    SEL newSel = NSSelectorFromString(newSelName);
-    class_addMethod(cls, newSel, newImp, types);
-    Method m1 = class_getInstanceMethod(cls, orig);
-    Method m2 = class_getInstanceMethod(cls, newSel);
-    if (m1 && m2) {
-        method_exchangeImplementations(m1, m2);
-        JALog(@"swizzle %@ OK", NSStringFromSelector(orig));
-    } else {
-        JALog(@"swizzle %@ 失败 m1=%p m2=%p", NSStringFromSelector(orig), m1, m2);
+static IMP g_orig_clickCloudRecordAction = NULL;
+static IMP g_orig_handleJumpToOpenCloud = NULL;
+
+// 幂等安装：method_setImplementation 直接覆盖；重复注入不会把 hook 交换回原实现
+static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved) {
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) {
+        JALog(@"!! 方法不存在: %@", NSStringFromSelector(sel));
+        return;
     }
+    IMP cur = method_getImplementation(m);
+    if (cur == newImp) {
+        JALog(@"方法 %@ 已是本 hook（检测到重复注入，跳过，不破坏）", NSStringFromSelector(sel));
+        return;
+    }
+    if (saved && !*saved) *saved = cur;
+    method_setImplementation(m, newImp);
+    JALog(@"hook %@ OK (old=%p new=%p)", NSStringFromSelector(sel), cur, newImp);
 }
 
 static BOOL JAHooked = NO;
@@ -410,8 +422,15 @@ static void JAHook(void) {
     Class detailCls = NSClassFromString(@"JANewsWarnInfoDetailVC");
     if (!detailCls) return;
 
-    JASwz(detailCls, @selector(clickCloudRecordAction:), (IMP)ja_clickCloudRecordAction, "v@:@");
-    JASwz(detailCls, @selector(handleJumpToOpenCloud), (IMP)ja_handleJumpToOpenCloud, "v@:");
+    // 检测旧版本（exchange 式 swizzle）残留的 _jasd_ selector → 提示用户清理 TrollFools 旧项
+    if ([detailCls instancesRespondToSelector:NSSelectorFromString(@"_jasd_clickCloudRecordAction:")]) {
+        JALog(@"!! 检测到旧版 dylib 残留的 _jasd_ 方法，建议 TrollFools 删除旧项只留最新（v1.3 本身幂等，不影响）");
+    }
+
+    JASetImp(detailCls, @selector(clickCloudRecordAction:), (IMP)ja_clickCloudRecordAction,
+             &g_orig_clickCloudRecordAction);
+    JASetImp(detailCls, @selector(handleJumpToOpenCloud), (IMP)ja_handleJumpToOpenCloud,
+             &g_orig_handleJumpToOpenCloud);
 
     JAHooked = YES;
 }
@@ -419,7 +438,7 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.2 injected");
+    JALog(@"JoolinkSDReplay v1.3 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")) {
         JAHook();
         return;
