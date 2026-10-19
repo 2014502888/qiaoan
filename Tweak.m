@@ -1,94 +1,37 @@
 // JoolinkSDReplay — 乔安智联 4.4.67 报警消息 → 直达本地 SD 卡录像
-// v1.17（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
+// v1.26（清理版）：移除日志系统（jasdreplay.log）、v1.17 首帧确认 hook
+// （respDeviceFirstFrameTimeStamp: 官方链不触发，挂空无用）、JADumpWarnInfo 诊断。
+// 保留完整功能链路（v1.15~v1.25 全部修复）：
+//   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
+//   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）→
+//   switchToSDDay:dateString:（官方选日入口，切到报警日并加载其事件，跨天修正）
+//   → 重设 myCamera.sdSelectiontDay=报警日0点 → 1.5s startSDPlayWithSelectTimeStamp:
+//   （定位报警秒）→ 1.5s JATimeLineSyncToSec（拨时间轴指示器/时间标签到报警时间）。
 //
-// v1.17 修复「时间轴拖条不跟随定位 / 播放时间变成最新」：
-//   只读溯源（反汇编 startSDPlayWithSelectTimeStamp: 0x100b07b0c →
-//   viewModel startSDPlayShowWithSelectTimeStamp: 0x100b0c730 → block 执行体
-//   0x100b0c9cc → isEnterSDPlay ? seekSDPlayWithSelectTimeStamp: : 
-//   startSDPlayWithSelectTimeStamp:）确认定位链正确，根因 = 延迟 0.4s 调用时
-//   官方播放器未就绪（block 预检查 streamCtx/isSeekingPlay 失败 → 定位不执行，
-//   官方默认播最新）→ 时间轴指示器停在最新。
-//   修法：延迟 0.4s → 3.0s（等官方建流完成）+ hook respDeviceFirstFrameTimeStamp:
-//   （参数是数值 long long，v1.14 定案）确认首帧时间≈报警时间，不匹配自动重试
-//   startSDPlayWithSelectTimeStamp:（最多 3 次，间隔 1.5s）→ 时间轴指示器随
-//   播放进度自然定位到报警时间点。
-//   另确认：RTC 版 viewWillAppear（0x100af4a90）不覆盖 sdSelectiontDay（我们
-//   KVC 喂的报警日保留，setupData 按报警日加载事件列表）。
-//
-// 功能：报警消息详情页点「看录像」→ 不再弹云存储 → 直接 push 官方本地 SD 回放界面
-//       JANewRtcSDPlayViewController，并自动定位到报警时间点播放（用户未开通云存储，
-//       录像在本地 SD 卡）。
-//
-// v1.15 定案（用户实测 + 二进制方法列表 + 反汇编）：
-//   官方本地 SD 回放界面 = JANewRtcSDPlayViewController（时间轴拖条/日历选日/
-//   SD 卡容量检测/变速/录音，即用户手机手动进本地回放看到的界面）。
-//   之前 push 的 JANewSDPlayerViewController 是另一播放器（旧版/云回放共用），
-//   界面完全不同 → 黑屏。v1.15 起换目标 VC。
-//
-// 初始化（反汇编 viewDidLoad 0x100af4498 定案）：
-//   RTC 版 viewDidLoad 自动：JADevicePlatform.sharedInstance setMyCamera:self.myCamera、
-//   setIsSDPlayer:YES、创建 viewModel、setupUI —— 只需喂 myCamera + currentTimeStamp。
-//   myCamera 无公开 setter → KVC [vc setValue:cam forKey:@"myCamera"]。
-//
-// 自动定位（反汇编 startSDPlayWithSelectTimeStamp: 0x100b07b0c 定案）：
-//   startSDPlayWithSelectTimeStamp:sec → viewModel startSDPlayShowWithSelectTimeStamp:sec
-//   → 官方建流播放并定位到 sec。本 dylib hook viewDidAppear，官方展示完成后延迟 0.4s
-//   调 startSDPlayWithSelectTimeStamp:（报警时间戳）→ 直达报警时间点。
-//   闸门：RTC 版是官方完整播放器，官方链自己建流 → 不做任何状态强制（v1.10~v1.14
-//   的 isEnterBackPlayer/isStarBackPlayer/detectType 强制、p2p 建流修复全部移除）。
-//
-// 实测（v1.15，jasdreplay (8).log）：
-//   连续 6 次点「看录像」全部成功 —— 时间戳全部秒级提取、push RTC 播放器、
-//   viewDidAppear 后自动 startSDPlayWithSelectTimeStamp: 报警秒；两台设备
-//   （WY5NT5B3ANSDAGV1111A / NBDEWTHYAZ6YG1R7111A）均正常。
-//
-// 历史决策链（git 有完整提交记录）：
-//   v1.0~v1.3：弹云存储根因 = 旧 dylib 未删双层加载 / 拦截方法还原；改 method_setImplementation 幂等。
-//   v1.4：时间戳单位错（毫秒→秒），event_file_url 内嵌秒提取。
-//   v1.5~v1.7：旧 VC 事件列表不拉取（sdSelectiontDay==0）→ 强制 pendingReload。
-//   v1.8~v1.9：MYEventModel 字段 dump、seekTo 两道闸门（isEnterBackPlayer/detectType）。
-//   v1.10：getter 层开闸，seekTo 首次被官方消费（sec=1792378567）但画面仍无录像。
-//   v1.11：崩溃（dispatch_after 补拉闭包 receiver=0x20）→ v1.11.1 移除 setIsSDPlayer:YES。
-//   v1.12：移除补拉闭包；v1.13：p2p_starPlayBack 建流分支（startReplay vs seekReplay）。
-//   v1.14：崩溃根治 —— respDeviceSDPlayerStatus:/respDeviceFirstFrameTimeStamp: 参数是
-//           数值不是对象（IPS 124424 + 反汇编 cmp w20,#0x21 跳表定案），旧签名向 32 发消息 SIGSEGV。
-//   v1.15：定案跳错界面 → 换 RTC 播放器，全链路打通（见上）。
-//   v1.16：清理 v1.5~v1.14 在旧 VC 上的全部残留 hook/闸门/建流代码，只保留 RTC 链路。
+// 关键定案（git 提交记录含完整历史）：
+//   v1.15：官方本地 SD 回放界面 = JANewRtcSDPlayViewController（时间轴/日历选日/
+//           SD 卡检测/变速；用户手动进本地回放看到的就是它）。之前 push 的
+//           JANewSDPlayerViewController 是另一播放器 → 界面不同 → 黑屏根因。
+//   v1.17：startSDPlayWithSelectTimeStamp: 调用延迟 0.4s→3.0s（官方未就绪时
+//           block 预检查失败 → 定位不执行 → 播最新）。
+//   v1.18：时间轴指示器唯一更新入口 = JATimeLineView changeCurrentTimeStamp:
+//           （0x1000ff834），主动拨动。
+//   v1.19：changeCurrentTimeStamp: 入参是当日相对秒（0~86399），不是绝对秒
+//           （绝对秒 1792407777 → 官方显示 497891:02:57）。
+//   v1.20：viewDidAppear 世代去重（官方可能多次触发 → 只保留最后一次定位）。
+//   v1.21：移除 viewWillDisappear stopSDPlay（pop 过渡期停流不干净 → 双流交替
+//           渲染），改 3.0s 定位前先 stopSDPlay 再立即建流（单流+每次强制重建）。
+//   v1.25：跨天修正定案 —— 官方选日正规入口 switchToSDDay:dateString:
+//           （反汇编 0x100afb2e8：x2=报警日0点秒、x3=日期字符串，内部设选中日/
+//           日期串/时间区间并经 viewModel 转发加载该日事件+刷新时间轴+顶部日期）。
+//           替代 v1.22~v1.24 的 setCurrentSelectedSDDay:/setCurrentDateStr:/
+//           loadDataFirstWithDate: 猜测组合（其中 loadDataFirstWithDate: 在 VC 与
+//           viewModel 上运行时均无该方法）。
+//   v1.26：清理（本版）。
 
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
-
-// ---------- 日志 ----------
-
-static NSString *JALogPath(void) {
-    NSArray *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
-    if (!paths.count) return nil;
-    return [paths[0] stringByAppendingPathComponent:@"jasdreplay.log"];
-}
-
-static void JALog(NSString *fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    NSLog(@"[JASDReplay] %@", msg);
-    @autoreleasepool {
-        NSString *p = JALogPath();
-        if (p) {
-            NSFileManager *fm = [NSFileManager defaultManager];
-            if (![fm fileExistsAtPath:p]) {
-                [fm createFileAtPath:p contents:nil attributes:nil];
-            }
-            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:p];
-            if (fh) {
-                [fh seekToEndOfFile];
-                [fh writeData:[[msg stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding]];
-                [fh closeFile];
-            }
-        }
-    }
-}
 
 // ---------- KVC 工具 ----------
 
@@ -101,7 +44,7 @@ static id JAVal(id obj, NSString *key) {
 static void JASet(id obj, NSString *key, id val) {
     if (!obj || !val) return;
     @try { [obj setValue:val forKey:key]; }
-    @catch (NSException *e) { JALog(@"set %@ failed: %@", key, e); }
+    @catch (NSException *e) {}
 }
 
 static UIViewController *JATopVC(void) {
@@ -125,13 +68,9 @@ static id JAGroupManagerShared(void) {
         SEL s = NSSelectorFromString(sn);
         if (class_respondsToSelector(cls, s)) {
             id obj = ((id(*)(id, SEL))objc_msgSend)((id)cls, s);
-            if (obj) {
-                JALog(@"JAGroupManager 单例命中: +[JAGroupManager %@] -> %@", sn, obj);
-                return obj;
-            }
+            if (obj) return obj;
         }
     }
-    JALog(@"!! JAGroupManager 单例未找到（common 单例名均无响应）");
     return nil;
 }
 
@@ -153,10 +92,7 @@ static id JAFindCameraFromGroupManager(id warn, NSString **src) {
     if (!gm) return nil;
 
     id map = JAVal(gm, @"myCameraMap");
-    JALog(@"myCameraMap=%@ count=%lu", map, (unsigned long)[map count]);
-
     NSString *eid = JANormId(JAVal(warn, @"eid"));
-    JALog(@"warn.eid=%@", eid);
 
     // 1) getMyCameraWithUid:eid 直查（myCameraMap[eid]）
     if (eid) {
@@ -164,38 +100,28 @@ static id JAFindCameraFromGroupManager(id warn, NSString **src) {
         @try {
             cam = [gm performSelector:NSSelectorFromString(@"getMyCameraWithUid:")
                            withObject:JAVal(warn, @"eid")];
-        } @catch (NSException *e) {
-            JALog(@"!! getMyCameraWithUid: 异常: %@", e);
-        }
+        } @catch (NSException *e) {}
         if (cam) {
             *src = [NSString stringWithFormat:@"JAGroupManager.getMyCameraWithUid(eid=%@)", eid];
             return cam;
         }
-        JALog(@"getMyCameraWithUid(eid=%@) 未命中", eid);
     }
 
     // 2) 遍历 getAllMyCamera 比对 uid
     id all = nil;
     @try {
         all = [gm performSelector:NSSelectorFromString(@"getAllMyCamera")];
-    } @catch (NSException *e) {
-        JALog(@"!! getAllMyCamera 异常: %@", e);
-    }
+    } @catch (NSException *e) {}
     if ([all isKindOfClass:NSArray.class]) {
         NSUInteger n = [all count];
-        JALog(@"getAllMyCamera 共 %lu 台设备", (unsigned long)n);
         for (NSUInteger i = 0; i < n; i++) {
             id cam = [all objectAtIndex:i];
             NSString *uid = JANormId(JAVal(cam, @"uid"));
-            if (i < 5) JALog(@"  设备[%lu] uid=%@ class=%@", (unsigned long)i, uid, NSStringFromClass([cam class]));
             if (eid && uid && [uid isEqualToString:eid]) {
                 *src = [NSString stringWithFormat:@"getAllMyCamera uid==eid(%@)", eid];
                 return cam;
             }
         }
-        JALog(@"getAllMyCamera 未匹配到 eid=%@", eid);
-    } else {
-        JALog(@"!! getAllMyCamera 返回非数组: %@", all);
     }
     return nil;
 }
@@ -259,7 +185,6 @@ static NSNumber *JABuildTimestamp(id warn) {
                                                    range:NSMakeRange(0, u.length)];
         if (m && m.numberOfRanges > 1) {
             NSString *sec = [u substringWithRange:[m rangeAtIndex:1]];
-            JALog(@"时间戳来源: event_file_url 内嵌秒 %@", sec);
             return @(sec.longLongValue);
         }
     }
@@ -267,11 +192,9 @@ static NSNumber *JABuildTimestamp(id warn) {
     id t = JAVal(warn, @"eventTimeUTC");
     if (t) {
         if ([t isKindOfClass:NSNumber.class]) {
-            JALog(@"时间戳来源: eventTimeUTC NSNumber %@", t);
             return t; // 原样（秒）
         }
         if ([t isKindOfClass:NSString.class]) {
-            JALog(@"时间戳来源: eventTimeUTC 字符串 %@", t);
             return @((long long)[t doubleValue]); // 秒字符串（不再 ×1000）
         }
         return nil;
@@ -287,9 +210,7 @@ static NSNumber *JABuildTimestamp(id warn) {
         fmt.timeZone = [NSTimeZone localTimeZone];
         NSDate *date = [fmt dateFromString:s];
         if (date) {
-            long long sec = (long long)[date timeIntervalSince1970];
-            JALog(@"时间戳来源: event_date+event_time 拼秒 %lld", sec);
-            return @(sec);
+            return @((long long)[date timeIntervalSince1970]);
         }
     }
     return nil;
@@ -313,7 +234,6 @@ static long long JADayStartSec(NSNumber *ts) {
 // 前置声明（实现位于下方 hook 区，JATryOpenSDReplay 需提前引用）
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
 static void ja_rtc_viewDidAppear(id self, SEL _cmd);
-static void ja_rtc_respFirstFrame(id self, SEL _cmd, long long ts);
 static void JATimeLineSyncToSec(id sdVC, long long sec);
 
 // v1.15：当前活跃 RTC SD 播放器指针（纯 C 比较守卫，不向对象发消息）
@@ -321,53 +241,27 @@ static id g_activeSDPlayer = nil;
 static BOOL g_rtcHooked = NO;        // JANewRtcSDPlayViewController viewDidAppear hook 已装
 static IMP g_orig_rtc_vda = NULL;    // 原 viewDidAppear: IMP
 static long long g_rtcTargetSec = 0; // 报警时间戳（秒），viewDidAppear 后自动定位播放
-// v1.17：首帧确认 + 自动重试（时间轴拖条不跟随定位的根治）
-static BOOL g_rtcFirstFrameHooked = NO;  // respDeviceFirstFrameTimeStamp: hook 已装
-static IMP g_orig_rtc_firstframe = NULL; // 原 respDeviceFirstFrameTimeStamp: IMP（数值签名）
-static BOOL g_rtcLocated = NO;           // 首帧已确认定位到报警时间点
-static int  g_rtcRetryCount = 0;         // 重试次数（最多 3 次）
-// v1.20：viewDidAppear 去重（官方可能多次触发 viewDidAppear → 只保留最后一次的 3.0s 定位）。
-// v1.21：移除 viewWillDisappear stopSDPlay —— (6).log 实测该时机停流不干净 + 官方自身
-// 清理叠加 → 旧流残留 + 新流并存 → 画面在两个时间点交替（20:18 ↔ 20:36）。
-// 改为：3.0s 定位调用前先 stopSDPlay（停官方自动流）再立即 startSDPlayWithSelectTimeStamp:
-// → 单流、每次强制重建（绕开 seekSDPlay 前置闸门 0x103429ee0）。
-static unsigned long long g_rtcVdaGen = 0;     // viewDidAppear 世代计数（去重）
+// v1.20：viewDidAppear 世代去重（官方可能多次触发 → 只保留最后一次的 3.0s 定位）
+static unsigned long long g_rtcVdaGen = 0;
 
 static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
-    JALog(@"--- JATryOpenSDReplay (camera=%@ class=%@ uid=%@) ---",
-          cam, cam ? NSStringFromClass([cam class]) : @"nil", JAVal(cam, @"uid"));
     // 目标界面 = 官方本地 SD 回放 JANewRtcSDPlayViewController（RTC 完整播放器，
     // 时间轴/日历/SD 卡检测/播放控制；用户手动进本地回放看到的就是它）。
     Class cls = NSClassFromString(@"JANewRtcSDPlayViewController");
-    if (!cls) {
-        JALog(@"!! JANewRtcSDPlayViewController 类不存在");
-        return;
-    }
+    if (!cls) return;
     // RTC viewDidAppear hook 补装（类晚加载/轮询错过场景兜底）
     if (!g_rtcHooked) {
         JASetImp(cls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
         g_rtcHooked = YES;
     }
-    // v1.17：respDeviceFirstFrameTimeStamp: hook 补装（数值签名 (id,SEL,long long)，
-    // 首帧时间确认 + 不匹配自动重试，时间轴拖条跟随定位的根治）
-    if (!g_rtcFirstFrameHooked) {
-        JASetImp(cls, @selector(respDeviceFirstFrameTimeStamp:), (IMP)ja_rtc_respFirstFrame,
-                 &g_orig_rtc_firstframe);
-        g_rtcFirstFrameHooked = YES;
-    }
     id vc = [[cls alloc] init];
-    JALog(@"已创建 SDPlayer(RTC): %@ class=%@", vc, NSStringFromClass([vc class]));
 
     // 1) myCamera 用 KVC（RTC 版无 setMyCamera: 公开方法）。
     // 官方 viewDidLoad 会自己读 self.myCamera → setMyCamera: 到 JADevicePlatform.sharedInstance
     //（反汇编 0x100af461c 定案），这里只需把 camera 挂到 VC 上。
     @try {
         [vc setValue:cam forKey:@"myCamera"];
-        id chk = [vc valueForKey:@"myCamera"];
-        JALog(@"setMyCamera(KVC) 后 RTC.myCamera=%@ uid=%@", chk, JAVal(chk, @"uid"));
-    } @catch (NSException *e) {
-        JALog(@"!! setValue myCamera 异常: %@", e);
-    }
+    } @catch (NSException *e) {}
 
     // 2) 事件与时间戳
     if (warn) {
@@ -376,19 +270,14 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
         if (ts) JASet(vc, @"currentTimeStamp", ts);
         // 校验秒范围：10 位秒级（1.0e9 ~ 9.9e9），防止再传毫秒
         long long tv = ts ? ts.longLongValue : 0;
-        JALog(@"currentTimeStamp=%@ (%lld 秒 → %@)", ts, tv,
-              tv >= 1000000000LL && tv < 10000000000LL
-              ? @"秒级 ✓" : @"⚠ 非秒级！");
         // 记录报警时间戳（秒），RTC viewDidAppear 后自动 startSDPlayWithSelectTimeStamp:
         if (tv >= 1000000000LL && tv < 10000000000LL) g_rtcTargetSec = tv;
-        // 补设设备 SD 选中日期 = 报警日 0 点秒 —— RTC setupData（0x100af6104）会
-        // 读 myCamera.sdSelectiontDay → setCurrentSelectedSDDay:（选中日）→ 加载该日事件列表
+        // 预设设备 SD 选中日期 = 报警日 0 点秒 —— RTC setupData（0x100af6104）会
+        // 读 myCamera.sdSelectiontDay → 加载该日事件列表
         long long dayStart = JADayStartSec(ts);
         if (dayStart > 0 && cam) {
             JASet(cam, @"sdSelectiontDay", @(dayStart));
-            JALog(@"已设 myCamera.sdSelectiontDay=%lld (报警日0点UTC)", dayStart);
         }
-        JALog(@"已设置 currentEvent/currentTimeStamp (RTC)");
     }
 
     // 3) push
@@ -398,60 +287,9 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
         g_activeSDPlayer = vc;  // 登记当前活跃 RTC SD 播放器（viewDidAppear hook 守卫用）
         [nav pushViewController:vc animated:YES];
         // RTC 版是官方完整播放器，官方链自己建流 → 不做任何状态强制
-        JALog(@"已 push SDPlayer(RTC)（官方原生链播放，不做状态强制）");
     } else {
-        JALog(@"!! 无 navigationController，改为 present");
         [UIApplication.sharedApplication.keyWindow.rootViewController presentViewController:vc animated:YES completion:nil];
     }
-}
-
-// ---------- 诊断 dump ----------
-
-static void JADumpWarnInfo(UIViewController *detailVC, NSString *from) {
-    JALog(@"=== %@ ===", from);
-    JALog(@"self=%p class=%@", detailVC, NSStringFromClass(detailVC.class));
-    JALog(@"deviceId=%@ devicePwd=%@",
-          JAVal(detailVC, @"deviceId"), JAVal(detailVC, @"devicePwd"));
-
-    id cam = JAVal(detailVC, @"myCamera");
-    JALog(@"self.myCamera=%@ class=%@ uid=%@", cam, cam ? NSStringFromClass([cam class]) : @"nil", JAVal(cam, @"uid"));
-
-    id warn = JAVal(detailVC, @"warnInfoEntityModelEx");
-    JALog(@"warnModel=%@", warn);
-    if (warn) {
-        id ts = JAVal(warn, @"eventTimeUTC");
-        JALog(@"  eventTimeUTC=%@ (%@)", ts, ts ? NSStringFromClass([ts class]) : @"nil");
-        JALog(@"  event_time=%@  event_date=%@  event_type=%@  eid=%@",
-              JAVal(warn, @"event_time"), JAVal(warn, @"event_date"), JAVal(warn, @"event_type"), JAVal(warn, @"eid"));
-        JALog(@"  warn_record_type=%@  cs_status=%@  isAli=%@",
-              JAVal(warn, @"warn_record_type"), JAVal(warn, @"cs_status"), JAVal(warn, @"isAli"));
-        JALog(@"  event_file_url=%@  eventPicThumbUrl=%@  rowKey=%@",
-              JAVal(warn, @"event_file_url"), JAVal(warn, @"eventPicThumbUrl"), JAVal(warn, @"rowKey"));
-        JALog(@"  event_id=%@  bucket_name=%@  end_point=%@",
-              JAVal(warn, @"event_id"), JAVal(warn, @"bucket_name"), JAVal(warn, @"end_point"));
-    }
-
-    id vm = JAVal(detailVC, @"viewModel");
-    JALog(@"viewModel=%@ class=%@", vm, NSStringFromClass([vm class]));
-    if (vm) {
-        NSArray *keys = @[@"device", @"myCamera", @"camera", @"devID", @"deviceId", @"deviceID", @"dev", @"cameraModel"];
-        for (NSString *k in keys) {
-            id v = JAVal(vm, k);
-            if (v) JALog(@"  viewModel.%@ = %@ (%@)", k, v, NSStringFromClass([v class]));
-        }
-    }
-
-    unsigned int pc = 0;
-    objc_property_t *props = class_copyPropertyList(detailVC.class, &pc);
-    for (unsigned int i = 0; i < pc; i++) {
-        const char *name = property_getName(props[i]);
-        NSString *pn = [NSString stringWithUTF8String:name];
-        id v = JAVal(detailVC, pn);
-        if (v && [NSStringFromClass([v class]) containsString:@"Camera"]) {
-            JALog(@"  self.%@ = %@ (%@)", pn, v, NSStringFromClass([v class]));
-        }
-    }
-    free(props);
 }
 
 // ---------- hook 实现（C IMP，无类依赖） ----------
@@ -468,97 +306,56 @@ static IMP g_orig_handleJumpToOpenCloud = NULL;
 // → 官方建流/定位到报警时间。
 // v1.17：延迟 0.4s→3.0s（反汇编 block 执行体 0x100b0c9cc 预检查 streamCtx/
 // isSeekingPlay，0.4s 时官方未就绪 → 预检查失败 → 定位不执行 → 播最新）。
-// v1.18：用户实测画面已播报警时间，但底部时间轴拖条指示器仍停最新 ——
-// 反汇编定案：VC setCurrentTimeStamp:（0x100b0bf30）是纯 ivar setter（str x2
-// → ivar，ret），官方播放进度从不驱动时间轴；时间轴指示器唯一更新入口 =
-// JATimeLineView changeCurrentTimeStamp:（0x1000ff834：setCurrentSec: +
-// adjustScrollViewOffsetAtCurrentSec 滚动 + setLastDisplaySec: + 更新顶部时间标签）。
-// 修法：定位调用后再延迟 1.0s，主动调 timeLineView changeCurrentTimeStamp:sec
-// → 指示器/滚动位置/时间标签全部拨到报警时间点。
+// v1.18：时间轴指示器唯一更新入口 = JATimeLineView changeCurrentTimeStamp:
+//（0x1000ff834），播放定位后主动拨动。
 static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     if (g_orig_rtc_vda) ((void(*)(id, SEL))g_orig_rtc_vda)(self, _cmd);
-    if (self != g_activeSDPlayer) {
-        JALog(@"[RTC-SD viewDidAppear] 非当前活跃实例，跳过自动定位");
-        return;
-    }
+    if (self != g_activeSDPlayer) return;
     long long sec = g_rtcTargetSec;
-    if (sec < 1000000000LL) {
-        JALog(@"[RTC-SD viewDidAppear] 无有效报警时间戳（%lld），跳过自动定位", sec);
-        return;
-    }
-    // 重置 v1.17 重试状态（每次进入页面重新开始）
-    g_rtcLocated = NO;
-    g_rtcRetryCount = 0;
-    // v1.20：世代去重 —— 官方可能多次触发 viewDidAppear（(5).log 首次进入触发 3 次，
-    // 每次都生成 3.0s 定位 → 建流/seek 竞争导致后续进入播最新），只保留最后一次生效
+    if (sec < 1000000000LL) return;
+    // v1.20：世代去重 —— 官方可能多次触发 viewDidAppear，只保留最后一次生效
     unsigned long long myGen = ++g_rtcVdaGen;
-    JALog(@"[RTC-SD viewDidAppear] 官方展示完成，3.0s 后自动 startSDPlayWithSelectTimeStamp: %lld (gen=%llu)", sec, myGen);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) {
-            JALog(@"[RTC-SD] 延迟触发时已离开页面/已有更新触发（gen=%llu vs %llu），跳过", myGen, g_rtcVdaGen);
-            return;
-        }
+        if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
         // v1.21：先停官方 viewDidLoad 自动起的流（避免双流并存交替渲染），再建定位流。
         // 每次进入都"停旧→建新"，绕开复用流上 seekSDPlay 前置闸门（0x103429ee0 bit0）
         // 导致的"第二次起偶发定位不生效/播最新"。
         SEL st = NSSelectorFromString(@"stopSDPlay");
         if ([self respondsToSelector:st]) {
-            JALog(@"[RTC-SD] 定位前先 stopSDPlay（停官方自动流，确保单流）");
             ((void(*)(id, SEL))objc_msgSend)(self, st);
         }
-        // v1.22：跨天修正 —— 官方默认选中"今日"（过了 12 点后打开昨天报警 → 时间轴
-        // 按今日加载 → 卡 00:00、看不到昨天进度条）。进入后强设：
-        // ① setCurrentSelectedSDDay:(报警日0点) ② setCurrentDateStr:(报警日字符串)
-        // ③ loadDataFirstWithDate: 重新加载报警日事件（时间轴刷新），再建流定位。
-        long long dayStart = JADayStartSec(@(sec));
-        if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
         // v1.25 定案（v1.24 运行时枚举 + 反汇编 0x100afb2e8）：官方"选日期"正规入口 =
         // switchToSDDay:dateString:（x2=报警日0点秒 long long，x3=日期字符串）。
         // 内部：算时间范围 → 设选中日/日期串/时间区间 → 经 viewModel 转发触发
-        // 加载该日事件 + 刷新时间轴 + 顶部日期显示。一次性替代 v1.22~v1.24 的
-        // setCurrentSelectedSDDay:/setCurrentDateStr:/loadDataFirstWithDate 猜测组合。
+        // 加载该日事件 + 刷新时间轴 + 顶部日期显示（跨天修正：官方默认选中"今日"，
+        // 过了 12 点打开昨天报警会卡 00:00、看不到昨天进度条）。
+        long long dayStart = JADayStartSec(@(sec));
+        if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
         NSDateFormatter *df = [[NSDateFormatter alloc] init];
         df.dateFormat = @"yyyy-MM-dd";
         NSString *ds = [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:sec]];
         SEL sw = NSSelectorFromString(@"switchToSDDay:dateString:");
         if ([self respondsToSelector:sw]) {
             ((void(*)(id, SEL, long long, id))objc_msgSend)(self, sw, dayStart, ds);
-            JALog(@"[RTC-SD] switchToSDDay:dateString: day=%lld ds=%@（官方选日入口：切到报警日并加载其事件）",
-                  dayStart, ds);
-        } else {
-            JALog(@"!! RTC-SD 无 switchToSDDay:dateString:");
         }
         // 官方 viewDidLoad 会把 myCamera.sdSelectiontDay 覆盖成"今日0点"（跨天场景 = 10-20），
-        // 时间轴/相对秒若读它就会算错（(7).log 实证 1792425600-1792422838→负数→clip 0）。
-        // 这里重设回报警日0点，JATimeLineSyncToSec 也不再信任该 ivar（改用计算值）。
+        // 时间轴/相对秒若读它就会算错。这里重设回报警日0点。
         @try {
             [self setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"];
-            JALog(@"[RTC-SD] 重设 myCamera.sdSelectiontDay=%lld（报警日0点，防官方覆盖）", dayStart);
-        } @catch (NSException *e) {
-            JALog(@"!! 重设 sdSelectiontDay 异常: %@", e);
-        }
+        } @catch (NSException *e) {}
         // 事件列表加载是异步的（网络拉取），等 1.5s 后再建流定位
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) {
-                JALog(@"[RTC-SD] 建流延迟触发时已离开页面/已有更新触发，跳过");
-                return;
-            }
-            JALog(@"[RTC-SD] 调 startSDPlayWithSelectTimeStamp: %lld（直达报警时间点）", sec);
+            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
             SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
             if ([self respondsToSelector:s]) {
                 ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
-            } else {
-                JALog(@"!! RTC-SD 无 startSDPlayWithSelectTimeStamp:");
             }
             // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到报警时间点
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
-                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) {
-                    JALog(@"[RTC-SD] 拨时间轴时已离开页面/已有更新触发，跳过");
-                    return;
-                }
+                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
                 JATimeLineSyncToSec(self, sec);
             });
         });
@@ -570,85 +367,26 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
 //     [timeLineView changeCurrentTimeStamp:sec]（官方 API 0x1000ff834：
 //     内部 setCurrentSec: + adjustScrollViewOffsetAtCurrentSec + setLastDisplaySec:）。
 // v1.19 关键修正：changeCurrentTimeStamp: 的入参是「当日内的相对秒」（0~86399），
-// 不是绝对 Unix 秒！v1.18 实测传 1792407777（绝对秒）→ 官方按 秒/3600 算小时
-// → 标签显示 497891:02:57（应为 19:02:57），指示器滚出当日范围 → 拖动无录像。
-// 修正：相对秒 = 报警秒 - 北京当日0点（= myCamera.sdSelectiontDay，日志确认
-// 1792407777 - 1792339200 = 68577 = 19:02:57）。兜底公式 (sec + 28800) % 86400。
+// 不是绝对 Unix 秒！绝对秒 1792407777 → 官方按 秒/3600 算小时 → 显示 497891:02:57。
+// 修正：相对秒 = 报警秒 - 报警日0点（JADayStartSec 纯计算，跨天后官方会把
+// myCamera.sdSelectiontDay 覆盖成今日0点，读 ivar 会算错 → 必须用计算值）。
 static void JATimeLineSyncToSec(id sdVC, long long sec) {
     @autoreleasepool {
-        // v1.23 修正：跨天后官方把 myCamera.sdSelectiontDay 覆盖成"今日0点"（10-20），
-        // 用它会算出负数相对秒 → clip 0 → 指示器卡 00:00（(7).log 实证）。
-        // 相对秒必须基于**报警日0点**：JADayStartSec(@(sec)) 按 sec 所在日期纯计算，
-        // 不受官方覆盖影响。读 sdSelectiontDay 仅作日志对比。
         long long dayStart = JADayStartSec(@(sec));
         if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
-        long long ivarDay = 0;
-        @try {
-            ivarDay = [[sdVC valueForKeyPath:@"myCamera.sdSelectiontDay"] longLongValue];
-            if (ivarDay != dayStart) {
-                JALog(@"[RTC-SD] 提示: myCamera.sdSelectiontDay=%lld ≠ 报警日0点=%lld（官方按今日覆盖，用计算值）", ivarDay, dayStart);
-            }
-        } @catch (NSException *e) {
-            JALog(@"!! 读 sdSelectiontDay 异常: %@", e);
-        }
         long long rel = sec - dayStart;   // 报警日相对秒 0~86399
         if (rel < 0) rel = 0;
         if (rel > 86399) rel = 86399;
-        JALog(@"[RTC-SD] 时间轴参数: 绝对=%lld 当日0点=%lld → 相对秒=%lld (应≈时:分:秒)", sec, dayStart, rel);
 
         id tl = nil;
         @try { tl = [sdVC valueForKey:@"timeLineView"]; }
-        @catch (NSException *e) { JALog(@"!! timeLineView KVC 异常: %@", e); }
-        if (!tl) {
-            JALog(@"!! timeLineView 为 nil，无法拨时间轴");
-            return;
-        }
+        @catch (NSException *e) { return; }
+        if (!tl) return;
         SEL c = NSSelectorFromString(@"changeCurrentTimeStamp:");
         if ([tl respondsToSelector:c]) {
             ((void(*)(id, SEL, long long))objc_msgSend)(tl, c, rel);
-            JALog(@"[RTC-SD] changeCurrentTimeStamp: 已调用（相对秒 %lld → 指示器/标签应正确）", rel);
-        } else {
-            JALog(@"!! timeLineView 无 changeCurrentTimeStamp:");
         }
     }
-}
-
-// v1.17 核心：respDeviceFirstFrameTimeStamp: hook —— 首帧时间确认 + 自动重试。
-// 注意：该回调参数 x2 是数值（long long 秒），不是对象（v1.14 反汇编 0x100b77d64 /
-// 0x100afdd0c + IPS 124424 定案），hook 必须用数值签名，严禁 (id,SEL,id)。
-// 首帧时间 ≈ 报警时间 → 定位成功（时间轴指示器随播放进度自然到位）；
-// 首帧时间 ≠ 报警时间（官方播了最新）→ 1.5s 后重试 startSDPlayWithSelectTimeStamp:，
-// 最多 3 次，成功后停止。
-static void ja_rtc_respFirstFrame(id self, SEL _cmd, long long ts) {
-    if (g_orig_rtc_firstframe) {
-        ((void(*)(id, SEL, long long))g_orig_rtc_firstframe)(self, _cmd, ts);
-    }
-    if (self != g_activeSDPlayer || g_rtcTargetSec < 1000000000LL || g_rtcLocated) {
-        return;
-    }
-    long long diff = ts - g_rtcTargetSec;
-    if (diff < 0) diff = -diff;
-    if (diff <= 2) {
-        g_rtcLocated = YES;
-        JALog(@"[RTC-SD 首帧] ts=%lld == 报警 %lld ✓ 已定位（时间轴应已指向报警时间点）", ts, g_rtcTargetSec);
-        return;
-    }
-    JALog(@"[RTC-SD 首帧] ts=%lld ≠ 报警 %lld（差 %llds）→ 官方播了其他时间，准备重试", ts, g_rtcTargetSec, diff);
-    if (g_rtcRetryCount >= 3) {
-        JALog(@"[RTC-SD] 重试次数用尽（3/3），保持现状（可能该日无录像）");
-        return;
-    }
-    g_rtcRetryCount++;
-    JALog(@"[RTC-SD] 第 %d 次重试：1.5s 后再调 startSDPlayWithSelectTimeStamp:", g_rtcRetryCount);
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (self != g_activeSDPlayer || g_rtcLocated) return;
-        JALog(@"[RTC-SD] 重试 startSDPlayWithSelectTimeStamp: %lld（第 %d 次）", g_rtcTargetSec, g_rtcRetryCount);
-        SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
-        if ([self respondsToSelector:s]) {
-            ((void(*)(id, SEL, long long))objc_msgSend)(self, s, g_rtcTargetSec);
-        }
-    });
 }
 
 // 防抖：同一详情页实例 2 秒内只 push 一次（官方可能触发两次点击事件 → 双 push 闪烁）
@@ -658,7 +396,6 @@ static NSTimeInterval g_lastPushTime = 0;
 static BOOL JADebounce(UIViewController *detailVC) {
     NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
     if ((__bridge void *)detailVC == g_lastDetailVC && (now - g_lastPushTime) < 2.0) {
-        JALog(@"!! 2 秒内重复触发（防抖拦截，避免双 push 闪烁）");
         return YES;
     }
     return NO;
@@ -666,17 +403,16 @@ static BOOL JADebounce(UIViewController *detailVC) {
 
 // 原 selector：clickCloudRecordAction:（点「看录像」按钮，官方原逻辑弹云存储）
 static void ja_clickCloudRecordAction(id self, SEL _cmd, id sender) {
-    JADumpWarnInfo(self, @"clickCloudRecordAction: 已拦截（不再弹云存储）");
     if (JADebounce(self)) return;
     NSString *src = nil;
-    id cam = JAFindCamera(self, JAVal(self, @"warnInfoEntityModelEx"), &src);
-    JALog(@"camera 来源: %@  camera=%@", src, cam);
+    id warn = JAVal(self, @"warnInfoEntityModelEx");
+    id cam = JAFindCamera(self, warn, &src);
     if (cam) {
-        JATryOpenSDReplay(self, JAVal(self, @"warnInfoEntityModelEx"), cam);
+        JATryOpenSDReplay(self, warn, cam);
         g_lastDetailVC = (__bridge void *)self;
         g_lastPushTime = [NSDate timeIntervalSinceReferenceDate];
     } else {
-        JALog(@"!! 无可用 camera，恢复官方逻辑（保留云存储引导，防崩溃）");
+        // 无可用 camera，恢复官方逻辑（保留云存储引导，防崩溃）
         if (g_orig_clickCloudRecordAction) {
             ((void(*)(id, SEL, id))g_orig_clickCloudRecordAction)(self, _cmd, sender);
         }
@@ -694,15 +430,9 @@ static void ja_handleJumpToOpenCloud(id self, SEL _cmd) {
 
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved) {
     Method m = class_getInstanceMethod(cls, sel);
-    if (!m) {
-        JALog(@"!! 方法不存在: %@", NSStringFromSelector(sel));
-        return;
-    }
+    if (!m) return;
     IMP cur = method_getImplementation(m);
-    if (cur == newImp) {
-        JALog(@"方法 %@ 已是本 hook（检测到重复注入，跳过，不破坏）", NSStringFromSelector(sel));
-        return;
-    }
+    if (cur == newImp) return;  // 已是本 hook（幂等，防重复注入）
     if (saved && !*saved) *saved = cur;
     method_setImplementation(m, newImp);
 }
@@ -714,16 +444,10 @@ static void JAHook(void) {
     if (!JAHooked) {
         Class detailCls = NSClassFromString(@"JANewsWarnInfoDetailVC");
         if (detailCls) {
-            // 检测旧版本（exchange 式 swizzle）残留的 _jasd_ selector → 提示用户清理 TrollFools 旧项
-            if ([detailCls instancesRespondToSelector:NSSelectorFromString(@"_jasd_clickCloudRecordAction:")]) {
-                JALog(@"!! 检测到旧版 dylib 残留的 _jasd_ 方法，建议 TrollFools 删除旧项只留最新（本版幂等，不影响）");
-            }
-
             JASetImp(detailCls, @selector(clickCloudRecordAction:), (IMP)ja_clickCloudRecordAction,
                      &g_orig_clickCloudRecordAction);
             JASetImp(detailCls, @selector(handleJumpToOpenCloud), (IMP)ja_handleJumpToOpenCloud,
                      &g_orig_handleJumpToOpenCloud);
-
             JAHooked = YES;
         }
     }
@@ -733,19 +457,6 @@ static void JAHook(void) {
         if (rtcCls) {
             JASetImp(rtcCls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
             g_rtcHooked = YES;
-            JALog(@"RTC-SD viewDidAppear hook 已装（轮询补装）");
-        } else {
-            JALog(@"!! JANewRtcSDPlayViewController 尚未加载（轮询重试）");
-        }
-    }
-    // v1.17：RTC SD 播放器 respDeviceFirstFrameTimeStamp: hook（首帧确认+重试）
-    if (!g_rtcFirstFrameHooked) {
-        Class rtcCls = NSClassFromString(@"JANewRtcSDPlayViewController");
-        if (rtcCls) {
-            JASetImp(rtcCls, @selector(respDeviceFirstFrameTimeStamp:), (IMP)ja_rtc_respFirstFrame,
-                     &g_orig_rtc_firstframe);
-            g_rtcFirstFrameHooked = YES;
-            JALog(@"RTC-SD respDeviceFirstFrameTimeStamp: hook 已装（数值签名，首帧确认）");
         }
     }
 }
@@ -753,7 +464,6 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.25 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
@@ -765,12 +475,6 @@ static void JASDReplayInit(void) {
             [NSThread sleepForTimeInterval:0.5];
             tries++;
             dispatch_async(dispatch_get_main_queue(), ^{ JAHook(); });
-        }
-        if (!JAHooked) {
-            JALog(@"!! 30 次重试后仍未找到 JANewsWarnInfoDetailVC");
-        }
-        if (!g_rtcHooked) {
-            JALog(@"!! 30 次重试后仍未找到 JANewRtcSDPlayViewController（点看录像时会再补装）");
         }
     });
 }
