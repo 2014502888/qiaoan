@@ -19,6 +19,13 @@
 //   入口：viewDidLoad/viewDidAppear 调它播上次位置/最新实时并显示读取进度）。定位
 //   完成前吞掉该调用，官方根本不起自动流 → 三段切换从源头消除（反复 stopSDPlay
 //   打不过官方自动重启/异步建流的问题不再存在）；定位发出 2s 后放行。
+// v1.32（回退定案）：v1.29/30/31 的预停与 startPlay 拦截均与官方 isEnterSDPlay 状态机
+//   耦合 —— 提前 stop 或吞 startPlay 会让官方 isEnterSDPlay 停在 NO，定位调用
+//   startSDPlayWithSelectTimeStamp: 走 block 的"startSDPlay 无时间戳分支" → 画面实时、
+//   忽略报警时间戳（时间轴对、画面不对）。回退到 v1.28 验收链路（3.0s 停官方流 →
+//   switchToSDDay → 2.5s 定位 → 1.5s 时间轴），定位 100% 可靠；官方 viewDidLoad 自动流
+//   的短暂显示（读取进度/实时）为官方固有行为，接受三段观感，换取定位正确。
+//   保留 viewDidDisappear 0.3s 停流（返回流量不再跑，v1.30，无副作用）。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）→
@@ -256,8 +263,6 @@ static long long JADayStartSec(NSNumber *ts) {
 
 // 前置声明（实现位于下方 hook 区，JATryOpenSDReplay 需提前引用）
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
-static void ja_rtc_startPlay(id self, SEL _cmd);
-static void ja_rtc_viewDidLoad(id self, SEL _cmd);
 static void ja_rtc_viewDidAppear(id self, SEL _cmd);
 static void ja_rtc_viewDidDisappear(id self, SEL _cmd);
 static void JATimeLineSyncToSec(id sdVC, long long sec);
@@ -265,17 +270,11 @@ static void JATimeLineSyncToSec(id sdVC, long long sec);
 // v1.15：当前活跃 RTC SD 播放器指针（纯 C 比较守卫，不向对象发消息）
 static id g_activeSDPlayer = nil;
 static BOOL g_rtcHooked = NO;        // JANewRtcSDPlayViewController hook 已装
-static IMP g_orig_rtc_startPlay = NULL; // 原无参 startPlay IMP（v1.31 源头拦截官方自动播）
-static IMP g_orig_rtc_vdl = NULL;    // 原 viewDidLoad: IMP（v1.30 预停官方自动流）
 static IMP g_orig_rtc_vda = NULL;    // 原 viewDidAppear: IMP
 static IMP g_orig_rtc_vdd = NULL;    // 原 viewDidDisappear: IMP（v1.30 返回停流）
 static long long g_rtcTargetSec = 0; // 报警时间戳（秒），viewDidAppear 后自动定位播放
 // v1.20：viewDidAppear 世代去重（官方可能多次触发 → 只保留最后一次的 3.0s 定位）
 static unsigned long long g_rtcVdaGen = 0;
-// v1.31：拦截官方无参 startPlay（"进入即播"自动流源头）。从 push 置 YES 到定位
-// 完成前，吞掉官方 viewDidLoad/viewDidAppear 自动调用的 startPlay，官方根本不起
-// 自动流 → 消除"上次画面→实时→定位"三段切换；定位发出后 2s 放行恢复官方行为。
-static BOOL g_sdBlockAutoPlay = NO;
 
 static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     // 目标界面 = 官方本地 SD 回放 JANewRtcSDPlayViewController（RTC 完整播放器，
@@ -284,14 +283,10 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     if (!cls) return;
     // RTC hooks 补装（类晚加载/轮询错过场景兜底）
     if (!g_rtcHooked) {
-        JASetImp(cls, @selector(startPlay), (IMP)ja_rtc_startPlay, &g_orig_rtc_startPlay);
-        JASetImp(cls, @selector(viewDidLoad), (IMP)ja_rtc_viewDidLoad, &g_orig_rtc_vdl);
         JASetImp(cls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
         JASetImp(cls, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
         g_rtcHooked = YES;
     }
-    // v1.31：进入即置拦截标志，官方 viewDidLoad 自动调 startPlay 将被吞掉
-    g_sdBlockAutoPlay = YES;
     id vc = [[cls alloc] init];
 
     // 1) myCamera 用 KVC（RTC 版无 setMyCamera: 公开方法）。
@@ -335,38 +330,6 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
 static IMP g_orig_clickCloudRecordAction = NULL;
 static IMP g_orig_handleJumpToOpenCloud = NULL;
 
-// v1.31：官方无参 startPlay（自动播源头）—— viewDidLoad/viewDidAppear 的"进入即播"
-// 调它（无时间戳 → 播上次位置/最新实时，显示读取进度）。定位流程中吞掉：
-// 官方根本不起自动流，三段切换消除。定位发出后 2s / VC pop 后放行（恢复官方行为）。
-// 我们的定位走 startSDPlayWithSelectTimeStamp:（带时间戳），不经此入口，不受影响。
-static void ja_rtc_startPlay(id self, SEL _cmd) {
-    if (g_sdBlockAutoPlay && self == g_activeSDPlayer) {
-        return;  // 吞掉官方自动播，等待我们的定位链路
-    }
-    if (g_orig_rtc_startPlay) {
-        ((void(*)(id, SEL))g_orig_rtc_startPlay)(self, _cmd);
-    }
-}
-
-// v1.30：viewDidLoad 后 0.3s 先停官方自动流 —— 官方在 viewDidLoad/setupData 阶段就
-// 恢复上次回放位置并开始建流渲染（秒数持续叠加），viewDidAppear 0.5s 预停太晚，
-// 三段切换仍可见。这里提前到 viewDidLoad 后 0.3s 停，把"上次画面"段压到不可见；
-// viewDidAppear 0.5s 与 3.0s 的 stopSDPlay 保留作层层兜底（幂等）。
-// v1.31：startPlay 已被源头拦截，此处兜底仍保留（防止 startStream/其他路径起流）。
-static void ja_rtc_viewDidLoad(id self, SEL _cmd) {
-    if (g_orig_rtc_vdl) ((void(*)(id, SEL))g_orig_rtc_vdl)(self, _cmd);
-    if (self != g_activeSDPlayer) return;
-    if (g_rtcTargetSec < 1000000000LL) return;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (self != g_activeSDPlayer) return;
-        SEL st = NSSelectorFromString(@"stopSDPlay");
-        if ([self respondsToSelector:st]) {
-            ((void(*)(id, SEL))objc_msgSend)(self, st);
-        }
-    });
-}
-
 // v1.15 核心：JANewRtcSDPlayViewController viewDidAppear（官方本地 SD 回放界面）
 // 官方 viewDidLoad/setupData 已自动：setMyCamera 到 sharedInstance、setIsSDPlayer:YES、
 // 建 viewModel、按 myCamera.sdSelectiontDay 设选中日、加载事件列表。
@@ -378,6 +341,13 @@ static void ja_rtc_viewDidLoad(id self, SEL _cmd) {
 // isSeekingPlay，0.4s 时官方未就绪 → 预检查失败 → 定位不执行 → 播最新）。
 // v1.18：时间轴指示器唯一更新入口 = JATimeLineView changeCurrentTimeStamp:
 //（0x1000ff834），播放定位后主动拨动。
+// v1.32：移除 v1.29 0.5s 预停 / v1.30 viewDidLoad 0.3s 预停 / v1.31 startPlay 拦截
+// —— 官方 viewDidLoad 自动播（上次位置→实时）与 isEnterSDPlay 状态机耦合，提前
+// stop 或吞 startPlay 会打断官方播放状态（isEnterSDPlay 停在 NO → 定位调用走
+// startSDPlay 无时间戳分支 → 画面实时、忽略报警时间戳）。回退到 v1.28 验收链路：
+// 3.0s stopSDPlay（停官方自动流）→ switchToSDDay 切报警日 → 2.5s 定位 → 1.5s 时间轴。
+// 官方自动流的短暂显示（读取进度/实时）是官方 viewDidLoad 固有行为，定位成功后
+// 画面即切到报警时间；三段"乱跳"观感保留，换取定位 100% 可靠。
 static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     if (g_orig_rtc_vda) ((void(*)(id, SEL))g_orig_rtc_vda)(self, _cmd);
     if (self != g_activeSDPlayer) return;
@@ -385,18 +355,6 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     if (sec < 1000000000LL) return;
     // v1.20：世代去重 —— 官方可能多次触发 viewDidAppear，只保留最后一次生效
     unsigned long long myGen = ++g_rtcVdaGen;
-    // v1.29：先停官方 viewDidLoad/viewDidAppear 自动起的流。官方会先恢复上次回放
-    // 位置、再自动播最新实时 → App 重启后点看录像出现三段乱跳（上次时间→实时→
-    // 定位）。0.5s 时官方自动流已建立，立即 stop 干净；3.0s 链路内的 stopSDPlay
-    // 幂等保留作兜底。
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-        SEL st0 = NSSelectorFromString(@"stopSDPlay");
-        if ([self respondsToSelector:st0]) {
-            ((void(*)(id, SEL))objc_msgSend)(self, st0);
-        }
-    });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
@@ -437,12 +395,6 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
             if ([self respondsToSelector:s]) {
                 ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
             }
-            // v1.31：定位已发出，2s 后放行官方 startPlay（后续用户手动操作/官方
-            // 内部流程恢复正常；若此期间已 pop，viewDidDisappear 也会放行）
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                g_sdBlockAutoPlay = NO;
-            });
             // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到报警时间点
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
@@ -548,7 +500,6 @@ static void ja_rtc_viewDidDisappear(id self, SEL _cmd) {
     if (g_orig_rtc_vdd) ((void(*)(id, SEL))g_orig_rtc_vdd)(self, _cmd);
     if (self != g_activeSDPlayer) return;
     g_activeSDPlayer = nil;  // 先清标记：后续 viewDidAppear/定位闭包不再执行
-    g_sdBlockAutoPlay = NO;  // v1.31：pop 放行官方行为
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         SEL st = NSSelectorFromString(@"stopSDPlay");
@@ -583,13 +534,11 @@ static void JAHook(void) {
             JAHooked = YES;
         }
     }
-    // RTC SD 播放器 hooks（startPlay 源头拦截自动播 / viewDidLoad 预停 /
-    // viewDidAppear 自动定位 / viewDidDisappear 返回停流；类可能晚加载，轮询重试）
+    // RTC SD 播放器 hooks（viewDidAppear 自动定位 / viewDidDisappear 返回停流；
+    // 类可能晚加载，轮询重试）
     if (!g_rtcHooked) {
         Class rtcCls = NSClassFromString(@"JANewRtcSDPlayViewController");
         if (rtcCls) {
-            JASetImp(rtcCls, @selector(startPlay), (IMP)ja_rtc_startPlay, &g_orig_rtc_startPlay);
-            JASetImp(rtcCls, @selector(viewDidLoad), (IMP)ja_rtc_viewDidLoad, &g_orig_rtc_vdl);
             JASetImp(rtcCls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
             JASetImp(rtcCls, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
             g_rtcHooked = YES;
