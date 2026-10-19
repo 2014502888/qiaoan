@@ -300,6 +300,7 @@ static void ja_sd_seekTo_duration(id self, SEL _cmd, long long sec, double dur);
 static long long ja_live_detectType(id self, SEL _cmd);              // v1.9 诊断：JALiveManager.detectType
 static long long ja_live_isEnterBackPlayer(id self, SEL _cmd);       // v1.9 诊断：JALiveManager.isEnterBackPlayer
 static void ja_vm_seekTo_duration(id self, SEL _cmd, long long sec, long long dur);  // v1.9：viewModel.seekTo:duration:
+static void JAHookLiveGates(void);   // v1.9：统一安装 JALiveManager 闸门 getter + viewModel seekTo hook（幂等）
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
 static BOOL JASDHooked = NO;
 static IMP g_orig_sd_vwa = NULL;  // JANewSDPlayerViewController viewWillAppear: 原 IMP
