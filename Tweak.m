@@ -252,7 +252,9 @@ static long long JADayStartSec(NSNumber *ts) {
 
 // 前置声明（实现位于下方 hook 区，JATryOpenSDReplay 需提前引用）
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
+static void ja_rtc_viewDidLoad(id self, SEL _cmd);
 static void ja_rtc_viewDidAppear(id self, SEL _cmd);
+static void ja_rtc_viewDidDisappear(id self, SEL _cmd);
 static void JATimeLineSyncToSec(id sdVC, long long sec);
 
 // v1.15：当前活跃 RTC SD 播放器指针（纯 C 比较守卫，不向对象发消息）
