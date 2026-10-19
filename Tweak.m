@@ -5,6 +5,8 @@
 //   （UTC 前一日 16~24 点）跨 UTC 日算错 → 10-21 00:21 报警 dayStart 错成 10-20
 //   0点 → 相对秒 87660 clip 23:59:59 + switchToSDDay 日期串与秒数不匹配播实时。
 //   改为 sec-((sec+28800)%86400)（v1.19 兜底式，正确统一处理凌晨与晚上）。
+// v1.28：① camera 可能异步加载未就绪 → 首次点击"不跳转"，加 1.2s 延迟重试一次；
+//   ② switchToSDDay 后事件列表异步拉取，等待 1.5s→2.5s 减少偶发"当前时间无录像"。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）→
@@ -353,8 +355,11 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         @try {
             [self setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"];
         } @catch (NSException *e) {}
-        // 事件列表加载是异步的（网络拉取），等 1.5s 后再建流定位
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+        // 事件列表加载是异步的（网络拉取），等 2.5s 后再建流定位。
+        // v1.28：1.5s→2.5s —— switchToSDDay 切日（尤其跨天场景 10-19）后官方要重新
+        // 网络拉取该日事件列表，网络稍慢时 1.5s 内列表未到 → startSDPlay 定位时官方
+        // 找不到该时间点录像 → 偶发"当前时间无录像"。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
             SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
@@ -411,6 +416,9 @@ static BOOL JADebounce(UIViewController *detailVC) {
 }
 
 // 原 selector：clickCloudRecordAction:（点「看录像」按钮，官方原逻辑弹云存储）
+// v1.28：camera 可能异步加载未就绪（详情页 myCamera 未挂/设备列表未拉到）→
+// 首次点击找不到 camera 会"不跳转"，用户需再点一次。改为延迟 1.2s 重试一次，
+// 仍找不到才恢复官方逻辑。
 static void ja_clickCloudRecordAction(id self, SEL _cmd, id sender) {
     if (JADebounce(self)) return;
     NSString *src = nil;
@@ -420,12 +428,31 @@ static void ja_clickCloudRecordAction(id self, SEL _cmd, id sender) {
         JATryOpenSDReplay(self, warn, cam);
         g_lastDetailVC = (__bridge void *)self;
         g_lastPushTime = [NSDate timeIntervalSinceReferenceDate];
-    } else {
-        // 无可用 camera，恢复官方逻辑（保留云存储引导，防崩溃）
-        if (g_orig_clickCloudRecordAction) {
-            ((void(*)(id, SEL, id))g_orig_clickCloudRecordAction)(self, _cmd, sender);
-        }
+        return;
     }
+    // 设备对象未就绪：延迟 1.2s 重试（设备列表/详情页数据异步加载完成后再找一次）
+    __weak id weakSelf = self;
+    __weak id weakSender = sender;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        id strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (JADebounce(strongSelf)) return;
+        id warn2 = JAVal(strongSelf, @"warnInfoEntityModelEx");
+        NSString *src2 = nil;
+        id cam2 = JAFindCamera(strongSelf, warn2, &src2);
+        if (cam2) {
+            JATryOpenSDReplay(strongSelf, warn2, cam2);
+            g_lastDetailVC = (__bridge void *)strongSelf;
+            g_lastPushTime = [NSDate timeIntervalSinceReferenceDate];
+        } else {
+            // 仍找不到，恢复官方逻辑（保留云存储引导，防崩溃）
+            id sender2 = weakSender;
+            if (g_orig_clickCloudRecordAction) {
+                ((void(*)(id, SEL, id))g_orig_clickCloudRecordAction)(strongSelf, _cmd, sender2);
+            }
+        }
+    });
 }
 
 // 原 selector：handleJumpToOpenCloud —— 不再拦截，转发原实现
