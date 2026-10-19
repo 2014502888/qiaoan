@@ -305,6 +305,11 @@ static void JAHookLiveGates(void);   // v1.9：统一安装 JALiveManager 闸门
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
 static BOOL JASDHooked = NO;
 static BOOL JASDPlayerActive = NO;   // v1.10：我们的 SDPlayer 是否活跃（活跃期间 getter 开闸）
+// v1.11.1：当前活跃 SDPlayer 指针（纯 C 比较守卫，不向对象发消息）。
+// 修复闪退：回放页返回详情后再点看录像（第二次 push）时，官方 resp 回调可能携带
+// 已释放的旧 SDPlayer A → hook 对野指针 A 做偏移读 + 向残留值发消息 → SIGSEGV。
+// 所有 SDPlayer hook 开头先判 self==g_activeSDPlayer，不是就直接透传原实现。
+static id g_activeSDPlayer = nil;
 static IMP g_orig_sd_vwa = NULL;  // JANewSDPlayerViewController viewWillAppear: 原 IMP
 static IMP g_orig_sd_vda = NULL;  // JANewSDPlayerViewController viewDidAppear: 原 IMP
 static IMP g_orig_sd_vwd = NULL;  // v1.10：viewWillDisappear: 原 IMP
@@ -448,6 +453,7 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     UINavigationController *nav = detailVC.navigationController;
     if (!nav) nav = JATopVC().navigationController;
     if (nav) {
+        g_activeSDPlayer = vc;  // v1.11.1：登记当前活跃 SDPlayer（resp/seekTo hook 守卫用）
         [nav pushViewController:vc animated:YES];
         JASDPlayerActive = YES;  // v1.10：push 即标记 SD 回放活跃（getter 开闸兜底）
     JALog(@"已 push SDPlayer");
@@ -628,6 +634,9 @@ static void JAHookLiveGates(void) {
 
 // v1.10 兜底：官方消费链若仍不 seekTo，按反汇编事实（receiver = SDPlayer+0x28）直接定位。
 // v1.9 的 KVC/ivar 遍历全部落空 → 改为按偏移 0x28 直读对象（最可靠）。
+// v1.11.1：不再被调用（官方链已自证 seekTo，且偏移读在野指针 receiver 时会 SIGSEGV）。
+// 保留定义备查；标记 unused 避免编译警告。
+__attribute__((unused))
 static void JAFallbackSeek(id sdPlayer) {
     if (!sdPlayer) return;
     NSNumber *ts = JAVal(sdPlayer, @"currentTimeStamp");
@@ -667,6 +676,16 @@ static void JAFallbackSeek(id sdPlayer) {
 }
 
 static void ja_sd_respDeviceSdEventList(id self, SEL _cmd, id arg) {
+    // v1.11.1：守卫——resp 回调的 receiver 必须仍是当前活跃 SDPlayer。
+    // 实测闪退：返回详情后再点看录像（第二次 push），官方回调携带已释放的旧 SDPlayer，
+    // hook 对野指针做偏移读 + 向残留值(1792368000)发消息 → SIGSEGV。
+    // 指针比较是纯 C，不向对象发消息，绝对安全。
+    if (self != g_activeSDPlayer) {
+        JALog(@"[respDeviceSdEventList:] ⚠ receiver≠当前活跃SDPlayer（self=%p active=%p），直接透传原实现",
+              self, g_activeSDPlayer);
+        if (g_orig_sd_respEventList) ((void(*)(id, SEL, id))g_orig_sd_respEventList)(self, _cmd, arg);
+        return;
+    }
     // v1.10：标记 SD 回放活跃（getter 层开闸依赖此标志；JALiveManager 无单例，setter 方案已弃）
     JASDPlayerActive = YES;
     NSNumber *ts = JAVal(self, @"currentTimeStamp");
@@ -693,12 +712,18 @@ static void ja_sd_respDeviceSdEventList(id self, SEL _cmd, id arg) {
         JALog(@"  字典 keys=%@", [arg allKeys]);
     }
     if (g_orig_sd_respEventList) ((void(*)(id, SEL, id))g_orig_sd_respEventList)(self, _cmd, arg);
-    // v1.9：原实现执行后（消费链可能因闸门/分支未 seekTo），强制兜底定位
-    JAFallbackSeek(self);
+    // v1.11.1：不再调用 JAFallbackSeek —— v1.10 已证明官方消费链自己会 seekTo，
+    // 兜底对 self+0x28 偏移读在"receiver=已释放旧SDPlayer"时会向残留值发消息 → SIGSEGV。
+    // （兜底从未成功定位过：+0x28 实测是 UINavigationItem，KVC 全空，纯风险无收益）
 }
 
 // v1.8 诊断：官方按时间戳在 eventList 里找事件（respDeviceSdEventList: 消费链关键一步）
+// v1.11.1：守卫——receiver 必须仍是当前活跃 SDPlayer（防官方回调已释放旧实例）
 static id ja_sd_getCurrentEventWithTimeStamp(id self, SEL _cmd, long long ts) {
+    if (self != g_activeSDPlayer) {
+        if (g_orig_getCurrentEvent) return ((id(*)(id, SEL, long long))g_orig_getCurrentEvent)(self, _cmd, ts);
+        return nil;
+    }
     id ret = g_orig_getCurrentEvent
         ? ((id(*)(id, SEL, long long))g_orig_getCurrentEvent)(self, _cmd, ts)
         : nil;
@@ -722,7 +747,12 @@ static id ja_sd_getCurrentEventWithTimeStamp(id self, SEL _cmd, long long ts) {
 }
 
 // v1.8 诊断：seekTo:duration: —— 定位播放是否执行（官方消费链最后一步）
+// v1.11.1：守卫——receiver 必须仍是当前活跃 SDPlayer（防官方回调已释放旧实例）
 static void ja_sd_seekTo_duration(id self, SEL _cmd, long long sec, double dur) {
+    if (self != g_activeSDPlayer) {
+        if (g_orig_seekTo) ((void(*)(id, SEL, long long, double))g_orig_seekTo)(self, _cmd, sec, dur);
+        return;
+    }
     JALog(@"[seekTo:duration:] sec=%lld duration=%.1f (定位执行 ✓)", sec, dur);
     if (g_orig_seekTo) ((void(*)(id, SEL, long long, double))g_orig_seekTo)(self, _cmd, sec, dur);
 }
@@ -769,6 +799,13 @@ static void ja_vm_seekTo_duration(id self, SEL _cmd, long long sec, long long du
 // 反汇编 0x100b77360：[self+0x28 noneVideoViewIsShow:1 dayEnd:0]（receiver 实际挂 SDPlayer）
 // 打印调用时刻、参数（dayStart/dayEnd）与当前 currentTimeStamp，判断是"无录像数据"还是"播放未起"
 static void ja_sd_noneVideoViewIsShow(id self, SEL _cmd, long long dayStart, long long dayEnd) {
+    // v1.11.1：守卫——非当前活跃 SDPlayer 直接透传（防野指针 receiver）
+    if (self != g_activeSDPlayer) {
+        if (g_orig_noneVideoViewIsShow) {
+            ((void(*)(id, SEL, long long, long long))g_orig_noneVideoViewIsShow)(self, _cmd, dayStart, dayEnd);
+        }
+        return;
+    }
     NSNumber *ts = JAVal(self, @"currentTimeStamp");
     JALog(@"[noneVideoViewIsShow:dayEnd:] dayStart=%lld dayEnd=%lld currentTimeStamp=%@ (⚠ 当前时间无录像提示)",
           dayStart, dayEnd, ts);
@@ -780,6 +817,11 @@ static void ja_sd_noneVideoViewIsShow(id self, SEL _cmd, long long dayStart, lon
 // v1.11 诊断：respDeviceSDPlayerStatus: —— SD 播放器状态回调（播放是否真正启动/切源）
 // 打印 arg 内容，判断 seekTo 后官方是否发起 SD 录像播放、还是仍在实时流
 static void ja_sd_respDeviceSDPlayerStatus(id self, SEL _cmd, id arg) {
+    // v1.11.1：守卫——非当前活跃 SDPlayer 直接透传（防野指针 receiver）
+    if (self != g_activeSDPlayer) {
+        if (g_orig_respSDPlayerStatus) ((void(*)(id, SEL, id))g_orig_respSDPlayerStatus)(self, _cmd, arg);
+        return;
+    }
     JALog(@"[respDeviceSDPlayerStatus:] arg=%@ class=%@",
           arg, arg ? NSStringFromClass([arg class]) : @"nil");
     if (g_orig_respSDPlayerStatus) ((void(*)(id, SEL, id))g_orig_respSDPlayerStatus)(self, _cmd, arg);
@@ -790,6 +832,11 @@ static void ja_sd_respDeviceSDPlayerStatus(id self, SEL _cmd, id arg) {
 // （不拉列表）→ 时间戳永远没机会被消费。这里强制设 = 报警日 0 点秒，
 // 官方 viewDidAppear 就会走 getEventListWithSelectiontDay: 主动拉对应日期事件列表。
 static void ja_sd_viewWillAppear(id self, SEL _cmd) {
+    // v1.11.1：守卫——只有当前活跃 SDPlayer 才做强制重载（防官方回调已释放旧实例）
+    if (self != g_activeSDPlayer) {
+        if (g_orig_sd_vwa) ((void(*)(id, SEL))g_orig_sd_vwa)(self, _cmd);
+        return;
+    }
     JASDPlayerActive = YES;  // v1.10：进入 SD 回放 → getter 层开闸
     if (g_orig_sd_vwa) ((void(*)(id, SEL))g_orig_sd_vwa)(self, _cmd);
     NSNumber *ts = JAVal(self, @"currentTimeStamp");
@@ -810,9 +857,12 @@ static void ja_sd_viewWillAppear(id self, SEL _cmd) {
 }
 
 // v1.10：离开 SD 回放 → 关闭闸门强制（getter 恢复透传，避免影响官方其他页面）
+// v1.11.1：若离开的是当前活跃 SDPlayer，同步清空守卫指针（防官方回调旧实例野指针）
 static void ja_sd_viewWillDisappear(id self, SEL _cmd) {
+    if (self == g_activeSDPlayer) g_activeSDPlayer = nil;
     JASDPlayerActive = NO;
-    JALog(@"SDPlayer viewWillDisappear: 关闭闸门强制（JASDPlayerActive=NO）");
+    JALog(@"SDPlayer viewWillDisappear: 关闭闸门强制（JASDPlayerActive=NO, g_activeSDPlayer=%@）",
+          g_activeSDPlayer ? NSStringFromClass([g_activeSDPlayer class]) : @"nil");
     if (g_orig_sd_vwd) ((void(*)(id, SEL))g_orig_sd_vwd)(self, _cmd);
 }
 
@@ -820,6 +870,11 @@ static void ja_sd_viewWillDisappear(id self, SEL _cmd) {
 // 官方 viewDidAppear 里 getEventListWithSelectiontDay: 在建链刚发起时调用，
 // 设备可能尚未连上（拉取失败/丢弃）。3s 后设备通常已连接，补拉一次兜底。
 static void ja_sd_viewDidAppear(id self, SEL _cmd) {
+    // v1.11.1：守卫——只有当前活跃 SDPlayer 才做补拉（防官方回调已释放旧实例）
+    if (self != g_activeSDPlayer) {
+        if (g_orig_sd_vda) ((void(*)(id, SEL))g_orig_sd_vda)(self, _cmd);
+        return;
+    }
     if (g_orig_sd_vda) ((void(*)(id, SEL))g_orig_sd_vda)(self, _cmd);
     NSNumber *ts = JAVal(self, @"currentTimeStamp");
     long long dayStart = JADayStartSec(ts);
