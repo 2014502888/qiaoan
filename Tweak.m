@@ -10,6 +10,11 @@
 // v1.29：App 杀死重进后官方 viewDidLoad/viewDidAppear 自动恢复上次回放位置并自动播
 //   实时 → 三段乱跳（上次时间→实时→定位）。viewDidAppear 后 0.5s 先 stopSDPlay
 //   停官方自动流，再走 3.0s 定位链路。
+// v1.30：① 预停提前到 viewDidLoad 后 0.3s（官方在 viewDidLoad 阶段即恢复上次位置并
+//   开播渲染，0.5s 预停太晚，三段切换仍可见）→ 压到不可见；
+//   ② 返回停流：viewDidDisappear 后 0.3s stopSDPlay（官方 pop 返回不主动停流，后台
+//   一直拉流 + 持久化播放状态 → 下次进入先恢复上次时间继续播）→ 清 g_activeSDPlayer。
+//   用 viewDidDisappear 避开 v1.21 viewWillDisappear 的 pop 过渡期停流冲突（双流交替）。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）→
@@ -252,8 +257,10 @@ static void JATimeLineSyncToSec(id sdVC, long long sec);
 
 // v1.15：当前活跃 RTC SD 播放器指针（纯 C 比较守卫，不向对象发消息）
 static id g_activeSDPlayer = nil;
-static BOOL g_rtcHooked = NO;        // JANewRtcSDPlayViewController viewDidAppear hook 已装
+static BOOL g_rtcHooked = NO;        // JANewRtcSDPlayViewController hook 已装
+static IMP g_orig_rtc_vdl = NULL;    // 原 viewDidLoad: IMP（v1.30 预停官方自动流）
 static IMP g_orig_rtc_vda = NULL;    // 原 viewDidAppear: IMP
+static IMP g_orig_rtc_vdd = NULL;    // 原 viewDidDisappear: IMP（v1.30 返回停流）
 static long long g_rtcTargetSec = 0; // 报警时间戳（秒），viewDidAppear 后自动定位播放
 // v1.20：viewDidAppear 世代去重（官方可能多次触发 → 只保留最后一次的 3.0s 定位）
 static unsigned long long g_rtcVdaGen = 0;
@@ -263,9 +270,11 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     // 时间轴/日历/SD 卡检测/播放控制；用户手动进本地回放看到的就是它）。
     Class cls = NSClassFromString(@"JANewRtcSDPlayViewController");
     if (!cls) return;
-    // RTC viewDidAppear hook 补装（类晚加载/轮询错过场景兜底）
+    // RTC viewDidLoad/viewDidAppear/viewDidDisappear hook 补装（类晚加载/轮询错过场景兜底）
     if (!g_rtcHooked) {
+        JASetImp(cls, @selector(viewDidLoad), (IMP)ja_rtc_viewDidLoad, &g_orig_rtc_vdl);
         JASetImp(cls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
+        JASetImp(cls, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
         g_rtcHooked = YES;
     }
     id vc = [[cls alloc] init];
@@ -310,6 +319,24 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
 
 static IMP g_orig_clickCloudRecordAction = NULL;
 static IMP g_orig_handleJumpToOpenCloud = NULL;
+
+// v1.30：viewDidLoad 后 0.3s 先停官方自动流 —— 官方在 viewDidLoad/setupData 阶段就
+// 恢复上次回放位置并开始建流渲染（秒数持续叠加），viewDidAppear 0.5s 预停太晚，
+// 三段切换仍可见。这里提前到 viewDidLoad 后 0.3s 停，把"上次画面"段压到不可见；
+// viewDidAppear 0.5s 与 3.0s 的 stopSDPlay 保留作层层兜底（幂等）。
+static void ja_rtc_viewDidLoad(id self, SEL _cmd) {
+    if (g_orig_rtc_vdl) ((void(*)(id, SEL))g_orig_rtc_vdl)(self, _cmd);
+    if (self != g_activeSDPlayer) return;
+    if (g_rtcTargetSec < 1000000000LL) return;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (self != g_activeSDPlayer) return;
+        SEL st = NSSelectorFromString(@"stopSDPlay");
+        if ([self respondsToSelector:st]) {
+            ((void(*)(id, SEL))objc_msgSend)(self, st);
+        }
+    });
+}
 
 // v1.15 核心：JANewRtcSDPlayViewController viewDidAppear（官方本地 SD 回放界面）
 // 官方 viewDidLoad/setupData 已自动：setMyCamera 到 sharedInstance、setIsSDPlayer:YES、
@@ -477,6 +504,24 @@ static void ja_handleJumpToOpenCloud(id self, SEL _cmd) {
     }
 }
 
+// v1.30：viewDidDisappear 后 0.3s 停流 —— 用户按返回时官方不主动停流，SD 回放流
+// 继续在后台拉数据（状态栏流量一直跑），官方还会把"播放中"状态持久化，导致下次
+// 进入先恢复上次时间继续播（秒数叠加）。用 viewDidDisappear（pop 动画结束后再停）
+// 避开 v1.21 曾用的 viewWillDisappear（pop 过渡期停流不干净 + 官方清理叠加 → 旧流
+// 残留与新流并存交替渲染）。停流后清活跃标记，阻断旧闭包继续执行。
+static void ja_rtc_viewDidDisappear(id self, SEL _cmd) {
+    if (g_orig_rtc_vdd) ((void(*)(id, SEL))g_orig_rtc_vdd)(self, _cmd);
+    if (self != g_activeSDPlayer) return;
+    g_activeSDPlayer = nil;  // 先清标记：后续 viewDidAppear/定位闭包不再执行
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        SEL st = NSSelectorFromString(@"stopSDPlay");
+        if ([self respondsToSelector:st]) {
+            ((void(*)(id, SEL))objc_msgSend)(self, st);
+        }
+    });
+}
+
 // ---------- hook 安装 ----------
 
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved) {
@@ -502,11 +547,14 @@ static void JAHook(void) {
             JAHooked = YES;
         }
     }
-    // RTC SD 播放器 viewDidAppear hook（自动定位报警时间，类可能晚加载，轮询重试）
+    // RTC SD 播放器 hooks（viewDidLoad 预停自动流 / viewDidAppear 自动定位 /
+    // viewDidDisappear 返回停流；类可能晚加载，轮询重试）
     if (!g_rtcHooked) {
         Class rtcCls = NSClassFromString(@"JANewRtcSDPlayViewController");
         if (rtcCls) {
+            JASetImp(rtcCls, @selector(viewDidLoad), (IMP)ja_rtc_viewDidLoad, &g_orig_rtc_vdl);
             JASetImp(rtcCls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
+            JASetImp(rtcCls, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
             g_rtcHooked = YES;
         }
     }
