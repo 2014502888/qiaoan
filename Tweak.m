@@ -313,6 +313,7 @@ static long long JADayStartSec(NSNumber *ts) {
 // 前置声明（实现位于下方 hook 区，JATryOpenSDReplay 需提前引用）
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
 static void ja_rtc_viewDidAppear(id self, SEL _cmd);
+static void ja_rtc_viewWillDisappear(id self, SEL _cmd, BOOL animated);
 static void ja_rtc_respFirstFrame(id self, SEL _cmd, long long ts);
 static void JATimeLineSyncToSec(id sdVC, long long sec);
 
@@ -326,6 +327,10 @@ static BOOL g_rtcFirstFrameHooked = NO;  // respDeviceFirstFrameTimeStamp: hook 
 static IMP g_orig_rtc_firstframe = NULL; // 原 respDeviceFirstFrameTimeStamp: IMP（数值签名）
 static BOOL g_rtcLocated = NO;           // 首帧已确认定位到报警时间点
 static int  g_rtcRetryCount = 0;         // 重试次数（最多 3 次）
+// v1.20：离开回放页时停官方 SD 播放（stopSDPlay）释放底层流 → 下次进入重新建流定位；
+// viewDidAppear 去重（官方可能多次触发 viewDidAppear → 只保留最后一次的 3.0s 定位）。
+static IMP g_orig_rtc_vwd = NULL;              // 原 viewWillDisappear: IMP
+static unsigned long long g_rtcVdaGen = 0;     // viewDidAppear 世代计数（去重）
 
 static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     JALog(@"--- JATryOpenSDReplay (camera=%@ class=%@ uid=%@) ---",
@@ -340,6 +345,7 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     // RTC viewDidAppear hook 补装（类晚加载/轮询错过场景兜底）
     if (!g_rtcHooked) {
         JASetImp(cls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
+        JASetImp(cls, @selector(viewWillDisappear:), (IMP)ja_rtc_viewWillDisappear, &g_orig_rtc_vwd);
         g_rtcHooked = YES;
     }
     // v1.17：respDeviceFirstFrameTimeStamp: hook 补装（数值签名 (id,SEL,long long)，
@@ -483,11 +489,14 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     // 重置 v1.17 重试状态（每次进入页面重新开始）
     g_rtcLocated = NO;
     g_rtcRetryCount = 0;
-    JALog(@"[RTC-SD viewDidAppear] 官方展示完成，3.0s 后自动 startSDPlayWithSelectTimeStamp: %lld", sec);
+    // v1.20：世代去重 —— 官方可能多次触发 viewDidAppear（(5).log 首次进入触发 3 次，
+    // 每次都生成 3.0s 定位 → 建流/seek 竞争导致后续进入播最新），只保留最后一次生效
+    unsigned long long myGen = ++g_rtcVdaGen;
+    JALog(@"[RTC-SD viewDidAppear] 官方展示完成，3.0s 后自动 startSDPlayWithSelectTimeStamp: %lld (gen=%llu)", sec, myGen);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        if (self != g_activeSDPlayer) {
-            JALog(@"[RTC-SD] 延迟触发时已离开页面，跳过");
+        if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) {
+            JALog(@"[RTC-SD] 延迟触发时已离开页面/已有更新触发（gen=%llu vs %llu），跳过", myGen, g_rtcVdaGen);
             return;
         }
         JALog(@"[RTC-SD] 调 startSDPlayWithSelectTimeStamp: %lld（直达报警时间点）", sec);
@@ -500,13 +509,32 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         // v1.18：播放定位已发出，再等 1.0s 拨时间轴指示器到报警时间点
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            if (self != g_activeSDPlayer) {
-                JALog(@"[RTC-SD] 拨时间轴时已离开页面，跳过");
+            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) {
+                JALog(@"[RTC-SD] 拨时间轴时已离开页面/已有更新触发，跳过");
                 return;
             }
             JATimeLineSyncToSec(self, sec);
         });
     });
+}
+
+// v1.20：离开回放页时停官方 SD 播放 → 释放底层流。
+// 背景：第二次起偶发"定位不生效、直接播最新"——底层 JALiveManager 流被复用，
+// startSDPlayWithSelectTimeStamp: 走 seekSDPlay 分支有前置闸门（0x103429ee0 bit0），
+// 复用场景闸门不过 → seek 被跳过 → 播最新。修法：每次离开页把流停掉，
+// 下次进入官方像第一次一样全新建流定位（startSDPlay 分支），可靠跳到报警时间点。
+static void ja_rtc_viewWillDisappear(id self, SEL _cmd, BOOL animated) {
+    if (g_orig_rtc_vwd) ((void(*)(id, SEL, BOOL))g_orig_rtc_vwd)(self, _cmd, animated);
+    if (self == g_activeSDPlayer) {
+        SEL s = NSSelectorFromString(@"stopSDPlay");
+        if ([self respondsToSelector:s]) {
+            JALog(@"[RTC-SD] viewWillDisappear: 调官方 stopSDPlay（释放底层流，下次进入重新建流）");
+            ((void(*)(id, SEL))objc_msgSend)(self, s);
+        } else {
+            JALog(@"!! viewWillDisappear: RTC-SD 无 stopSDPlay 方法");
+        }
+        g_activeSDPlayer = nil;
+    }
 }
 
 // v1.18：把官方时间轴指示器/滚动位置/时间标签同步到指定秒。
@@ -672,8 +700,10 @@ static void JAHook(void) {
         Class rtcCls = NSClassFromString(@"JANewRtcSDPlayViewController");
         if (rtcCls) {
             JASetImp(rtcCls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
+            // v1.20：viewWillDisappear hook —— 离开时 stopSDPlay 释放底层流
+            JASetImp(rtcCls, @selector(viewWillDisappear:), (IMP)ja_rtc_viewWillDisappear, &g_orig_rtc_vwd);
             g_rtcHooked = YES;
-            JALog(@"RTC-SD viewDidAppear hook 已装（轮询补装）");
+            JALog(@"RTC-SD viewDidAppear/viewWillDisappear hook 已装（轮询补装）");
         } else {
             JALog(@"!! JANewRtcSDPlayViewController 尚未加载（轮询重试）");
         }
@@ -693,7 +723,7 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.19 injected");
+    JALog(@"JoolinkSDReplay v1.20 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
