@@ -1,32 +1,36 @@
 // JoolinkSDReplay — 乔安智联 4.4.67 报警消息 → 直达本地 SD 卡录像
-// v1.14 崩溃根治 + 建流全开（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
+// v1.15 换对界面：官方本地 SD 回放 = JANewRtcSDPlayViewController（RTC 完整播放器）
+// （TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
 //
-// v1.14 崩溃根因（IPS 124424 定案）：
+// v1.15 定案（用户实测 + 二进制方法列表 + 反汇编）：
+//   用户手动进本地回放看到的界面（时间轴拖条/日历选日/SD 卡容量/变速/录音）
+//   = JANewRtcSDPlayViewController（321 个方法：timeLineView、calendarPopViewHelper、
+//   switchToSDDay:dateString:、getSDCapcity、startSDPlayWithSelectTimeStamp:、
+//   startPlay/pausePlay/changeSDPlaySpeed:、respDeviceSDPlayerStatus:、
+//   respDeviceFirstFrameTimeStamp:、seekTo:duration:、noneVideoViewIsShow:dayEnd:）。
+//   之前 push 的 JANewSDPlayerViewController 是另一播放器（旧版/云回放共用），
+//   界面完全不同 → 黑屏。v1.15 换目标：clickCloudRecordAction → push RTC SD 播放器。
+// 初始化（反汇编 viewDidLoad 0x100af4498 定案）：
+//   viewDidLoad 自动：JADevicePlatform.sharedInstance setMyCamera:self.myCamera、
+//   setIsSDPlayer:YES、创建 viewModel、setupUI —— 只需喂 myCamera + currentTimeStamp。
+//   myCamera 无公开 setter（getter stub=0x103462da0）→ 用 KVC [vc setValue:cam forKey:@"myCamera"]。
+// 自动定位（反汇编 startSDPlayWithSelectTimeStamp: 0x100b07b0c 定案）：
+//   startSDPlayWithSelectTimeStamp:sec → viewModel startSDPlayShowWithSelectTimeStamp:sec
+//   → 官方建流播放并定位到 sec。本版 hook viewDidAppear，官方完成后延迟 0.4s
+//   调 startSDPlayWithSelectTimeStamp:（报警时间戳）→ 直达报警时间点。
+// 闸门：RTC 版是官方完整播放器，官方链自己建流 → JASDPlayerActive 全程 NO，
+//   isEnterBackPlayer/isStarBackPlayer/detectType 强制全关，不干扰官方逻辑。
+//
+// v1.14 崩溃根治（IPS 124424 定案，保留）：
 //   respDeviceSDPlayerStatus:（0x100b75ecc）与 respDeviceFirstFrameTimeStamp:（0x100b77d64）
-//   的参数【不是对象】而是数值：
-//     respDeviceSDPlayerStatus: 内部 cmp w20,#0x21 + 跳表 → 参数是 int 状态码（32 = 某播放状态）
-//     respDeviceFirstFrameTimeStamp: 内部 x2 直接传下游 → 参数是 long long 时间戳
-//   v1.11 起 hook 用了 (id, SEL, id) 签名，把数值 32 当对象指针发 [arg class] → SIGSEGV
-//   （IPS: rawCodes=[1,32]、PC=0x10b4492E8 = 本 dylib respDeviceSDPlayerStatus hook +0x44）。
-//   v1.14 修正两个回调签名为数值型，不再向参数发消息。
-// v1.14 建流全开（反汇编定案）：
-//   MYP2PChannel selectTimeStamp:（0x100c7fa20）isStarBackPlayer==1 走"播放中定位"路径
-//   （不调 p2p_starPlayBack → 永不建流）；==0 才走 setSelectTimeStamp + p2p_starPlayBack。
-//   本版 hook JALiveManager.isStarBackPlayer getter：建流前（!g_startReplaySent）强制返回 0，
-//   让官方进入建流路径；建流后透传真实值（播放中 seek 定位路径恢复）。
+//   参数【不是对象】而是数值（respDeviceSDPlayerStatus 内部 cmp w20,#0x21 + 跳表 = int 状态码）。
+//   旧签名 (id, SEL, id) 把 32 当对象指针发 [arg class] → SIGSEGV（PC=hook+0x44）。
+//   v1.14 起两个 hook 按数值打印，不再向参数发消息。
 //
-// v1.13 根因（已并入本版修复，反汇编定案）：
+// v1.13 根因（已并入，保留备查）：
 //   seekTo 已命中但播放不启动 —— 官方 SD 回放必须先【建流】再【定位】：
-//   seekTo:duration:(0x100b78338) → live selectTimeStamp:(0x100c88bd0)
-//     → MYP2PChannel selectTimeStamp:(0x100c7fa20)
-//     → MYP2PChannel p2p_starPlayBack(0x100c7feac)：
-//         分支1（建流）：live.isEnterBackPlayer==0 且 isStarBackPlayer==0
-//                        → liveServce startReplay:selectTimeStamp:complete:（建流指令）
-//         分支2（定位）：否则 → seekReplay:selectTimeStamp:complete:（仅 seek，无流可 seek）
-//   v1.10 强制 isEnterBackPlayer=1 → p2p_starPlayBack 永远走分支2 → 只 seek 不建流 → 设备无回放回调。
-//   v1.13/v1.14 修复：hook p2p_starPlayBack —— 首次临时放开 isEnterBackPlayer 强制
-//   （getter 透传真实值 0）→ 官方原 IMP 走 startReplay 建流分支（自带 [cam selectTimeStamp]
-//   = 报警时间，设备直接从报警时间起播）；建流后恢复强制，后续 seek 走 seekReplay 定位。
+//   MYP2PChannel p2p_starPlayBack(0x100c7feac)：isEnterBackPlayer==0 且 isStarBackPlayer==0
+//   → startReplay 建流；否则 seekReplay 仅定位。旧版强制 isEnterBackPlayer=1 → 只 seek 不建流。
 //
 // 实测问题链：
 //   v1：闪退（设备对象未传入，JALiveManager.myCamera=nil → MYOpenSDK 异常）
@@ -335,8 +339,15 @@ static void ja_sd_respFirstFrame(id self, SEL _cmd, long long ts); // v1.13/v1.1
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
 static void JASDInstallHooks(void);   // v1.13：统一安装 SDPlayer 生命周期/消费链 hook
 static void JAHookP2PChannel(void);   // v1.13：MYP2PChannel p2p_starPlayBack hook（类晚加载幂等）
+static void ja_rtc_viewDidAppear(id self, SEL _cmd);  // v1.15：RTC SD 播放器 viewDidAppear（官方后自动定位报警时间）
 static BOOL JASDHooked = NO;
 static BOOL JASDPlayerActive = NO;   // v1.10：我们的 SDPlayer 是否活跃（活跃期间 getter 开闸）
+// v1.15：目标界面改为官方本地 SD 回放 JANewRtcSDPlayViewController（时间轴/日历/播放控制）。
+// RTC 版是官方完整播放器，viewDidLoad 自动 setMyCamera/setIsSDPlayer/建 viewModel，
+// 官方链自己建流播放 → JASDPlayerActive 全程 NO（闸门强制全关，不干扰官方逻辑）。
+static BOOL g_rtcHooked = NO;        // v1.15：RTC SD 播放器 hook 已装
+static IMP g_orig_rtc_vda = NULL;    // v1.15：JANewRtcSDPlayViewController viewDidAppear: 原 IMP
+static long long g_rtcTargetSec = 0; // v1.15：报警时间戳（秒），viewDidAppear 后自动定位播放
 // v1.11.1：当前活跃 SDPlayer 指针（纯 C 比较守卫，不向对象发消息）。
 // 修复闪退：回放页返回详情后再点看录像（第二次 push）时，官方 resp 回调可能携带
 // 已释放的旧 SDPlayer A → hook 对野指针 A 做偏移读 + 向残留值发消息 → SIGSEGV。
@@ -382,9 +393,11 @@ static long long JADayStartSec(NSNumber *ts) {
 static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     JALog(@"--- JATryOpenSDReplay (camera=%@ class=%@ uid=%@) ---",
           cam, cam ? NSStringFromClass([cam class]) : @"nil", JAVal(cam, @"uid"));
-    Class cls = NSClassFromString(@"JANewSDPlayerViewController");
+    // v1.15：目标界面 = 官方本地 SD 回放 JANewRtcSDPlayViewController（RTC 完整播放器，
+    // 时间轴/日历/SD 卡检测/播放控制；用户手动进本地回放看到的就是它）。
+    Class cls = NSClassFromString(@"JANewRtcSDPlayViewController");
     if (!cls) {
-        JALog(@"!! JANewSDPlayerViewController 类不存在");
+        JALog(@"!! JANewRtcSDPlayViewController 类不存在");
         return;
     }
     // v1.5：类此刻已加载（NSClassFromString 触发），若启动轮询错过（15s 内未点入），
@@ -393,19 +406,28 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
         JASDInstallHooks();
         JALog(@"点看录像时补装 SDPlayer 生命周期 hook（轮询错过场景兜底）");
     }
-    // v1.13：p2p_starPlayBack 建流 hook 无条件补装（幂等）——MYP2PChannel 可能晚于
-    // 启动轮询窗口加载，若不补装则建流修复不生效
+    // v1.13：p2p_starPlayBack 建流 hook 无条件补装（幂等）——保留（RTC 场景 JASDPlayerActive=NO 时透传，无副作用）
     JAHookP2PChannel();
+    // v1.15：RTC viewDidAppear hook 补装（自动定位报警时间）
+    if (!g_rtcHooked) {
+        Class rtcCls = NSClassFromString(@"JANewRtcSDPlayViewController");
+        if (rtcCls) {
+            JASetImp(rtcCls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
+            g_rtcHooked = YES;
+        }
+    }
     id vc = [[cls alloc] init];
-    JALog(@"已创建 SDPlayer: %@ class=%@", vc, NSStringFromClass([vc class]));
+    JALog(@"已创建 SDPlayer(RTC): %@ class=%@", vc, NSStringFromClass([vc class]));
 
-    // 1) 官方配置：setMyCamera:（崩溃修复关键）
+    // 1) v1.15：myCamera 用 KVC（RTC 版无 setMyCamera: 公开方法，performSelector 会崩）。
+    // 官方 viewDidLoad 会自己读 self.myCamera → setMyCamera: 到 JADevicePlatform.sharedInstance
+    //（0x100af461c 定案），这里只需把 camera 挂到 VC 上。
     @try {
-        [vc performSelector:NSSelectorFromString(@"setMyCamera:") withObject:cam];
+        [vc setValue:cam forKey:@"myCamera"];
         id chk = [vc valueForKey:@"myCamera"];
-        JALog(@"setMyCamera 后 SDPlayer.myCamera=%@ uid=%@", chk, JAVal(chk, @"uid"));
+        JALog(@"setMyCamera(KVC) 后 RTC.myCamera=%@ uid=%@", chk, JAVal(chk, @"uid"));
     } @catch (NSException *e) {
-        JALog(@"!! setMyCamera 异常: %@", e);
+        JALog(@"!! setValue myCamera 异常: %@", e);
     }
 
     // 2) 同步 JALiveManager 单例（delegateCamera:/connectionDevice 内部从它取 myCamera）
@@ -425,7 +447,6 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
         }
         if (!lm) {
             JALog(@"!! JALiveManager 单例未找到（%lu 个 common 名均无响应）", (unsigned long)sels.count);
-            // v1.6 诊断：打印类方法列表，定位真正单例名（下次对齐）
             unsigned int mc = 0;
             Method *methods = class_copyMethodList(object_getClass(lmCls), &mc);
             JALog(@"JALiveManager 类方法共 %u 个：", mc);
@@ -455,11 +476,10 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
         JALog(@"currentTimeStamp=%@ (%lld 秒 → %@)", ts, tv,
               tv >= 1000000000LL && tv < 10000000000LL
               ? @"秒级 ✓" : @"⚠ 非秒级！");
-        // v1.5：补设设备 SD 选中日期 = 报警日 0 点秒（UTC 语义，非 0 值）
-        // 官方 respDeviceSdEventList: 定位偏移 = currentTimeStamp - sdSelectiontDay；
-        // 且官方 viewWillAppear 的 pendingReload 判定在 sdSelectiontDay==0 时直接置 0
-        // （不拉列表）—— 这里先给非 0 值打底（后续 viewWillAppear 会无条件覆盖为今天，
-        // 我们的 hook 再强制 pendingReload=报警日 0 点）。
+        // v1.15：记录报警时间戳（秒），RTC viewDidAppear 后自动 startSDPlayWithSelectTimeStamp:
+        if (tv >= 1000000000LL && tv < 10000000000LL) g_rtcTargetSec = tv;
+        // v1.5：补设设备 SD 选中日期 = 报警日 0 点秒 —— RTC setupData（0x100af6104）会
+        // 读 myCamera.sdSelectiontDay → setCurrentSelectedSDDay:（选中日）→ 加载该日事件列表
         long long dayStart = JADayStartSec(ts);
         if (dayStart > 0 && cam) {
             JASet(cam, @"sdSelectiontDay", @(dayStart));
@@ -467,13 +487,8 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
         }
         id evtList = JAVal(detailVC, @"warnInfoListArr");
         if (evtList) JASet(vc, @"eventList", evtList);
-        JALog(@"已设置 currentEvent/currentTimeStamp/eventList");
+        JALog(@"已设置 currentEvent/currentTimeStamp/eventList (RTC)");
     }
-
-    // v1.11 曾加 setIsSDPlayer:YES（push 前显式）—— 实测导致点看录像直接闪退
-    // （v1.11 crash: objc_msgSend ← dylib+0x59AC ← dispatch_after 补拉闭包, receiver=0x20）
-    // 提前调用改变了官方 viewDidLoad 初始化时序（v1.4 已确认官方 viewDidLoad 自会设），
-    // 移除恢复 v1.10 行为。setIsSDPlayer 交给官方 viewDidLoad 自己处理。
 
     // 4) push
     UINavigationController *nav = detailVC.navigationController;
@@ -481,8 +496,9 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     if (nav) {
         g_activeSDPlayer = vc;  // v1.11.1：登记当前活跃 SDPlayer（resp/seekTo hook 守卫用）
         [nav pushViewController:vc animated:YES];
-        JASDPlayerActive = YES;  // v1.10：push 即标记 SD 回放活跃（getter 开闸兜底）
-    JALog(@"已 push SDPlayer");
+        // v1.15：RTC 版是官方完整播放器，官方链自己建流 → 闸门强制保持关闭
+        JASDPlayerActive = NO;
+        JALog(@"已 push SDPlayer(RTC)（闸门强制关闭，由官方原生链播放）");
     } else {
         JALog(@"!! 无 navigationController，改为 present");
         [UIApplication.sharedApplication.keyWindow.rootViewController presentViewController:vc animated:YES completion:nil];
@@ -997,6 +1013,41 @@ static void ja_sd_viewDidAppear(id self, SEL _cmd) {
           JADayStartSec(JAVal(self, @"currentTimeStamp")));
 }
 
+// v1.15 核心：JANewRtcSDPlayViewController viewDidAppear（官方本地 SD 回放界面）
+// 官方 viewDidLoad/setupData 已自动：setMyCamera 到 sharedInstance、setIsSDPlayer:YES、
+// 建 viewModel、按 myCamera.sdSelectiontDay 设选中日、加载事件列表。
+// 本 hook：官方 viewDidAppear 完成后，延迟 0.4s 调 startSDPlayWithSelectTimeStamp:
+//（报警时间戳）→ viewModel startSDPlayShowWithSelectTimeStamp: → 官方建流播放并定位。
+// 延迟理由：官方 UI/连接初始化需要时间，过早调用可能被官方 viewDidAppear 自己的
+// 播放逻辑（默认今天当前时间）覆盖。g_rtcTargetSec 在 JATryOpenSDReplay 已记录。
+static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
+    if (g_orig_rtc_vda) ((void(*)(id, SEL))g_orig_rtc_vda)(self, _cmd);
+    if (self != g_activeSDPlayer) {
+        JALog(@"[RTC-SD viewDidAppear] 非当前活跃实例，跳过自动定位");
+        return;
+    }
+    long long sec = g_rtcTargetSec;
+    if (sec < 1000000000LL) {
+        JALog(@"[RTC-SD viewDidAppear] 无有效报警时间戳（%lld），跳过自动定位", sec);
+        return;
+    }
+    JALog(@"[RTC-SD viewDidAppear] 官方展示完成，0.4s 后自动 startSDPlayWithSelectTimeStamp: %lld", sec);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (self != g_activeSDPlayer) {
+            JALog(@"[RTC-SD] 延迟触发时已离开页面，跳过");
+            return;
+        }
+        JALog(@"[RTC-SD] 调 startSDPlayWithSelectTimeStamp: %lld（直达报警时间点）", sec);
+        SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
+        if ([self respondsToSelector:s]) {
+            ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
+        } else {
+            JALog(@"!! RTC-SD 无 startSDPlayWithSelectTimeStamp:");
+        }
+    });
+}
+
 // 防抖：同一详情页实例 2 秒内只 push 一次 SDPlayer（官方可能触发两次点击事件 → 双 push 闪烁）
 // 裸指针存地址，不持有对象
 static void *g_lastDetailVC = NULL;
@@ -1129,21 +1180,32 @@ static void JAHook(void) {
             JALog(@"!! MYP2PChannel 尚未加载（轮询重试）");
         }
     }
+    // v1.15：JANewRtcSDPlayViewController viewDidAppear hook（自动定位报警时间，类可能晚加载）
+    if (!g_rtcHooked) {
+        Class rtcCls = NSClassFromString(@"JANewRtcSDPlayViewController");
+        if (rtcCls) {
+            JASetImp(rtcCls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
+            g_rtcHooked = YES;
+            JALog(@"RTC-SD viewDidAppear hook 已装（轮询补装）");
+        } else {
+            JALog(@"!! JANewRtcSDPlayViewController 尚未加载（轮询重试）");
+        }
+    }
 }
 
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.14 injected");
+    JALog(@"JoolinkSDReplay v1.15 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
-        && NSClassFromString(@"JANewSDPlayerViewController")) {
+        && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
         return;
     }
     __block int tries = 0;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         // v1.13：轮询条件含 g_p2pHooked（MYP2PChannel 建流 hook 必须装上才停）
-        while (tries < 30 && !(JAHooked && JASDHooked && g_p2pHooked)) {
+        while (tries < 30 && !(JAHooked && JASDHooked && g_p2pHooked && g_rtcHooked)) {
             [NSThread sleepForTimeInterval:0.5];
             tries++;
             dispatch_async(dispatch_get_main_queue(), ^{ JAHook(); });
