@@ -499,7 +499,6 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
             JALog(@"[RTC-SD] 延迟触发时已离开页面/已有更新触发（gen=%llu vs %llu），跳过", myGen, g_rtcVdaGen);
             return;
         }
-        JALog(@"[RTC-SD] 调 startSDPlayWithSelectTimeStamp: %lld（直达报警时间点）", sec);
         // v1.21：先停官方 viewDidLoad 自动起的流（避免双流并存交替渲染），再建定位流。
         // 每次进入都"停旧→建新"，绕开复用流上 seekSDPlay 前置闸门（0x103429ee0 bit0）
         // 导致的"第二次起偶发定位不生效/播最新"。
@@ -508,20 +507,57 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
             JALog(@"[RTC-SD] 定位前先 stopSDPlay（停官方自动流，确保单流）");
             ((void(*)(id, SEL))objc_msgSend)(self, st);
         }
-        SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
-        if ([self respondsToSelector:s]) {
-            ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
+        // v1.22：跨天修正 —— 官方默认选中"今日"（过了 12 点后打开昨天报警 → 时间轴
+        // 按今日加载 → 卡 00:00、看不到昨天进度条）。进入后强设：
+        // ① setCurrentSelectedSDDay:(报警日0点) ② setCurrentDateStr:(报警日字符串)
+        // ③ loadDataFirstWithDate: 重新加载报警日事件（时间轴刷新），再建流定位。
+        long long dayStart = JADayStartSec(@(sec));
+        if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
+        SEL ssd = NSSelectorFromString(@"setCurrentSelectedSDDay:");
+        if ([self respondsToSelector:ssd]) {
+            ((void(*)(id, SEL, long long))objc_msgSend)(self, ssd, dayStart);
+            JALog(@"[RTC-SD] setCurrentSelectedSDDay: %lld（选中日=报警日，跨天修正）", dayStart);
         } else {
-            JALog(@"!! RTC-SD 无 startSDPlayWithSelectTimeStamp:");
+            JALog(@"!! RTC-SD 无 setCurrentSelectedSDDay:");
         }
-        // v1.18：播放定位已发出，再等 1.0s 拨时间轴指示器到报警时间点
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.dateFormat = @"yyyy-MM-dd";
+        NSString *ds = [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:sec]];
+        SEL scd = NSSelectorFromString(@"setCurrentDateStr:");
+        if ([self respondsToSelector:scd]) {
+            ((void(*)(id, SEL, id))objc_msgSend)(self, scd, ds);
+            JALog(@"[RTC-SD] setCurrentDateStr: %@（顶部日期=报警日）", ds);
+        }
+        SEL ldf = NSSelectorFromString(@"loadDataFirstWithDate:showHud:isTableRefresh:finish:");
+        if ([self respondsToSelector:ldf]) {
+            ((void(*)(id, SEL, id, BOOL, BOOL, id))objc_msgSend)(self, ldf, ds, (BOOL)NO, (BOOL)YES, nil);
+            JALog(@"[RTC-SD] loadDataFirstWithDate: %@（重新加载报警日事件 → 时间轴刷新）", ds);
+        } else {
+            JALog(@"!! RTC-SD 无 loadDataFirstWithDate:showHud:isTableRefresh:finish:");
+        }
+        // 事件列表加载是异步的（网络拉取），等 1.5s 后再建流定位
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) {
-                JALog(@"[RTC-SD] 拨时间轴时已离开页面/已有更新触发，跳过");
+                JALog(@"[RTC-SD] 建流延迟触发时已离开页面/已有更新触发，跳过");
                 return;
             }
-            JATimeLineSyncToSec(self, sec);
+            JALog(@"[RTC-SD] 调 startSDPlayWithSelectTimeStamp: %lld（直达报警时间点）", sec);
+            SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
+            if ([self respondsToSelector:s]) {
+                ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
+            } else {
+                JALog(@"!! RTC-SD 无 startSDPlayWithSelectTimeStamp:");
+            }
+            // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到报警时间点
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) {
+                    JALog(@"[RTC-SD] 拨时间轴时已离开页面/已有更新触发，跳过");
+                    return;
+                }
+                JATimeLineSyncToSec(self, sec);
+            });
         });
     });
 }
@@ -710,7 +746,7 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.21 injected");
+    JALog(@"JoolinkSDReplay v1.22 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
