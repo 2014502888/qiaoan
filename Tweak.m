@@ -1,5 +1,5 @@
 // JoolinkSDReplay — 乔安智联 4.4.67 报警消息 → 直达本地 SD 卡录像
-// v1.9 闸门修复版（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
+// v1.10 getter 开闸版（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
 //
 // 实测问题链：
 //   v1：闪退（设备对象未传入，JALiveManager.myCamera=nil → MYOpenSDK 异常）
@@ -299,12 +299,15 @@ static id ja_sd_getCurrentEventWithTimeStamp(id self, SEL _cmd, long long ts);  
 static void ja_sd_seekTo_duration(id self, SEL _cmd, long long sec, double dur);  // v1.8
 static long long ja_live_detectType(id self, SEL _cmd);              // v1.9 诊断：JALiveManager.detectType
 static long long ja_live_isEnterBackPlayer(id self, SEL _cmd);       // v1.9 诊断：JALiveManager.isEnterBackPlayer
+static void ja_sd_viewWillDisappear(id self, SEL _cmd);  // v1.10：离开 SD 回放时关闭闸门强制
 static void ja_vm_seekTo_duration(id self, SEL _cmd, long long sec, long long dur);  // v1.9：viewModel.seekTo:duration:
 static void JAHookLiveGates(void);   // v1.9：统一安装 JALiveManager 闸门 getter + viewModel seekTo hook（幂等）
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
 static BOOL JASDHooked = NO;
+static BOOL JASDPlayerActive = NO;   // v1.10：我们的 SDPlayer 是否活跃（活跃期间 getter 开闸）
 static IMP g_orig_sd_vwa = NULL;  // JANewSDPlayerViewController viewWillAppear: 原 IMP
 static IMP g_orig_sd_vda = NULL;  // JANewSDPlayerViewController viewDidAppear: 原 IMP
+static IMP g_orig_sd_vwd = NULL;  // v1.10：viewWillDisappear: 原 IMP
 static IMP g_orig_sd_respEventList = NULL;  // v1.6：respDeviceSdEventList: 原 IMP
 static IMP g_orig_getEventList = NULL;      // v1.6：getEventListWithSelectiontDay:detectionType: 原 IMP
 static IMP g_orig_getCurrentEvent = NULL;   // v1.8：getCurrentEventWithTimeStamp: 原 IMP
@@ -338,6 +341,7 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     if (!JASDHooked) {
         JASetImp(cls, @selector(viewWillAppear:), (IMP)ja_sd_viewWillAppear, &g_orig_sd_vwa);
         JASetImp(cls, @selector(viewDidAppear:), (IMP)ja_sd_viewDidAppear, &g_orig_sd_vda);
+        JASetImp(cls, @selector(viewWillDisappear:), (IMP)ja_sd_viewWillDisappear, &g_orig_sd_vwd);
         JASetImp(cls, @selector(respDeviceSdEventList:), (IMP)ja_sd_respDeviceSdEventList,
                  &g_orig_sd_respEventList);
         JASetImp(cls, @selector(getCurrentEventWithTimeStamp:), (IMP)ja_sd_getCurrentEventWithTimeStamp,
@@ -427,7 +431,8 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     if (!nav) nav = JATopVC().navigationController;
     if (nav) {
         [nav pushViewController:vc animated:YES];
-        JALog(@"已 push SDPlayer");
+        JASDPlayerActive = YES;  // v1.10：push 即标记 SD 回放活跃（getter 开闸兜底）
+    JALog(@"已 push SDPlayer");
     } else {
         JALog(@"!! 无 navigationController，改为 present");
         [UIApplication.sharedApplication.keyWindow.rootViewController presentViewController:vc animated:YES completion:nil];
@@ -594,92 +599,54 @@ static void JAHookLiveGates(void) {
     JALiveHooked = YES;
 }
 
-// v1.9 修复：设备回传消费链有两道闸门（反汇编 0x100b76d48 起）：
+// v1.10 修复：设备回传消费链有两道闸门（反汇编 0x100b76d48 起）：
 //   闸门1：cbz [live isEnterBackPlayer] → 0x100b7741c（不消费）
 //   闸门2：cmn [live detectType],#1 → b.eq 0x100b77374（不 seekTo）
-// 我们直接 push SDPlayer 未走官方初始化，这两个状态大概率是 0/-1 → 永远不 seekTo。
-// 对策：调原实现前强制设 detectType=0 + isEnterBackPlayer=1（带日志确认当前值）。
-static void JASetLiveGates(void) {
-    Class lmCls = NSClassFromString(@"JALiveManager");
-    if (!lmCls) return;
-    // JALiveManager 单例：尝试常见类方法名
-    NSArray *names = @[@"sharedInstance", @"shared", @"shareManager", @"defaultManager"];
-    id lm = nil;
-    for (NSString *sn in names) {
-        SEL s = NSSelectorFromString(sn);
-        if (s && [lmCls respondsToSelector:s]) {
-            lm = ((id(*)(id, SEL))objc_msgSend)((id)lmCls, s);
-            if (lm) break;
-        }
-    }
-    if (!lm) return;
-    // detectType → 0（走 seekTo 分支的必要条件：!= -1）
-    SEL setDT = NSSelectorFromString(@"setDetectType:");
-    if (setDT && [lm respondsToSelector:setDT]) {
-        long long cur = 0;
-        SEL getDT = NSSelectorFromString(@"detectType");
-        if (getDT && [lm respondsToSelector:getDT])
-            cur = ((long long(*)(id, SEL))objc_msgSend)(lm, getDT);
-        ((void(*)(id, SEL, long long))objc_msgSend)(lm, setDT, 0);
-        JALog(@"[JALiveManager] setDetectType:0 (原值=%lld)", cur);
-    }
-    // isEnterBackPlayer → YES（消费链闸门1）
-    SEL setIBP = NSSelectorFromString(@"setIsEnterBackPlayer:");
-    if (setIBP && [lm respondsToSelector:setIBP]) {
-        BOOL cur = NO;
-        SEL getIBP = NSSelectorFromString(@"isEnterBackPlayer");
-        if (getIBP && [lm respondsToSelector:getIBP])
-            cur = ((BOOL(*)(id, SEL))objc_msgSend)(lm, getIBP);
-        ((void(*)(id, SEL, BOOL))objc_msgSend)(lm, setIBP, YES);
-        JALog(@"[JALiveManager] setIsEnterBackPlayer:YES (原值=%d)", cur);
-    }
-}
+// 我们直接 push SDPlayer 未走官方初始化，这两个状态是 0/-1 → 永远不 seekTo。
+// v1.9 尝试 setDetectType:/setIsEnterBackPlayer: 强设 —— 实测 JALiveManager
+// 无 sharedInstance 单例（4 个 common 名均无响应），setter 方案失效。
+// v1.10 改为在 getter 层开闸（见 ja_live_detectType / ja_live_isEnterBackPlayer）：
+// 我们的 SDPlayer 活跃期间（JASDPlayerActive）强制返回 0 / YES，其余场景透传原值。
 
-// v1.9 兜底：官方消费链若仍不 seekTo，直接对 viewModel 强制定位播放。
-// 反汇编：seekTo:duration: receiver = SDPlayer+0x28（JANewRtcSDPlayViewModel），
-// 参数 x2=时间戳（绝对秒）、x3=0。
+// v1.10 兜底：官方消费链若仍不 seekTo，按反汇编事实（receiver = SDPlayer+0x28）直接定位。
+// v1.9 的 KVC/ivar 遍历全部落空 → 改为按偏移 0x28 直读对象（最可靠）。
 static void JAFallbackSeek(id sdPlayer) {
     if (!sdPlayer) return;
     NSNumber *ts = JAVal(sdPlayer, @"currentTimeStamp");
     if (!ts || ts.longLongValue <= 0) return;
+    SEL seek = NSSelectorFromString(@"seekTo:duration:");
+    // 1) 按偏移 0x28 直读（反汇编：seekTo receiver = self+0x28，且该对象持 currentTimeStamp）
+    id vm = nil;
+    @try { vm = *(id *)((char *)sdPlayer + 0x28); } @catch (NSException *e) { vm = nil; }
+    if (vm) {
+        JALog(@"[兜底] self+0x28 = %@ (类=%@) seekTo响应=%d",
+              vm, NSStringFromClass([vm class]),
+              [vm respondsToSelector:seek] ? 1 : 0);
+        if (seek && [vm respondsToSelector:seek]) {
+            JALog(@"[兜底] 强制定位 viewModel.seekTo:duration:(%lld, 0)", ts.longLongValue);
+            ((void(*)(id, SEL, long long, long long))objc_msgSend)(vm, seek, ts.longLongValue, 0);
+            return;
+        }
+    }
+    // 2) 老方案：KVC 常用名探测（保底）
     NSArray *vmKeys = @[@"viewModel", @"rtcSDPlayViewModel", @"sdkPlayViewModel",
                         @"playerViewModel", @"liveViewModel", @"playViewModel"];
-    id vm = nil;
     for (NSString *k in vmKeys) {
-        @try { vm = [sdPlayer valueForKey:k]; } @catch (NSException *e) { vm = nil; }
-        if (vm) break;
-    }
-    if (!vm) {
-        // ivar 偏移 0x28 兜底（class_getInstanceVariable 不可靠时用 object_getIvar 列表探测）
-        unsigned int ic = 0;
-        Ivar *ivs = class_copyIvarList([sdPlayer class], &ic);
-        for (unsigned int i = 0; i < ic; i++) {
-            const char *t = ivar_getTypeEncoding(ivs[i]);
-            if (t && t[0] == '@') {
-                id obj = object_getIvar(sdPlayer, ivs[i]);
-                if (obj && [obj respondsToSelector:@selector(seekTo:duration:)]) {
-                    vm = obj;
-                    JALog(@"[兜底] 经 ivar %s 找到 viewModel=%@",
-                          ivar_getName(ivs[i]), NSStringFromClass([obj class]));
-                    break;
-                }
-            }
+        id o = nil;
+        @try { o = [sdPlayer valueForKey:k]; } @catch (NSException *e) { o = nil; }
+        if (o && seek && [o respondsToSelector:seek]) {
+            JALog(@"[兜底] KVC %@ → %@ 强制定位 seekTo:duration:(%lld, 0)",
+                  k, NSStringFromClass([o class]), ts.longLongValue);
+            ((void(*)(id, SEL, long long, long long))objc_msgSend)(o, seek, ts.longLongValue, 0);
+            return;
         }
-        free(ivs);
     }
-    if (!vm) { JALog(@"[兜底] 未找到 SDPlayer 的 viewModel，无法强制定位"); return; }
-    SEL seek = NSSelectorFromString(@"seekTo:duration:");
-    if (seek && [vm respondsToSelector:seek]) {
-        JALog(@"[兜底] 强制定位 viewModel.seekTo:duration:(%lld, 0)", ts.longLongValue);
-        ((void(*)(id, SEL, long long, long long))objc_msgSend)(vm, seek, ts.longLongValue, 0);
-    } else {
-        JALog(@"[兜底] viewModel=%@ 不响应 seekTo:duration:", NSStringFromClass([vm class]));
-    }
+    JALog(@"[兜底] 未找到可定位的 viewModel（偏移0x28无对象且KVC全空）");
 }
 
 static void ja_sd_respDeviceSdEventList(id self, SEL _cmd, id arg) {
-    // v1.9：先放开两道闸门（在消费链执行前）
-    JASetLiveGates();
+    // v1.10：标记 SD 回放活跃（getter 层开闸依赖此标志；JALiveManager 无单例，setter 方案已弃）
+    JASDPlayerActive = YES;
     NSNumber *ts = JAVal(self, @"currentTimeStamp");
     long long dayStart = JADayStartSec(ts);
     id cam = JAVal(self, @"myCamera");
@@ -738,21 +705,33 @@ static void ja_sd_seekTo_duration(id self, SEL _cmd, long long sec, double dur) 
     if (g_orig_seekTo) ((void(*)(id, SEL, long long, double))g_orig_seekTo)(self, _cmd, sec, dur);
 }
 
-// v1.9 诊断：JALiveManager.detectType getter —— 确认闸门2 当前值
+// v1.9/v1.10 诊断+修复：JALiveManager.detectType getter
+// v1.10：官方消费链闸门2（detectType==-1 跳过 seekTo）。JALiveManager 无单例
+// （sharedInstance 等均无响应），setter 方案失效 → 直接在 getter 层开闸：
+// 我们的 SDPlayer 活跃期间强制返回 0，其余场景透传原值。
 static long long ja_live_detectType(id self, SEL _cmd) {
     long long ret = g_orig_live_detectType
         ? ((long long(*)(id, SEL))g_orig_live_detectType)(self, _cmd)
         : -1;
-    JALog(@"[JALiveManager.detectType] 当前值=%lld (官方消费链闸门2: -1 会跳过 seekTo)", ret);
+    if (JASDPlayerActive) {
+        if (ret != 0) JALog(@"[JALiveManager.detectType] 原值=%lld → 强制返回 0（SD 回放开闸）", ret);
+        return 0;
+    }
+    JALog(@"[JALiveManager.detectType] 当前值=%lld (非SD回放)", ret);
     return ret;
 }
 
-// v1.9 诊断：JALiveManager.isEnterBackPlayer getter —— 确认闸门1 当前值
+// v1.9/v1.10 诊断+修复：JALiveManager.isEnterBackPlayer getter
+// v1.10：官方消费链闸门1（==0 跳过消费）→ 活跃期强制返回 YES
 static long long ja_live_isEnterBackPlayer(id self, SEL _cmd) {
     long long ret = g_orig_live_isEnterBackPlayer
         ? ((long long(*)(id, SEL))g_orig_live_isEnterBackPlayer)(self, _cmd)
         : 0;
-    JALog(@"[JALiveManager.isEnterBackPlayer] 当前值=%lld (官方消费链闸门1: 0 会跳过消费)", ret);
+    if (JASDPlayerActive) {
+        if (ret != 1) JALog(@"[JALiveManager.isEnterBackPlayer] 原值=%lld → 强制返回 1（SD 回放开闸）", ret);
+        return 1;
+    }
+    JALog(@"[JALiveManager.isEnterBackPlayer] 当前值=%lld (非SD回放)", ret);
     return ret;
 }
 
@@ -769,6 +748,7 @@ static void ja_vm_seekTo_duration(id self, SEL _cmd, long long sec, long long du
 // （不拉列表）→ 时间戳永远没机会被消费。这里强制设 = 报警日 0 点秒，
 // 官方 viewDidAppear 就会走 getEventListWithSelectiontDay: 主动拉对应日期事件列表。
 static void ja_sd_viewWillAppear(id self, SEL _cmd) {
+    JASDPlayerActive = YES;  // v1.10：进入 SD 回放 → getter 层开闸
     if (g_orig_sd_vwa) ((void(*)(id, SEL))g_orig_sd_vwa)(self, _cmd);
     NSNumber *ts = JAVal(self, @"currentTimeStamp");
     long long dayStart = JADayStartSec(ts);
@@ -785,6 +765,13 @@ static void ja_sd_viewWillAppear(id self, SEL _cmd) {
         JASet(cam, @"sdSelectiontDay", @(dayStart));
         JALog(@"SDPlayer viewWillAppear: 设回 myCamera.sdSelectiontDay=%lld (防官方覆盖为今天)", dayStart);
     }
+}
+
+// v1.10：离开 SD 回放 → 关闭闸门强制（getter 恢复透传，避免影响官方其他页面）
+static void ja_sd_viewWillDisappear(id self, SEL _cmd) {
+    JASDPlayerActive = NO;
+    JALog(@"SDPlayer viewWillDisappear: 关闭闸门强制（JASDPlayerActive=NO）");
+    if (g_orig_sd_vwd) ((void(*)(id, SEL))g_orig_sd_vwd)(self, _cmd);
 }
 
 // v1.5：viewDidAppear hook —— 原实现后延迟 3s 主动补拉一次
@@ -891,6 +878,7 @@ static void JAHook(void) {
         if (sdCls) {
             JASetImp(sdCls, @selector(viewWillAppear:), (IMP)ja_sd_viewWillAppear, &g_orig_sd_vwa);
             JASetImp(sdCls, @selector(viewDidAppear:), (IMP)ja_sd_viewDidAppear, &g_orig_sd_vda);
+            JASetImp(sdCls, @selector(viewWillDisappear:), (IMP)ja_sd_viewWillDisappear, &g_orig_sd_vwd);
             // v1.6 诊断：hook 设备回传事件列表回调
             JASetImp(sdCls, @selector(respDeviceSdEventList:), (IMP)ja_sd_respDeviceSdEventList,
                      &g_orig_sd_respEventList);
@@ -910,7 +898,7 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.9 injected");
+    JALog(@"JoolinkSDReplay v1.10 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewSDPlayerViewController")) {
         JAHook();
