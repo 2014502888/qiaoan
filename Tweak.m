@@ -520,6 +520,15 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         } else {
             JALog(@"!! RTC-SD 无 setCurrentSelectedSDDay:");
         }
+        // 官方 viewDidLoad 会把 myCamera.sdSelectiontDay 覆盖成"今日0点"（跨天场景 = 10-20），
+        // 时间轴/相对秒若读它就会算错（(7).log 实证 1792425600-1792422838→负数→clip 0）。
+        // 这里重设回报警日0点，JATimeLineSyncToSec 也不再信任该 ivar（改用计算值）。
+        @try {
+            [self setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"];
+            JALog(@"[RTC-SD] 重设 myCamera.sdSelectiontDay=%lld（报警日0点，防官方覆盖）", dayStart);
+        } @catch (NSException *e) {
+            JALog(@"!! 重设 sdSelectiontDay 异常: %@", e);
+        }
         NSDateFormatter *df = [[NSDateFormatter alloc] init];
         df.dateFormat = @"yyyy-MM-dd";
         NSString *ds = [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:sec]];
@@ -528,12 +537,20 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
             ((void(*)(id, SEL, id))objc_msgSend)(self, scd, ds);
             JALog(@"[RTC-SD] setCurrentDateStr: %@（顶部日期=报警日）", ds);
         }
+        // v1.23 修正：loadDataFirstWithDate: 在 **viewModel** 上（(7).log 实证 VC
+        // respondsToSelector=NO，官方手动选日期实际走 viewModel）。KVC 取 viewModel 再调。
+        id vm = nil;
+        @try { vm = [self valueForKey:@"viewModel"]; } @catch (NSException *e) {
+            JALog(@"!! 取 viewModel 异常: %@", e);
+        }
         SEL ldf = NSSelectorFromString(@"loadDataFirstWithDate:showHud:isTableRefresh:finish:");
-        if ([self respondsToSelector:ldf]) {
-            ((void(*)(id, SEL, id, BOOL, BOOL, id))objc_msgSend)(self, ldf, ds, (BOOL)NO, (BOOL)YES, nil);
-            JALog(@"[RTC-SD] loadDataFirstWithDate: %@（重新加载报警日事件 → 时间轴刷新）", ds);
+        id ldfTarget = ([vm respondsToSelector:ldf]) ? vm : (id)self;
+        if (ldfTarget && [ldfTarget respondsToSelector:ldf]) {
+            ((void(*)(id, SEL, id, BOOL, BOOL, id))objc_msgSend)(ldfTarget, ldf, ds, (BOOL)NO, (BOOL)YES, nil);
+            JALog(@"[RTC-SD] loadDataFirstWithDate: %@ on %@（重新加载报警日事件 → 时间轴刷新）",
+                  ds, (ldfTarget == vm) ? @"viewModel" : @"self");
         } else {
-            JALog(@"!! RTC-SD 无 loadDataFirstWithDate:showHud:isTableRefresh:finish:");
+            JALog(@"!! RTC-SD 无 loadDataFirstWithDate:showHud:isTableRefresh:finish:（VC 与 viewModel 均无）");
         }
         // 事件列表加载是异步的（网络拉取），等 1.5s 后再建流定位
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
@@ -573,18 +590,22 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
 // 1792407777 - 1792339200 = 68577 = 19:02:57）。兜底公式 (sec + 28800) % 86400。
 static void JATimeLineSyncToSec(id sdVC, long long sec) {
     @autoreleasepool {
-        long long dayStart = 0;
+        // v1.23 修正：跨天后官方把 myCamera.sdSelectiontDay 覆盖成"今日0点"（10-20），
+        // 用它会算出负数相对秒 → clip 0 → 指示器卡 00:00（(7).log 实证）。
+        // 相对秒必须基于**报警日0点**：JADayStartSec(@(sec)) 按 sec 所在日期纯计算，
+        // 不受官方覆盖影响。读 sdSelectiontDay 仅作日志对比。
+        long long dayStart = JADayStartSec(@(sec));
+        if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
+        long long ivarDay = 0;
         @try {
-            dayStart = [[sdVC valueForKeyPath:@"myCamera.sdSelectiontDay"] longLongValue];
+            ivarDay = [[sdVC valueForKeyPath:@"myCamera.sdSelectiontDay"] longLongValue];
+            if (ivarDay != dayStart) {
+                JALog(@"[RTC-SD] 提示: myCamera.sdSelectiontDay=%lld ≠ 报警日0点=%lld（官方按今日覆盖，用计算值）", ivarDay, dayStart);
+            }
         } @catch (NSException *e) {
             JALog(@"!! 读 sdSelectiontDay 异常: %@", e);
         }
-        if (dayStart < 1000000000LL) {
-            // 兜底：北京当日0点（UTC 秒）= sec - ((sec + 28800) % 86400)
-            dayStart = sec - ((sec + 28800LL) % 86400LL);
-            JALog(@"[RTC-SD] sdSelectiontDay 不可读，兜底 dayStart=%lld", dayStart);
-        }
-        long long rel = sec - dayStart;   // 当日相对秒 0~86399
+        long long rel = sec - dayStart;   // 报警日相对秒 0~86399
         if (rel < 0) rel = 0;
         if (rel > 86399) rel = 86399;
         JALog(@"[RTC-SD] 时间轴参数: 绝对=%lld 当日0点=%lld → 相对秒=%lld (应≈时:分:秒)", sec, dayStart, rel);
@@ -746,7 +767,7 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.22 injected");
+    JALog(@"JoolinkSDReplay v1.23 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
