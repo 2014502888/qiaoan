@@ -1,5 +1,22 @@
 // JoolinkSDReplay — 乔安智联 4.4.67 报警消息 → 直达本地 SD 卡录像
-// v1.12 移除补拉闭包（崩溃根治）+ 全链路诊断（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
+// v1.13 补建流（核心修复）+ 首帧确认（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
+//
+// v1.13 根因（本版修复，反汇编定案）：
+//   seekTo 已命中但播放不启动的最后一环 —— 官方 SD 回放必须先【建流】再【定位】：
+//   JANewSDPlayerViewController seekTo:duration:(0x100b78338)
+//     → live selectTimeStamp:(0x100c88bd0)
+//     → MYP2PChannel selectTimeStamp:(0x100c7fa20)
+//     → MYP2PChannel p2p_starPlayBack(0x100c7feac)：
+//         分支1（建流）：live.isEnterBackPlayer==0 且 isStarBackPlayer==0
+//                        → liveServce startReplay:selectTimeStamp:complete:（发建流指令）
+//         分支2（定位）：否则 → seekReplay:selectTimeStamp:complete:（仅 seek，无流可 seek）
+//   v1.10 为过 respDeviceSdEventList: 消费链闸门把 isEnterBackPlayer 强制返回 1，
+//   p2p_starPlayBack 永远命中分支2 → 只发 seek、从未建流 → 设备无回放流回调
+//   （respDeviceSDPlayerStatus / respDeviceFirstFrameTimeStamp 全程不回）→ "当前时间无录像"。
+//   v1.13 修复：hook p2p_starPlayBack —— 首次调用时临时放开 isEnterBackPlayer 强制
+//   （getter 透传真实值 0）→ 官方原 IMP 走 startReplay 建流分支（startReplay 自带
+//   [cam selectTimeStamp] = 报警时间，设备直接从报警时间开始播）；建流后恢复强制，
+//   后续 seek 走 seekReplay 定位分支。另 hook respDeviceFirstFrameTimeStamp: 确认首帧。
 //
 // 实测问题链：
 //   v1：闪退（设备对象未传入，JALiveManager.myCamera=nil → MYOpenSDK 异常）
@@ -302,7 +319,11 @@ static long long ja_live_isEnterBackPlayer(id self, SEL _cmd);       // v1.9 诊
 static void ja_sd_viewWillDisappear(id self, SEL _cmd);  // v1.10：离开 SD 回放时关闭闸门强制
 static void ja_vm_seekTo_duration(id self, SEL _cmd, long long sec, long long dur);  // v1.9：viewModel.seekTo:duration:
 static void JAHookLiveGates(void);   // v1.9：统一安装 JALiveManager 闸门 getter + viewModel seekTo hook（幂等）
+static void ja_p2p_starPlayBack(id self, SEL _cmd);          // v1.13：MYP2PChannel 建流/定位分支 hook
+static void ja_sd_respFirstFrame(id self, SEL _cmd, id arg); // v1.13：首帧回调确认（播放已启动）
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
+static void JASDInstallHooks(void);   // v1.13：统一安装 SDPlayer 生命周期/消费链 hook
+static void JAHookP2PChannel(void);   // v1.13：MYP2PChannel p2p_starPlayBack hook（类晚加载幂等）
 static BOOL JASDHooked = NO;
 static BOOL JASDPlayerActive = NO;   // v1.10：我们的 SDPlayer 是否活跃（活跃期间 getter 开闸）
 // v1.11.1：当前活跃 SDPlayer 指针（纯 C 比较守卫，不向对象发消息）。
@@ -322,6 +343,12 @@ static IMP g_orig_live_isEnterBackPlayer = NULL;  // v1.9：JALiveManager.isEnte
 static IMP g_orig_vm_seekTo = NULL;         // v1.9：viewModel.seekTo:duration: 原 IMP（官方消费链实际调用者）
 static IMP g_orig_noneVideoViewIsShow = NULL; // v1.11：noneVideoViewIsShow:dayEnd: 原 IMP（"当前时间无录像"提示）
 static IMP g_orig_respSDPlayerStatus = NULL;  // v1.11：respDeviceSDPlayerStatus: 原 IMP（播放状态回调）
+// v1.13：建流修复相关
+static IMP g_orig_p2p_starPlayBack = NULL;    // MYP2PChannel p2p_starPlayBack 原 IMP
+static IMP g_orig_respFirstFrame = NULL;      // respDeviceFirstFrameTimeStamp: 原 IMP（首帧回调）
+static BOOL g_p2pHooked = NO;                 // MYP2PChannel hook 是否已装（类可能晚加载）
+static long long g_lastRealEnterBack = -1;    // isEnterBackPlayer 最近一次真实值（getter hook 里记录）
+static BOOL g_startReplaySent = NO;           // 本次回放会话是否已发出建流（startReplay）
 
 // v1.5：从秒级时间戳算"报警日 0 点秒"（本地时区语义 = 北京时间 00:00）
 // v1.11 修正：原实现取 UTC 0 点（北京 08:00），比官方"今日 0 点"（北京 00:00）偏 8 小时。
@@ -349,19 +376,12 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     // v1.5：类此刻已加载（NSClassFromString 触发），若启动轮询错过（15s 内未点入），
     // 在这里立即补装生命周期 hook，确保 viewWillAppear/viewDidAppear 生效
     if (!JASDHooked) {
-        JASetImp(cls, @selector(viewWillAppear:), (IMP)ja_sd_viewWillAppear, &g_orig_sd_vwa);
-        JASetImp(cls, @selector(viewDidAppear:), (IMP)ja_sd_viewDidAppear, &g_orig_sd_vda);
-        JASetImp(cls, @selector(viewWillDisappear:), (IMP)ja_sd_viewWillDisappear, &g_orig_sd_vwd);
-        JASetImp(cls, @selector(respDeviceSdEventList:), (IMP)ja_sd_respDeviceSdEventList,
-                 &g_orig_sd_respEventList);
-        JASetImp(cls, @selector(getCurrentEventWithTimeStamp:), (IMP)ja_sd_getCurrentEventWithTimeStamp,
-                 &g_orig_getCurrentEvent);
-        JASetImp(cls, @selector(seekTo:duration:), (IMP)ja_sd_seekTo_duration,
-                 &g_orig_seekTo);
-        JAHookLiveGates();
-        JASDHooked = YES;
+        JASDInstallHooks();
         JALog(@"点看录像时补装 SDPlayer 生命周期 hook（轮询错过场景兜底）");
     }
+    // v1.13：p2p_starPlayBack 建流 hook 无条件补装（幂等）——MYP2PChannel 可能晚于
+    // 启动轮询窗口加载，若不补装则建流修复不生效
+    JAHookP2PChannel();
     id vc = [[cls alloc] init];
     JALog(@"已创建 SDPlayer: %@ class=%@", vc, NSStringFromClass([vc class]));
 
@@ -777,10 +797,12 @@ static long long ja_live_detectType(id self, SEL _cmd) {
 
 // v1.9/v1.10 诊断+修复：JALiveManager.isEnterBackPlayer getter
 // v1.10：官方消费链闸门1（==0 跳过消费）→ 活跃期强制返回 YES
+// v1.13：每次先记录真实值到 g_lastRealEnterBack（p2p_starPlayBack 建流分支判断用）
 static long long ja_live_isEnterBackPlayer(id self, SEL _cmd) {
     long long ret = g_orig_live_isEnterBackPlayer
         ? ((long long(*)(id, SEL))g_orig_live_isEnterBackPlayer)(self, _cmd)
         : 0;
+    g_lastRealEnterBack = ret;  // v1.13：记录真实值（建流判断依据）
     if (JASDPlayerActive) {
         if (ret != 1) JALog(@"[JALiveManager.isEnterBackPlayer] 原值=%lld → 强制返回 1（SD 回放开闸）", ret);
         return 1;
@@ -829,6 +851,61 @@ static void ja_sd_respDeviceSDPlayerStatus(id self, SEL _cmd, id arg) {
     if (g_orig_respSDPlayerStatus) ((void(*)(id, SEL, id))g_orig_respSDPlayerStatus)(self, _cmd, arg);
 }
 
+// v1.13 核心修复：MYP2PChannel p2p_starPlayBack（IMP 0x100c7feac）
+// 官方分支（反汇编定案）：
+//   isEnterBackPlayer==0 && isStarBackPlayer==0 → startReplay:selectTimeStamp:complete:（建流）
+//   否则 → seekReplay:selectTimeStamp:complete:（仅定位）
+// v1.10 强制 isEnterBackPlayer=1 → 永远走 seekReplay → 无流可 seek → 设备不回播放回调。
+// 本 hook：SD 回放活跃且本次会话还没建过流且真实 isEnterBackPlayer==0（官方尚未进入回放模式）
+// → 临时关闭闸门强制（getter 透传真实值）→ 调原 IMP 让官方走 startReplay 建流分支
+// （startReplay 自带 [cam selectTimeStamp] = 报警时间戳，设备直接从报警时间起播）→ 恢复强制。
+// 建流后 g_startReplaySent=YES：后续 seekTo 走原 IMP（isEnterBackPlayer 强制 1）→ seekReplay 定位 ✓
+static void ja_p2p_starPlayBack(id self, SEL _cmd) {
+    if (JASDPlayerActive && !g_startReplaySent && g_lastRealEnterBack == 0) {
+        // 读 isStarBackPlayer 真实值（未 hook，透传）：必须为 0 才走建流分支
+        long long star = -1;
+        Class dp = NSClassFromString(@"JADevicePlatform");
+        if (dp) {
+            id inst = nil;
+            @try { inst = ((id(*)(id, SEL))objc_msgSend)((id)dp, NSSelectorFromString(@"sharedInstance")); }
+            @catch (NSException *e) { inst = nil; }
+            if (inst) {
+                id live = JAVal(inst, @"live");
+                if (live && [live respondsToSelector:NSSelectorFromString(@"isStarBackPlayer")]) {
+                    star = ((long long(*)(id, SEL))objc_msgSend)(live, NSSelectorFromString(@"isStarBackPlayer"));
+                }
+            }
+        }
+        JALog(@"[p2p_starPlayBack] 首次路径判定: 真实isEnterBackPlayer=%lld isStarBackPlayer=%lld → %@",
+              g_lastRealEnterBack, star,
+              (star == 0) ? @"走建流 startReplay（本版修复）" : @"isStarBackPlayer!=0 走原逻辑");
+        if (star == 0) {
+            BOOL savedActive = JASDPlayerActive;
+            JASDPlayerActive = NO;  // getter 透传真实值 → 原 IMP 读到 isEnterBackPlayer=0 → startReplay 分支
+            JALog(@"[p2p_starPlayBack] 已临时关闭闸门强制，调原 IMP（官方将发 startReplay 建流）");
+            if (g_orig_p2p_starPlayBack) ((void(*)(id, SEL))g_orig_p2p_starPlayBack)(self, _cmd);
+            JASDPlayerActive = savedActive;
+            g_startReplaySent = YES;
+            JALog(@"[p2p_starPlayBack] 建流指令已发出（g_startReplaySent=YES），恢复闸门强制");
+            return;
+        }
+    }
+    if (g_orig_p2p_starPlayBack) ((void(*)(id, SEL))g_orig_p2p_starPlayBack)(self, _cmd);
+}
+
+// v1.13 确认：respDeviceFirstFrameTimeStamp:（IMP 0x100b77d64）—— 设备回传首帧时间戳
+// 出现即证明 SD 回放流已建立、画面开始渲染（"当前时间无录像"提示随之消除）
+static void ja_sd_respFirstFrame(id self, SEL _cmd, id arg) {
+    if (self != g_activeSDPlayer) {
+        if (g_orig_respFirstFrame) ((void(*)(id, SEL, id))g_orig_respFirstFrame)(self, _cmd, arg);
+        return;
+    }
+    NSNumber *ts = JAVal(self, @"currentTimeStamp");
+    JALog(@"[respDeviceFirstFrameTimeStamp:] arg=%@ (SD 回放流已建立，首帧到达 ✓) currentTimeStamp=%@",
+          arg, ts);
+    if (g_orig_respFirstFrame) ((void(*)(id, SEL, id))g_orig_respFirstFrame)(self, _cmd, arg);
+}
+
 // v1.5：viewWillAppear hook —— 原实现后强制打开"拉取开关"
 // 官方 viewWillAppear 判定：设备 sdSelectiontDay==0 → pendingReloadTodaySDSelectiontDay=0
 // （不拉列表）→ 时间戳永远没机会被消费。这里强制设 = 报警日 0 点秒，
@@ -860,11 +937,16 @@ static void ja_sd_viewWillAppear(id self, SEL _cmd) {
 
 // v1.10：离开 SD 回放 → 关闭闸门强制（getter 恢复透传，避免影响官方其他页面）
 // v1.11.1：若离开的是当前活跃 SDPlayer，同步清空守卫指针（防官方回调旧实例野指针）
+// v1.13：重置建流标志（下次进入重新走 startReplay 建流）
 static void ja_sd_viewWillDisappear(id self, SEL _cmd) {
-    if (self == g_activeSDPlayer) g_activeSDPlayer = nil;
+    if (self == g_activeSDPlayer) {
+        g_activeSDPlayer = nil;
+        g_startReplaySent = NO;  // v1.13：会话结束，重置建流标志
+    }
     JASDPlayerActive = NO;
-    JALog(@"SDPlayer viewWillDisappear: 关闭闸门强制（JASDPlayerActive=NO, g_activeSDPlayer=%@）",
-          g_activeSDPlayer ? NSStringFromClass([g_activeSDPlayer class]) : @"nil");
+    JALog(@"SDPlayer viewWillDisappear: 关闭闸门强制（JASDPlayerActive=NO, g_activeSDPlayer=%@, startReplaySent=%@）",
+          g_activeSDPlayer ? NSStringFromClass([g_activeSDPlayer class]) : @"nil",
+          g_startReplaySent ? @"YES" : @"NO");
     if (g_orig_sd_vwd) ((void(*)(id, SEL))g_orig_sd_vwd)(self, _cmd);
 }
 
@@ -949,6 +1031,44 @@ static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved) {
     JALog(@"hook %@ OK (old=%p new=%p)", NSStringFromSelector(sel), (void *)cur, (void *)newImp);
 }
 
+// v1.13：统一安装 SDPlayer 生命周期/消费链 hook（JAHook 轮询与 JATryOpenSDReplay 补装共用）
+static void JASDInstallHooks(void) {
+    if (JASDHooked) return;
+    Class sdCls = NSClassFromString(@"JANewSDPlayerViewController");
+    if (!sdCls) return;
+    JASetImp(sdCls, @selector(viewWillAppear:), (IMP)ja_sd_viewWillAppear, &g_orig_sd_vwa);
+    JASetImp(sdCls, @selector(viewDidAppear:), (IMP)ja_sd_viewDidAppear, &g_orig_sd_vda);
+    JASetImp(sdCls, @selector(viewWillDisappear:), (IMP)ja_sd_viewWillDisappear, &g_orig_sd_vwd);
+    // v1.6 诊断：hook 设备回传事件列表回调
+    JASetImp(sdCls, @selector(respDeviceSdEventList:), (IMP)ja_sd_respDeviceSdEventList,
+             &g_orig_sd_respEventList);
+    // v1.8 诊断：hook 定位消费链（找事件 + seekTo 播放）
+    JASetImp(sdCls, @selector(getCurrentEventWithTimeStamp:), (IMP)ja_sd_getCurrentEventWithTimeStamp,
+             &g_orig_getCurrentEvent);
+    JASetImp(sdCls, @selector(seekTo:duration:), (IMP)ja_sd_seekTo_duration,
+             &g_orig_seekTo);
+    // v1.11 诊断：无录像提示 + 播放状态回调（确认 seekTo 后播放链路状态）
+    JASetImp(sdCls, @selector(noneVideoViewIsShow:dayEnd:), (IMP)ja_sd_noneVideoViewIsShow,
+             &g_orig_noneVideoViewIsShow);
+    JASetImp(sdCls, @selector(respDeviceSDPlayerStatus:), (IMP)ja_sd_respDeviceSDPlayerStatus,
+             &g_orig_respSDPlayerStatus);
+    // v1.13：首帧回调（确认建流成功后播放已启动）
+    JASetImp(sdCls, @selector(respDeviceFirstFrameTimeStamp:), (IMP)ja_sd_respFirstFrame,
+             &g_orig_respFirstFrame);
+    JAHookLiveGates();
+    JASDHooked = YES;
+}
+
+// v1.13：MYP2PChannel p2p_starPlayBack hook（类可能晚加载，幂等）
+static void JAHookP2PChannel(void) {
+    if (g_p2pHooked) return;
+    Class p2pCls = NSClassFromString(@"MYP2PChannel");
+    if (!p2pCls) return;
+    JASetImp(p2pCls, NSSelectorFromString(@"p2p_starPlayBack"), (IMP)ja_p2p_starPlayBack,
+             &g_orig_p2p_starPlayBack);
+    g_p2pHooked = YES;
+}
+
 static BOOL JAHooked = NO;    // 详情页 hook（clickCloudRecordAction 主链）
 // JASDHooked 已在核心逻辑区前置声明处定义（v1.5 SDPlayer 生命周期 hook 标志）
 
@@ -972,28 +1092,16 @@ static void JAHook(void) {
     }
     // v1.5：SDPlayer 生命周期 hook（类可能晚加载，轮询重试）
     if (!JASDHooked) {
-        Class sdCls = NSClassFromString(@"JANewSDPlayerViewController");
-        if (sdCls) {
-            JASetImp(sdCls, @selector(viewWillAppear:), (IMP)ja_sd_viewWillAppear, &g_orig_sd_vwa);
-            JASetImp(sdCls, @selector(viewDidAppear:), (IMP)ja_sd_viewDidAppear, &g_orig_sd_vda);
-            JASetImp(sdCls, @selector(viewWillDisappear:), (IMP)ja_sd_viewWillDisappear, &g_orig_sd_vwd);
-            // v1.6 诊断：hook 设备回传事件列表回调
-            JASetImp(sdCls, @selector(respDeviceSdEventList:), (IMP)ja_sd_respDeviceSdEventList,
-                     &g_orig_sd_respEventList);
-            // v1.8 诊断：hook 定位消费链（找事件 + seekTo 播放）
-            JASetImp(sdCls, @selector(getCurrentEventWithTimeStamp:), (IMP)ja_sd_getCurrentEventWithTimeStamp,
-                     &g_orig_getCurrentEvent);
-            JASetImp(sdCls, @selector(seekTo:duration:), (IMP)ja_sd_seekTo_duration,
-                     &g_orig_seekTo);
-            // v1.11 诊断：无录像提示 + 播放状态回调（确认 seekTo 后播放链路状态）
-            JASetImp(sdCls, @selector(noneVideoViewIsShow:dayEnd:), (IMP)ja_sd_noneVideoViewIsShow,
-                     &g_orig_noneVideoViewIsShow);
-            JASetImp(sdCls, @selector(respDeviceSDPlayerStatus:), (IMP)ja_sd_respDeviceSDPlayerStatus,
-                     &g_orig_respSDPlayerStatus);
-            JAHookLiveGates();
-            JASDHooked = YES;
-        } else {
+        JASDInstallHooks();
+        if (!JASDHooked) {
             JALog(@"!! JANewSDPlayerViewController 尚未加载（轮询重试）");
+        }
+    }
+    // v1.13：MYP2PChannel p2p_starPlayBack 建流 hook（类可能晚加载，轮询重试）
+    if (!g_p2pHooked) {
+        JAHookP2PChannel();
+        if (!g_p2pHooked) {
+            JALog(@"!! MYP2PChannel 尚未加载（轮询重试）");
         }
     }
 }
@@ -1001,7 +1109,7 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.12 injected");
+    JALog(@"JoolinkSDReplay v1.13 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewSDPlayerViewController")) {
         JAHook();
@@ -1009,7 +1117,8 @@ static void JASDReplayInit(void) {
     }
     __block int tries = 0;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        while (tries < 30 && !(JAHooked && JASDHooked)) {
+        // v1.13：轮询条件含 g_p2pHooked（MYP2PChannel 建流 hook 必须装上才停）
+        while (tries < 30 && !(JAHooked && JASDHooked && g_p2pHooked)) {
             [NSThread sleepForTimeInterval:0.5];
             tries++;
             dispatch_async(dispatch_get_main_queue(), ^{ JAHook(); });
@@ -1019,6 +1128,9 @@ static void JASDReplayInit(void) {
         }
         if (!JASDHooked) {
             JALog(@"!! 30 次重试后仍未找到 JANewSDPlayerViewController（v1.5 生命周期 hook 未装）");
+        }
+        if (!g_p2pHooked) {
+            JALog(@"!! 30 次重试后仍未找到 MYP2PChannel（v1.13 建流 hook 未装，点看录像时会再补装）");
         }
     });
 }
