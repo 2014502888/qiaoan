@@ -1,5 +1,5 @@
 // JoolinkSDReplay — 乔安智联 4.4.67 报警消息 → 直达本地 SD 卡录像
-// v1.11 getter 开闸+播放链路诊断版（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
+// v1.12 移除补拉闭包（崩溃根治）+ 全链路诊断（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
 //
 // 实测问题链：
 //   v1：闪退（设备对象未传入，JALiveManager.myCamera=nil → MYOpenSDK 异常）
@@ -1001,7 +1001,7 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.11 injected");
+    JALog(@"JoolinkSDReplay v1.12 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewSDPlayerViewController")) {
         JAHook();
