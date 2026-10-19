@@ -7,6 +7,9 @@
 //   改为 sec-((sec+28800)%86400)（v1.19 兜底式，正确统一处理凌晨与晚上）。
 // v1.28：① camera 可能异步加载未就绪 → 首次点击"不跳转"，加 1.2s 延迟重试一次；
 //   ② switchToSDDay 后事件列表异步拉取，等待 1.5s→2.5s 减少偶发"当前时间无录像"。
+// v1.29：App 杀死重进后官方 viewDidLoad/viewDidAppear 自动恢复上次回放位置并自动播
+//   实时 → 三段乱跳（上次时间→实时→定位）。viewDidAppear 后 0.5s 先 stopSDPlay
+//   停官方自动流，再走 3.0s 定位链路。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）→
@@ -326,6 +329,18 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     if (sec < 1000000000LL) return;
     // v1.20：世代去重 —— 官方可能多次触发 viewDidAppear，只保留最后一次生效
     unsigned long long myGen = ++g_rtcVdaGen;
+    // v1.29：先停官方 viewDidLoad/viewDidAppear 自动起的流。官方会先恢复上次回放
+    // 位置、再自动播最新实时 → App 重启后点看录像出现三段乱跳（上次时间→实时→
+    // 定位）。0.5s 时官方自动流已建立，立即 stop 干净；3.0s 链路内的 stopSDPlay
+    // 幂等保留作兜底。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+        SEL st0 = NSSelectorFromString(@"stopSDPlay");
+        if ([self respondsToSelector:st0]) {
+            ((void(*)(id, SEL))objc_msgSend)(self, st0);
+        }
+    });
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
