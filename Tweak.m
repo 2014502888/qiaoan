@@ -1,5 +1,5 @@
 // JoolinkSDReplay — 乔安智联 4.4.67 报警消息 → 直达本地 SD 卡录像
-// v1.10 getter 开闸版（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
+// v1.11 getter 开闸+播放链路诊断版（TrollStore 兼容：纯 runtime hook + C IMP，零类依赖，可直接 clang 编译）
 //
 // 实测问题链：
 //   v1：闪退（设备对象未传入，JALiveManager.myCamera=nil → MYOpenSDK 异常）
@@ -315,15 +315,20 @@ static IMP g_orig_seekTo = NULL;            // v1.8：seekTo:duration: 原 IMP�
 static IMP g_orig_live_detectType = NULL;   // v1.9：JALiveManager.detectType getter 原 IMP
 static IMP g_orig_live_isEnterBackPlayer = NULL;  // v1.9：JALiveManager.isEnterBackPlayer getter 原 IMP
 static IMP g_orig_vm_seekTo = NULL;         // v1.9：viewModel.seekTo:duration: 原 IMP（官方消费链实际调用者）
+static IMP g_orig_noneVideoViewIsShow = NULL; // v1.11：noneVideoViewIsShow:dayEnd: 原 IMP（"当前时间无录像"提示）
+static IMP g_orig_respSDPlayerStatus = NULL;  // v1.11：respDeviceSDPlayerStatus: 原 IMP（播放状态回调）
 
-// v1.5：从秒级时间戳算"报警日 0 点秒"（UTC 语义 = 本地 00:00）
-// ts - (ts % 86400)：对 epoch 秒取 UTC 当天 0 点。例：1792339861 → 1792281600
-// = 2026-10-19 00:00:00 UTC+8（与官方 getTodayStartTimestamp / timeIntervalSince1970 语义一致）
+// v1.5：从秒级时间戳算"报警日 0 点秒"（本地时区语义 = 北京时间 00:00）
+// v1.11 修正：原实现取 UTC 0 点（北京 08:00），比官方"今日 0 点"（北京 00:00）偏 8 小时。
+// 官方 getTodayStartTimestamp / resp 内部 setSdSelectiontDay 均按本地（北京）0 点。
+// 正确公式：epoch 秒先取 UTC 当天 0 点，再减 28800（东八区）→ 北京 00:00。
+// 例：1792378567（北京 10-19 10:56:07）→ (1792378567-1792378567%86400)-28800 = 1792339200
 static long long JADayStartSec(NSNumber *ts) {
     if (!ts) return 0;
     long long v = ts.longLongValue;
     if (v >= 1000000000LL && v < 10000000000LL) {
-        return v - (v % 86400LL);
+        long long utcMid = v - (v % 86400LL);  // UTC 当天 0 点
+        return utcMid - 28800LL;               // 减 8 小时 → 北京当天 00:00
     }
     return 0;
 }
@@ -424,6 +429,19 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
         id evtList = JAVal(detailVC, @"warnInfoListArr");
         if (evtList) JASet(vc, @"eventList", evtList);
         JALog(@"已设置 currentEvent/currentTimeStamp/eventList");
+    }
+
+    // v1.11 兜底：显式 setIsSDPlayer:YES —— 官方 viewDidLoad 自会设，但 seekTo 后播放未起，
+    // 显式设一次保证 SD 播放模式标志位就位（幂等，重复设无害）
+    @try {
+        if ([vc respondsToSelector:NSSelectorFromString(@"setIsSDPlayer:")]) {
+            ((void(*)(id, SEL, BOOL))objc_msgSend)(vc, NSSelectorFromString(@"setIsSDPlayer:"), YES);
+            JALog(@"已显式 setIsSDPlayer:YES（SD 播放模式标志位就位）");
+        } else {
+            JALog(@"!! SDPlayer 无 setIsSDPlayer: 方法");
+        }
+    } @catch (NSException *e) {
+        JALog(@"!! setIsSDPlayer:YES 异常: %@", e);
     }
 
     // 4) push
@@ -667,8 +685,8 @@ static void ja_sd_respDeviceSdEventList(id self, SEL _cmd, id arg) {
     JALog(@"  SDPlayer.currentTimeStamp=%@ cam.sdSelectiontDay=%@", ts, sd);
     if ([arg isKindOfClass:NSArray.class]) {
         NSUInteger n = [arg count];
-        for (NSUInteger i = 0; i < n && i < 3; i++) {
-            // v1.8：全量 dump 属性（前 3 条），MYEventModel 字段名与报警模型不同
+        for (NSUInteger i = 0; i < n; i++) {
+            // v1.8：全量 dump 属性（v1.11 取消 3 条限制，确认报警点是否被某事件段覆盖）
             JADumpEventModel([arg objectAtIndex:i], i);
         }
     } else if ([arg isKindOfClass:NSDictionary.class]) {
@@ -745,6 +763,26 @@ static void ja_vm_seekTo_duration(id self, SEL _cmd, long long sec, long long du
     JALog(@"[viewModel seekTo:duration:] self=%@ sec=%lld dur=%lld (定位执行 ✓)",
           NSStringFromClass([self class]), sec, dur);
     if (g_orig_vm_seekTo) ((void(*)(id, SEL, long long, long long))g_orig_vm_seekTo)(self, _cmd, sec, dur);
+}
+
+// v1.11 诊断：noneVideoViewIsShow:dayEnd: —— "当前时间无录像"大字提示的触发时机与参数
+// 反汇编 0x100b77360：[self+0x28 noneVideoViewIsShow:1 dayEnd:0]（receiver 实际挂 SDPlayer）
+// 打印调用时刻、参数（dayStart/dayEnd）与当前 currentTimeStamp，判断是"无录像数据"还是"播放未起"
+static void ja_sd_noneVideoViewIsShow(id self, SEL _cmd, long long dayStart, long long dayEnd) {
+    NSNumber *ts = JAVal(self, @"currentTimeStamp");
+    JALog(@"[noneVideoViewIsShow:dayEnd:] dayStart=%lld dayEnd=%lld currentTimeStamp=%@ (⚠ 当前时间无录像提示)",
+          dayStart, dayEnd, ts);
+    if (g_orig_noneVideoViewIsShow) {
+        ((void(*)(id, SEL, long long, long long))g_orig_noneVideoViewIsShow)(self, _cmd, dayStart, dayEnd);
+    }
+}
+
+// v1.11 诊断：respDeviceSDPlayerStatus: —— SD 播放器状态回调（播放是否真正启动/切源）
+// 打印 arg 内容，判断 seekTo 后官方是否发起 SD 录像播放、还是仍在实时流
+static void ja_sd_respDeviceSDPlayerStatus(id self, SEL _cmd, id arg) {
+    JALog(@"[respDeviceSDPlayerStatus:] arg=%@ class=%@",
+          arg, arg ? NSStringFromClass([arg class]) : @"nil");
+    if (g_orig_respSDPlayerStatus) ((void(*)(id, SEL, id))g_orig_respSDPlayerStatus)(self, _cmd, arg);
 }
 
 // v1.5：viewWillAppear hook —— 原实现后强制打开"拉取开关"
@@ -891,6 +929,11 @@ static void JAHook(void) {
                      &g_orig_getCurrentEvent);
             JASetImp(sdCls, @selector(seekTo:duration:), (IMP)ja_sd_seekTo_duration,
                      &g_orig_seekTo);
+            // v1.11 诊断：无录像提示 + 播放状态回调（确认 seekTo 后播放链路状态）
+            JASetImp(sdCls, @selector(noneVideoViewIsShow:dayEnd:), (IMP)ja_sd_noneVideoViewIsShow,
+                     &g_orig_noneVideoViewIsShow);
+            JASetImp(sdCls, @selector(respDeviceSDPlayerStatus:), (IMP)ja_sd_respDeviceSDPlayerStatus,
+                     &g_orig_respSDPlayerStatus);
             JAHookLiveGates();
             JASDHooked = YES;
         } else {
@@ -902,7 +945,7 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.10 injected");
+    JALog(@"JoolinkSDReplay v1.11 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewSDPlayerViewController")) {
         JAHook();
