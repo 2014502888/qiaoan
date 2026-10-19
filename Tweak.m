@@ -321,6 +321,31 @@ static id g_activeSDPlayer = nil;
 static BOOL g_rtcHooked = NO;        // JANewRtcSDPlayViewController viewDidAppear hook 已装
 static IMP g_orig_rtc_vda = NULL;    // 原 viewDidAppear: IMP
 static long long g_rtcTargetSec = 0; // 报警时间戳（秒），viewDidAppear 后自动定位播放
+// v1.24：运行时枚举指定对象的方法清单（过滤日期/加载/刷新相关），用于定位官方
+// "选日期→加载事件"的准确接口（v1.23 实证 VC 与 viewModel 上 loadDataFirstWithDate:
+// 运行时均无，方法名/归属不能再猜）。
+static void JADumpRtcMethods(id obj, NSString *tag) {
+    if (!obj) { JALog(@"[DIAG %@] obj=nil", tag); return; }
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList([obj class], &count);
+    NSMutableArray *names = [NSMutableArray array];
+    for (unsigned int i = 0; i < count; i++) {
+        SEL sel = method_getName(methods[i]);
+        NSString *n = NSStringFromSelector(sel);
+        if ([n containsString:@"loadData"] || [n containsString:@"Date"] ||
+            [n containsString:@"SDDay"] || [n containsString:@"select"] ||
+            [n containsString:@"reload"] || [n containsString:@"Refresh"] ||
+            [n containsString:@"Calendar"] || [n containsString:@"calendar"] ||
+            [n containsString:@"Segement"] || [n containsString:@"segment"]) {
+            [names addObject:n];
+        }
+    }
+    free(methods);
+    JALog(@"[DIAG %@] class=%s 命中方法(%lu): %@",
+          tag, class_getName([obj class]), (unsigned long)names.count,
+          [names componentsJoinedByString:@" | "]);
+}
+
 // v1.17：首帧确认 + 自动重试（时间轴拖条不跟随定位的根治）
 static BOOL g_rtcFirstFrameHooked = NO;  // respDeviceFirstFrameTimeStamp: hook 已装
 static IMP g_orig_rtc_firstframe = NULL; // 原 respDeviceFirstFrameTimeStamp: IMP（数值签名）
@@ -532,16 +557,28 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         NSDateFormatter *df = [[NSDateFormatter alloc] init];
         df.dateFormat = @"yyyy-MM-dd";
         NSString *ds = [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:sec]];
-        SEL scd = NSSelectorFromString(@"setCurrentDateStr:");
-        if ([self respondsToSelector:scd]) {
-            ((void(*)(id, SEL, id))objc_msgSend)(self, scd, ds);
-            JALog(@"[RTC-SD] setCurrentDateStr: %@（顶部日期=报警日）", ds);
-        }
-        // v1.23 修正：loadDataFirstWithDate: 在 **viewModel** 上（(7).log 实证 VC
-        // respondsToSelector=NO，官方手动选日期实际走 viewModel）。KVC 取 viewModel 再调。
+        // v1.24：运行时枚举诊断 —— 不再猜方法归属。把 VC / viewModel 上所有
+        // loadData/Date/SDDay/reload/Refresh/Calendar/select 相关方法真实清单打进日志，
+        // 一次拿准官方"选日期→加载事件"的准确接口。
         id vm = nil;
         @try { vm = [self valueForKey:@"viewModel"]; } @catch (NSException *e) {
             JALog(@"!! 取 viewModel 异常: %@", e);
+        }
+        JADumpRtcMethods(self, @"VC");
+        if (vm) {
+            JADumpRtcMethods(vm, @"VM");
+        } else {
+            JALog(@"[DIAG] viewModel=nil（KVC viewModel 无值）");
+        }
+        // 双目标尝试：setCurrentDateStr: / loadDataFirstWithDate: 优先 viewModel，兜底 self
+        SEL scd = NSSelectorFromString(@"setCurrentDateStr:");
+        id scdTarget = ([vm respondsToSelector:scd]) ? vm : (id)self;
+        if (scdTarget && [scdTarget respondsToSelector:scd]) {
+            ((void(*)(id, SEL, id))objc_msgSend)(scdTarget, scd, ds);
+            JALog(@"[RTC-SD] setCurrentDateStr: %@ on %@（顶部日期=报警日）",
+                  ds, (scdTarget == vm) ? @"viewModel" : @"self");
+        } else {
+            JALog(@"!! RTC-SD 无 setCurrentDateStr:（VC 与 viewModel 均无）");
         }
         SEL ldf = NSSelectorFromString(@"loadDataFirstWithDate:showHud:isTableRefresh:finish:");
         id ldfTarget = ([vm respondsToSelector:ldf]) ? vm : (id)self;
@@ -767,7 +804,7 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.23 injected");
+    JALog(@"JoolinkSDReplay v1.24 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
