@@ -513,8 +513,29 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
 // 链：VC.timeLineView（懒加载 getter，自动创建并初始化）→
 //     [timeLineView changeCurrentTimeStamp:sec]（官方 API 0x1000ff834：
 //     内部 setCurrentSec: + adjustScrollViewOffsetAtCurrentSec + setLastDisplaySec:）。
+// v1.19 关键修正：changeCurrentTimeStamp: 的入参是「当日内的相对秒」（0~86399），
+// 不是绝对 Unix 秒！v1.18 实测传 1792407777（绝对秒）→ 官方按 秒/3600 算小时
+// → 标签显示 497891:02:57（应为 19:02:57），指示器滚出当日范围 → 拖动无录像。
+// 修正：相对秒 = 报警秒 - 北京当日0点（= myCamera.sdSelectiontDay，日志确认
+// 1792407777 - 1792339200 = 68577 = 19:02:57）。兜底公式 (sec + 28800) % 86400。
 static void JATimeLineSyncToSec(id sdVC, long long sec) {
     @autoreleasepool {
+        long long dayStart = 0;
+        @try {
+            dayStart = [[sdVC valueForKeyPath:@"myCamera.sdSelectiontDay"] longLongValue];
+        } @catch (NSException *e) {
+            JALog(@"!! 读 sdSelectiontDay 异常: %@", e);
+        }
+        if (dayStart < 1000000000LL) {
+            // 兜底：北京当日0点（UTC 秒）= sec - ((sec + 28800) % 86400)
+            dayStart = sec - ((sec + 28800LL) % 86400LL);
+            JALog(@"[RTC-SD] sdSelectiontDay 不可读，兜底 dayStart=%lld", dayStart);
+        }
+        long long rel = sec - dayStart;   // 当日相对秒 0~86399
+        if (rel < 0) rel = 0;
+        if (rel > 86399) rel = 86399;
+        JALog(@"[RTC-SD] 时间轴参数: 绝对=%lld 当日0点=%lld → 相对秒=%lld (应≈时:分:秒)", sec, dayStart, rel);
+
         id tl = nil;
         @try { tl = [sdVC valueForKey:@"timeLineView"]; }
         @catch (NSException *e) { JALog(@"!! timeLineView KVC 异常: %@", e); }
@@ -522,12 +543,10 @@ static void JATimeLineSyncToSec(id sdVC, long long sec) {
             JALog(@"!! timeLineView 为 nil，无法拨时间轴");
             return;
         }
-        JALog(@"[RTC-SD] 拨时间轴: timeLineView=%@ class=%@ → changeCurrentTimeStamp: %lld",
-              tl, NSStringFromClass([tl class]), sec);
         SEL c = NSSelectorFromString(@"changeCurrentTimeStamp:");
         if ([tl respondsToSelector:c]) {
-            ((void(*)(id, SEL, long long))objc_msgSend)(tl, c, sec);
-            JALog(@"[RTC-SD] changeCurrentTimeStamp: 已调用（指示器应已拨到报警时间点）");
+            ((void(*)(id, SEL, long long))objc_msgSend)(tl, c, rel);
+            JALog(@"[RTC-SD] changeCurrentTimeStamp: 已调用（相对秒 %lld → 指示器/标签应正确）", rel);
         } else {
             JALog(@"!! timeLineView 无 changeCurrentTimeStamp:");
         }
@@ -674,7 +693,7 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.18 injected");
+    JALog(@"JoolinkSDReplay v1.19 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
