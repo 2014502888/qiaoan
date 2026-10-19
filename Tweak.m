@@ -314,6 +314,7 @@ static long long JADayStartSec(NSNumber *ts) {
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
 static void ja_rtc_viewDidAppear(id self, SEL _cmd);
 static void ja_rtc_respFirstFrame(id self, SEL _cmd, long long ts);
+static void JATimeLineSyncToSec(id sdVC, long long sec);
 
 // v1.15：当前活跃 RTC SD 播放器指针（纯 C 比较守卫，不向对象发消息）
 static id g_activeSDPlayer = nil;
@@ -461,7 +462,13 @@ static IMP g_orig_handleJumpToOpenCloud = NULL;
 // → 官方建流/定位到报警时间。
 // v1.17：延迟 0.4s→3.0s（反汇编 block 执行体 0x100b0c9cc 预检查 streamCtx/
 // isSeekingPlay，0.4s 时官方未就绪 → 预检查失败 → 定位不执行 → 播最新）。
-// 定位是否生效由 respDeviceFirstFrameTimeStamp: 首帧时间确认，不匹配自动重试。
+// v1.18：用户实测画面已播报警时间，但底部时间轴拖条指示器仍停最新 ——
+// 反汇编定案：VC setCurrentTimeStamp:（0x100b0bf30）是纯 ivar setter（str x2
+// → ivar，ret），官方播放进度从不驱动时间轴；时间轴指示器唯一更新入口 =
+// JATimeLineView changeCurrentTimeStamp:（0x1000ff834：setCurrentSec: +
+// adjustScrollViewOffsetAtCurrentSec 滚动 + setLastDisplaySec: + 更新顶部时间标签）。
+// 修法：定位调用后再延迟 1.0s，主动调 timeLineView changeCurrentTimeStamp:sec
+// → 指示器/滚动位置/时间标签全部拨到报警时间点。
 static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     if (g_orig_rtc_vda) ((void(*)(id, SEL))g_orig_rtc_vda)(self, _cmd);
     if (self != g_activeSDPlayer) {
@@ -490,7 +497,41 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         } else {
             JALog(@"!! RTC-SD 无 startSDPlayWithSelectTimeStamp:");
         }
+        // v1.18：播放定位已发出，再等 1.0s 拨时间轴指示器到报警时间点
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self != g_activeSDPlayer) {
+                JALog(@"[RTC-SD] 拨时间轴时已离开页面，跳过");
+                return;
+            }
+            JATimeLineSyncToSec(self, sec);
+        });
     });
+}
+
+// v1.18：把官方时间轴指示器/滚动位置/时间标签同步到指定秒。
+// 链：VC.timeLineView（懒加载 getter，自动创建并初始化）→
+//     [timeLineView changeCurrentTimeStamp:sec]（官方 API 0x1000ff834：
+//     内部 setCurrentSec: + adjustScrollViewOffsetAtCurrentSec + setLastDisplaySec:）。
+static void JATimeLineSyncToSec(id sdVC, long long sec) {
+    @autoreleasepool {
+        id tl = nil;
+        @try { tl = [sdVC valueForKey:@"timeLineView"]; }
+        @catch (NSException *e) { JALog(@"!! timeLineView KVC 异常: %@", e); }
+        if (!tl) {
+            JALog(@"!! timeLineView 为 nil，无法拨时间轴");
+            return;
+        }
+        JALog(@"[RTC-SD] 拨时间轴: timeLineView=%@ class=%@ → changeCurrentTimeStamp: %lld",
+              tl, NSStringFromClass([tl class]), sec);
+        SEL c = NSSelectorFromString(@"changeCurrentTimeStamp:");
+        if ([tl respondsToSelector:c]) {
+            ((void(*)(id, SEL, long long))objc_msgSend)(tl, c, sec);
+            JALog(@"[RTC-SD] changeCurrentTimeStamp: 已调用（指示器应已拨到报警时间点）");
+        } else {
+            JALog(@"!! timeLineView 无 changeCurrentTimeStamp:");
+        }
+    }
 }
 
 // v1.17 核心：respDeviceFirstFrameTimeStamp: hook —— 首帧时间确认 + 自动重试。
@@ -633,7 +674,7 @@ static void JAHook(void) {
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
-    JALog(@"JoolinkSDReplay v1.17 injected");
+    JALog(@"JoolinkSDReplay v1.18 injected");
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
