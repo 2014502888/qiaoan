@@ -436,18 +436,10 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
         JALog(@"已设置 currentEvent/currentTimeStamp/eventList");
     }
 
-    // v1.11 兜底：显式 setIsSDPlayer:YES —— 官方 viewDidLoad 自会设，但 seekTo 后播放未起，
-    // 显式设一次保证 SD 播放模式标志位就位（幂等，重复设无害）
-    @try {
-        if ([vc respondsToSelector:NSSelectorFromString(@"setIsSDPlayer:")]) {
-            ((void(*)(id, SEL, BOOL))objc_msgSend)(vc, NSSelectorFromString(@"setIsSDPlayer:"), YES);
-            JALog(@"已显式 setIsSDPlayer:YES（SD 播放模式标志位就位）");
-        } else {
-            JALog(@"!! SDPlayer 无 setIsSDPlayer: 方法");
-        }
-    } @catch (NSException *e) {
-        JALog(@"!! setIsSDPlayer:YES 异常: %@", e);
-    }
+    // v1.11 曾加 setIsSDPlayer:YES（push 前显式）—— 实测导致点看录像直接闪退
+    // （v1.11 crash: objc_msgSend ← dylib+0x59AC ← dispatch_after 补拉闭包, receiver=0x20）
+    // 提前调用改变了官方 viewDidLoad 初始化时序（v1.4 已确认官方 viewDidLoad 自会设），
+    // 移除恢复 v1.10 行为。setIsSDPlayer 交给官方 viewDidLoad 自己处理。
 
     // 4) push
     UINavigationController *nav = detailVC.navigationController;
@@ -562,6 +554,13 @@ static void JASDForcePullEventList(long long dayStart, double delaySec) {
         id live = JAVal(inst, @"live");
         if (!live) {
             JALog(@"!! live=nil");
+            return;
+        }
+        // v1.11.2 保险：live 必须是 JALiveManager 才继续（防状态异常时读到非预期对象）
+        Class liveCls = [live class];
+        if (liveCls != NSClassFromString(@"JALiveManager")) {
+            JALog(@"!! live 类型异常 class=%@（预期 JALiveManager），跳过补拉",
+                  liveCls ? NSStringFromClass(liveCls) : @"nil");
             return;
         }
         JASDEnsureGetEventListHook(live);
