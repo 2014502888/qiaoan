@@ -616,8 +616,12 @@ static void JAFallbackSeek(id sdPlayer) {
     if (!ts || ts.longLongValue <= 0) return;
     SEL seek = NSSelectorFromString(@"seekTo:duration:");
     // 1) 按偏移 0x28 直读（反汇编：seekTo receiver = self+0x28，且该对象持 currentTimeStamp）
+    // ARC 下 ObjC 指针不能裸转 char*，须经 __bridge void* + __unsafe_unretained id*
     id vm = nil;
-    @try { vm = *(id *)((char *)sdPlayer + 0x28); } @catch (NSException *e) { vm = nil; }
+    @try {
+        void *raw = (__bridge void *)sdPlayer;
+        vm = *((__unsafe_unretained id *)((char *)raw + 0x28));
+    } @catch (NSException *e) { vm = nil; }
     if (vm) {
         JALog(@"[兜底] self+0x28 = %@ (类=%@) seekTo响应=%d",
               vm, NSStringFromClass([vm class]),
