@@ -532,7 +532,10 @@ static void JASDEnsureGetEventListHook(id live) {
 // getEventListWithSelectiontDay:detectionType: —— 设备返回后走官方
 // respDeviceSdEventList: 回调 → 读 currentTimeStamp → seekTo: 定位播放
 // v1.6：delaySec 延迟秒数（多轮补拉），detectType 传 0（比 -1 更可能命中通用列表）
-static void JASDForcePullEventList(long long dayStart, double delaySec) {
+// v1.5~v1.11：主动拉取 SD 事件列表 —— v1.12 起不再调用（官方 viewDidAppear 自行拉取已成功，
+// 本闭包是 v1.11/v1.11.2 崩溃源：dispatch_after 补拉时 JADevicePlatform.live=0x20 → SIGSEGV）。
+// 保留定义备查。
+static void JASDForcePullEventList(long long dayStart, double delaySec) __attribute__((unused)) {
     if (dayStart <= 0) return;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delaySec * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -875,17 +878,16 @@ static void ja_sd_viewDidAppear(id self, SEL _cmd) {
         return;
     }
     if (g_orig_sd_vda) ((void(*)(id, SEL))g_orig_sd_vda)(self, _cmd);
-    NSNumber *ts = JAVal(self, @"currentTimeStamp");
-    long long dayStart = JADayStartSec(ts);
-    if (dayStart <= 0) {
-        JALog(@"!! SDPlayer viewDidAppear: 无有效秒级时间戳，跳过补拉");
-        return;
-    }
-    // v1.6：多轮补拉（3s/7s/12s），提高设备连接完成后拉取命中率
-    JASDForcePullEventList(dayStart, 3);
-    JASDForcePullEventList(dayStart, 7);
-    JASDForcePullEventList(dayStart, 12);
-    JALog(@"SDPlayer viewDidAppear: 已排定 3/7/12s 三轮补拉事件列表 dayStart=%lld", dayStart);
+    // v1.12：移除 3/7/12s 主动补拉。
+    // 崩溃铁证（v1.11 110809 / v1.11.2 111655）：两次 EXC_BAD_ACCESS 地址 0x20，
+    // 栈均为 libdispatch(dispatch_after) → dylib → objc_msgSend（receiver=0x20），
+    // dylib 内唯一 dispatch_after = 本补拉闭包。补拉在 [live class]/valueForKey 处
+    // 拿到 JADevicePlatform.live=0x20（官方消费链中 live 状态异常）→ SIGSEGV。
+    // v1.11.2 实测日志证明官方 viewDidAppear 自己拉取列表已成功（resp 12 条、事件齐全、
+    // seekTo 命中、getCurrentEventWithTimeStamp 命中），补拉（v1.5 设备未连上兜底）已无必要。
+    // 官方链：viewWillAppear 强制 pendingReload → viewDidAppear 官方拉取 → resp → seekTo → 播放。
+    JALog(@"SDPlayer viewDidAppear: 已由官方自行拉取事件列表（viewWillAppear 已强制 pendingReload=%lld）",
+          JADayStartSec(JAVal(self, @"currentTimeStamp")));
 }
 
 // 防抖：同一详情页实例 2 秒内只 push 一次 SDPlayer（官方可能触发两次点击事件 → 双 push 闪烁）
