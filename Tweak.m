@@ -1,6 +1,10 @@
 // JoolinkSDReplay — 乔安智联 4.4.67 报警消息 → 直达本地 SD 卡录像
 // v1.26（清理版）：移除日志系统（jasdreplay.log）、v1.17 首帧确认 hook
 // （respDeviceFirstFrameTimeStamp: 官方链不触发，挂空无用）、JADumpWarnInfo 诊断。
+// v1.27：修正 JADayStartSec 公式 —— 旧实现"UTC当日0点-28800"在北京凌晨 0~8 点
+//   （UTC 前一日 16~24 点）跨 UTC 日算错 → 10-21 00:21 报警 dayStart 错成 10-20
+//   0点 → 相对秒 87660 clip 23:59:59 + switchToSDDay 日期串与秒数不匹配播实时。
+//   改为 sec-((sec+28800)%86400)（v1.19 兜底式，正确统一处理凌晨与晚上）。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）→
@@ -217,14 +221,19 @@ static NSNumber *JABuildTimestamp(id warn) {
 }
 
 // 从秒级时间戳算"报警日 0 点秒"（本地时区语义 = 北京时间 00:00）
-// 正确公式：epoch 秒先取 UTC 当天 0 点，再减 28800（东八区）→ 北京 00:00。
-// 例：1792378567（北京 10-19 10:56:07）→ (1792378567-1792378567%86400)-28800 = 1792339200
+// 正确公式：sec - ((sec + 28800) % 86400)（东八区，正确处理北京凌晨 0~8 点）。
+// ⚠ 不能按"UTC 当日 0 点 - 28800"算：北京凌晨 0~8 点 = UTC 前一日 16~24 点，
+//   会跨 UTC 日 → 得出前一日北京 0 点（v1.26 实测 bug：10-21 00:21 报警 →
+//   dayStart 错成 10-20 0点 → 相对秒 87660 → clip 23:59:59；switchToSDDay 日期串
+//   与秒数不匹配 → 定位失败播实时）。晚上时段（北京日==UTC 日）旧公式碰巧正确，
+//   所以 v1.25 测 10-19 23:13 未暴露。
+// 例：1792513260（北京 10-21 00:21）→ (1792513260+28800)%86400=1260 →
+//     1792513260-1260 = 1792512000（北京 10-21 00:00）
 static long long JADayStartSec(NSNumber *ts) {
     if (!ts) return 0;
     long long v = ts.longLongValue;
     if (v >= 1000000000LL && v < 10000000000LL) {
-        long long utcMid = v - (v % 86400LL);  // UTC 当天 0 点
-        return utcMid - 28800LL;               // 减 8 小时 → 北京当天 00:00
+        return v - ((v + 28800LL) % 86400LL);
     }
     return 0;
 }
