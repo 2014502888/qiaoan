@@ -28,10 +28,10 @@
 //   保留 viewDidDisappear 0.3s 停流（返回流量不再跑，v1.30，无副作用）。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
-//   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）→
+//   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
 //   switchToSDDay:dateString:（官方选日入口，切到报警日并加载其事件，跨天修正）
-//   → 重设 myCamera.sdSelectiontDay=报警日0点 → 1.5s startSDPlayWithSelectTimeStamp:
-//   （定位报警秒）→ 1.5s JATimeLineSyncToSec（拨时间轴指示器/时间标签到报警时间）。
+//   + 重设 myCamera.sdSelectiontDay=报警日0点 → 再 2.5s startSDPlayWithSelectTimeStamp:
+//   （定位报警秒）→ 再 1.5s JATimeLineSyncToSec（拨时间轴指示器/时间标签到报警时间）。
 //
 // 关键定案（git 提交记录含完整历史）：
 //   v1.15：官方本地 SD 回放界面 = JANewRtcSDPlayViewController（时间轴/日历选日/
@@ -116,7 +116,6 @@ static id JAFindCameraFromGroupManager(id warn, NSString **src) {
     id gm = JAGroupManagerShared();
     if (!gm) return nil;
 
-    id map = JAVal(gm, @"myCameraMap");
     NSString *eid = JANormId(JAVal(warn, @"eid"));
 
     // 1) getMyCameraWithUid:eid 直查（myCameraMap[eid]）
