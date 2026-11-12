@@ -1463,7 +1463,7 @@ static id JAGridCameraForView(UIView *v) {
                 } @catch (NSException *e) {}
             }
         }
-        id ownUid = JANormId(JAVal(owner, @"uid"));
+        NSString *ownUid = JANormId(JAVal(owner, @"uid"));
         if (ownUid.length) {
             id gm = JAGroupManagerShared();
             @try {
