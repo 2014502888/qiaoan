@@ -1179,11 +1179,6 @@ static NSString *JAGridImageURL(id ev) {
     self.navigationItem.rightBarButtonItem.title = self.autoNext ? @"连播 开" : @"连播 关";
 }
 
-- (void)toggleAutoNext {
-    self.autoNext = !self.autoNext;
-    self.navigationItem.rightBarButtonItem.title = self.autoNext ? @"连播 开" : @"连播 关";
-}
-
 @end
 
 // 官方本地回放页右上角加一个「格子」入口（不替换官方任何按钮）
