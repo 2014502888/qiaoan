@@ -7,6 +7,7 @@ LIBRARY_NAME = JoolinkSDReplay
 
 JoolinkSDReplay_FILES = Tweak.m
 JoolinkSDReplay_CFLAGS = -fobjc-arc -Wno-deprecated-declarations
+JoolinkSDReplay_FRAMEWORKS = UIKit Foundation CoreGraphics QuartzCore
 JoolinkSDReplay_INSTALL_PATH = /usr/lib
 JoolinkSDReplay_LDFLAGS = -install_name @rpath/JoolinkSDReplay.dylib
 
