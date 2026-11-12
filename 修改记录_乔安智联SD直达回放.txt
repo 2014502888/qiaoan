@@ -157,3 +157,10 @@ GitHub Actions 编译产物 `JoolinkSDReplay-v1.32.dylib`。
 
 ### 测试路径
 乔安智联 → 设备 → 本地回放（进入 `JANewRtcSDPlayViewController`）→ 右上角「格子」→ 看到 3 列卡片 → 点任意卡片 → 定位到该秒并播放 → 38s 后自动回格子页并播下一格。
+
+### 编译修正（首次云端编译踩到的两个坑）
+1. `duplicate declaration of method 'toggleAutoNext'`：追加段落时重复写了一份，删掉。
+2. `Undefined symbols: _CGRectZero`：dylib 只链了 UIKit/Foundation，补 `-framework CoreGraphics -framework QuartzCore`（workflow / build.sh / Makefile 三处一致）。
+3. 顺手加 `.gitignore` 忽略 `*.dylib`，避免把编译产物提交进仓库。
+
+构建产物：`JoolinkSDReplay-v2.0.dylib`（GitHub Actions macos-latest / arm64 / iOS 13+）。
