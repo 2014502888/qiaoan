@@ -572,6 +572,7 @@ static BOOL JAGridIsJunk(id o) {
 // 这里改成「打分」：数组元素只要有抓拍图字段 / 时间字段 / 类名带 Event 就是候选，
 // 全树收集候选后取代分最高的那个（v2.1 修正：原来只认字典导致找不到列表）。
 static NSString *JAGridImageURL(id ev);
+static NSNumber *JAGridTimestamp(id ev);
 
 static BOOL JAGridIsPlainJunk(id o) {
     if (!o) return YES;
@@ -589,11 +590,12 @@ static int JAGridScoreElement(id o) {
         if (d[@"event_file_url"]) s += 6;
     }
     if (JAGridImageURL(o)) s += 6;
-    if (JABuildTimestamp(o)) s += 2;
+    if (JAGridTimestamp(o)) s += 2;
     NSString *cn = NSStringFromClass(object_getClass(o));
     if (cn.length) {
         if ([cn rangeOfString:@"event" options:NSCaseInsensitiveSearch].location != NSNotFound) s += 2;
         if ([cn rangeOfString:@"warn" options:NSCaseInsensitiveSearch].location != NSNotFound) s += 1;
+        if ([cn rangeOfString:@"record" options:NSCaseInsensitiveSearch].location != NSNotFound) s += 2;
     }
     return s;
 }
@@ -655,10 +657,11 @@ static NSArray *JAGridFindEvents(id vc) {
     if (!vc) return nil;
     NSMutableArray *cands = [NSMutableArray array];
     NSMutableSet *seen = [NSMutableSet set];
-    NSArray *keys = @[@"eventList", @"eventLists", @"events", @"eventArray", @"eventModelList",
-                      @"dataArray", @"dataList", @"listArray", @"records", @"recordList",
-                      @"warnList", @"warningList", @"currentEventList", @"sdEventList",
-                      @"mEventList", @"allEvents", @"viewModel", @"mViewModel",
+    NSArray *keys = @[@"sdRecordFileArr", @"recordFileArr", @"recordFileList", @"sdRecordFileList",
+                      @"recordFiles", @"fileArr", @"eventList", @"eventLists", @"events",
+                      @"eventArray", @"eventModelList", @"dataArray", @"dataList", @"listArray",
+                      @"records", @"recordList", @"warnList", @"warningList", @"currentEventList",
+                      @"sdEventList", @"mEventList", @"allEvents", @"viewModel", @"mViewModel",
                       @"playerModel", @"sdModel", @"dataSource", @"adapter"];
     for (NSString *k in keys) {
         JAGridCollect(JAVal(vc, k), 4, seen, cands);
@@ -767,6 +770,28 @@ static NSString *JAGridProbeText(id vc) {
     [s appendFormat:@"IVAR=%@\n", JAGridIvarNames(vc, 3, 30)];
     [s appendFormat:@"SEL=%@\n", JAGridMethodNames(vc)];
 
+    // 直接看几个关键属性的值/条数（最有用：能立刻判断「列表有没有被拉回来」）
+    for (NSString *k in @[@"sdRecordFileArr", @"currentSelectedSDDay", @"currentSDDay",
+                         @"isLoadCacheEventList", @"isReLoadNormalEventList",
+                         @"currentEvent", @"todayMaxTimestamp"]) {
+        id v = JAVal(vc, k);
+        if (!v) continue;
+        if ([v isKindOfClass:NSArray.class]) {
+            NSArray *a = (NSArray *)v;
+            NSString *cn = a.count ? NSStringFromClass(object_getClass([a objectAtIndex:0])) : @"-";
+            [s appendFormat:@"KVC %@ count=%lu first=%@\n", k, (unsigned long)a.count, cn];
+            if (a.count) {
+                NSString *d = [[a objectAtIndex:0] description];
+                if (d.length > 200) d = [d substringToIndex:200];
+                [s appendFormat:@"   %@\n", d];
+            }
+        } else {
+            NSString *d = [v description];
+            if (d.length > 120) d = [d substringToIndex:120];
+            [s appendFormat:@"KVC %@ = %@\n", k, d];
+        }
+    }
+
     NSMutableArray *cands = [NSMutableArray array];
     NSMutableSet *seen = [NSMutableSet set];
     JAGridCollect(vc, 4, seen, cands);
@@ -798,12 +823,81 @@ static NSString *JAGridProbeText(id vc) {
 
 static NSString *JAGridImageURL(id ev) {
     NSArray *keys = @[@"event_file_url", @"event_pic_url", @"event_pic", @"picUrl",
-                      @"pic_url", @"event_img", @"imageUrl", @"snapUrl", @"eventImagePath"];
+                      @"pic_url", @"event_img", @"imageUrl", @"snapUrl", @"eventImagePath",
+                      @"recordFileUrl", @"record_file_url", @"fileUrl", @"file_url",
+                      @"coverUrl", @"thumbUrl", @"imgUrl", @"eventPicUrl"];
     for (NSString *k in keys) {
         id v = JAVal(ev, k);
         if ([v isKindOfClass:NSString.class] && [(NSString *)v length] > 8) return (NSString *)v;
     }
     return nil;
+}
+
+// 时间字段兜底：SD 录像模型不一定叫 event_*，这里把常见命名都试一遍，
+// 能取到 10 位秒就返回（文件名内嵌秒优先，其次数值字段/时间字符串）
+static NSNumber *JAGridTimestamp(id ev) {
+    NSNumber *t = JABuildTimestamp(ev);
+    if (t) return t;
+    NSArray *numKeys = @[@"startTime", @"startTimestamp", @"beginTime", @"recordStartTime",
+                         @"createTime", @"time", @"timestamp", @"eventTime"];
+    for (NSString *k in numKeys) {
+        id v = JAVal(ev, k);
+        if ([v isKindOfClass:NSNumber.class]) {
+            long long n = [(NSNumber *)v longLongValue];
+            if (n > 1000000000000LL) n /= 1000;      // 毫秒转秒
+            if (n >= 1000000000LL && n < 10000000000LL) return @(n);
+        }
+        if ([v isKindOfClass:NSString.class]) {
+            NSString *s = (NSString *)v;
+            if (s.length >= 10) {
+                long long n = s.longLongValue;
+                if (n > 1000000000000LL) n /= 1000;
+                if (n >= 1000000000LL && n < 10000000000LL) return @(n);
+            }
+        }
+    }
+    NSArray *strKeys = @[@"fileName", @"name", @"file_name", @"recordFileUrl", @"fileUrl"];
+    for (NSString *k in strKeys) {
+        id v = JAVal(ev, k);
+        if (![v isKindOfClass:NSString.class]) continue;
+        NSString *s = (NSString *)v;
+        if (s.length < 10) continue;
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"(\\d{10})"
+                                                                            options:0 error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:s options:0 range:NSMakeRange(0, s.length)];
+        if (m && m.numberOfRanges > 1) {
+            NSString *sec = [s substringWithRange:[m rangeAtIndex:1]];
+            long long n = sec.longLongValue;
+            if (n >= 1000000000LL && n < 10000000000LL) return @(n);
+        }
+    }
+    return nil;
+}
+
+// 按运行时类型编码调「单参数」方法：参数可能是 long long，也可能是对象，猜错会崩
+static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg, BOOL forceObject) {
+    if (!obj || !selName.length) return NO;
+    SEL sel = NSSelectorFromString(selName);
+    Method m = class_getInstanceMethod(object_getClass(obj), sel);
+    if (!m) return NO;
+    const char *enc = method_getTypeEncoding(m);
+    char t = 0;
+    if (enc) {
+        const char *p = enc;
+        while (*p && *p != ':') p++;
+        if (*p == ':') {
+            p++;
+            while (*p >= '0' && *p <= '9') p++;
+            t = *p;
+        }
+    }
+    if (t == '@' || forceObject) {
+        if (!objArg) return NO;
+        ((void (*)(id, SEL, id))objc_msgSend)(obj, sel, objArg);
+    } else {
+        ((void (*)(id, SEL, long long))objc_msgSend)(obj, sel, num);
+    }
+    return YES;
 }
 
 // ---------- 图片缓存（内存 + 并发限流） ----------
@@ -1075,6 +1169,24 @@ static NSString *JAGridImageURL(id ev) {
     [self.retained addObject:dataVC];
     while (self.retained.count > 4) [self.retained removeObjectAtIndex:0];
 
+    // 关键（v2.3）：诊断显示列表存在（sdRecordFileArr / loadRecordListWithSelectiontDay:）
+    // 但为空 —— 说明官方这页自己没去拉。这里主动触发：先设选中日，再调 v1.28 已验证
+    // 的 switchToSDDay:dateString:（内部会转发触发该日事件列表加载），最后兜底直接调
+    // loadRecordListWithSelectiontDay:（参数类型运行时判断，避免猜错崩溃）。
+    @try { JASet(dataVC, @"currentSelectedSDDay", @(dayStart)); } @catch (NSException *e) {}
+    NSDateFormatter *dfDay = [[NSDateFormatter alloc] init];
+    dfDay.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    dfDay.dateFormat = @"yyyy-MM-dd";
+    NSString *dayStr = [dfDay stringFromDate:[NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)dayStart]];
+    SEL swDay = NSSelectorFromString(@"switchToSDDay:dateString:");
+    @try {
+        if ([dvc respondsToSelector:swDay]) {
+            ((void (*)(id, SEL, long long, id))objc_msgSend)(dvc, swDay, dayStart, dayStr);
+        }
+    } @catch (NSException *e) {}
+    @try { JAGridCallOneArg(dvc, @"loadRecordListWithSelectiontDay:", dayStart, @(dayStart), NO); }
+    @catch (NSException *e) {}
+
     [self gridTryFetch:dataVC attempt:0 completion:cb];
 }
 
@@ -1156,7 +1268,7 @@ static NSString *JAGridImageURL(id ev) {
 - (void)appendDay:(long long)day events:(NSArray *)events {
     NSMutableArray *items = [NSMutableArray array];
     for (id ev in events) {
-        NSNumber *ts = JABuildTimestamp(ev);
+        NSNumber *ts = JAGridTimestamp(ev);
         if (!ts) continue;
         long long sec = ts.longLongValue;
         if (sec < 1000000000LL || sec > 10000000000LL) continue;   // 只要 10 位秒
