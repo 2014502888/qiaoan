@@ -568,66 +568,92 @@ static BOOL JAGridIsJunk(id o) {
     return NO;
 }
 
-static BOOL JAGridLooksLikeEvent(id o) {
-    if (!o || JAGridIsJunk(o)) return NO;
-    if ([o isKindOfClass:NSArray.class]) return NO;
-    if ([o isKindOfClass:NSDictionary.class]) {
-        NSDictionary *d = (NSDictionary *)o;
-        if (d[@"event_file_url"] || d[@"event_time"] || d[@"eventTimeUTC"] || d[@"event_date"]) return YES;
-        return NO;
-    }
-    NSArray *keys = @[@"event_file_url", @"event_time", @"eventTimeUTC", @"event_date"];
-    for (NSString *k in keys) {
-        if (JAVal(o, k)) return YES;
-    }
-    return NO;
+// 官方事件模型是 MYEventModel 对象（不是字典），所以不能只认字典键；
+// 这里改成「打分」：数组元素只要有抓拍图字段 / 时间字段 / 类名带 Event 就是候选，
+// 全树收集候选后取代分最高的那个（v2.1 修正：原来只认字典导致找不到列表）。
+static NSString *JAGridImageURL(id ev);
+
+static BOOL JAGridIsPlainJunk(id o) {
+    if (!o) return YES;
+    if ([o isKindOfClass:UIViewController.class]) return NO;
+    return JAGridIsJunk(o);
 }
 
-static NSArray *JAGridScanValue(id root, int depth, NSMutableSet *seen);
+static int JAGridScoreElement(id o) {
+    if (!o) return -8;
+    if ([o isKindOfClass:NSString.class] || [o isKindOfClass:NSNumber.class]) return -8;
+    if ([o isKindOfClass:NSDate.class] || [o isKindOfClass:NSData.class]) return -8;
+    int s = 0;
+    if ([o isKindOfClass:NSDictionary.class]) {
+        NSDictionary *d = (NSDictionary *)o;
+        if (d[@"event_file_url"]) s += 6;
+    }
+    if (JAGridImageURL(o)) s += 6;
+    if (JABuildTimestamp(o)) s += 2;
+    NSString *cn = NSStringFromClass(object_getClass(o));
+    if (cn.length) {
+        if ([cn rangeOfString:@"event" options:NSCaseInsensitiveSearch].location != NSNotFound) s += 2;
+        if ([cn rangeOfString:@"warn" options:NSCaseInsensitiveSearch].location != NSNotFound) s += 1;
+    }
+    return s;
+}
 
-static NSArray *JAGridScanIvars(id root, int depth, NSMutableSet *seen) {
+static int JAGridScoreArray(NSArray *a) {
+    if (!a || a.count == 0) return -100;
+    int best = -100;
+    NSUInteger n = MIN(a.count, (NSUInteger)4);
+    for (NSUInteger i = 0; i < n; i++) {
+        int s = JAGridScoreElement([a objectAtIndex:i]);
+        if (s > best) best = s;
+    }
+    if (best < 3) return best;
+    if (a.count == 1) best -= 1;
+    return best;
+}
+
+static void JAGridCollect(id root, int depth, NSMutableSet *seen, NSMutableArray *cands) {
+    if (!root || depth <= 0) return;
+    if ([root isKindOfClass:NSArray.class]) {
+        NSArray *a = (NSArray *)root;
+        if (a.count == 0) return;
+        int sc = JAGridScoreArray(a);
+        if (sc >= 3) {
+            [cands addObject:@[a, @(sc)]];
+            return;                      // 已经是事件列表，不用再往下钻
+        }
+        NSUInteger lim = MIN(a.count, (NSUInteger)3);
+        for (NSUInteger i = 0; i < lim; i++) {
+            JAGridCollect([a objectAtIndex:i], depth - 1, seen, cands);
+        }
+        return;
+    }
+    if (JAGridIsPlainJunk(root)) return;
+    NSValue *k = [NSValue valueWithNonretainedObject:root];
+    if ([seen containsObject:k]) return;
+    [seen addObject:k];
+
     Class cls = object_getClass(root);
     int level = 0;
     while (cls && cls != [NSObject class] && level < 3) {
         unsigned int n = 0;
         Ivar *ivars = class_copyIvarList(cls, &n);
         for (unsigned int i = 0; i < n; i++) {
-            const char *enc = ivar_getTypeEncoding(ivars[i]);
+            const char *enc = ivars ? ivar_getTypeEncoding(ivars[i]) : NULL;
             if (!enc || enc[0] != '@') continue;   // 只读对象型 ivar
             id v = nil;
             @try { v = object_getIvar(root, ivars[i]); } @catch (NSException *e) { v = nil; }
-            NSArray *r = JAGridScanValue(v, depth - 1, seen);
-            if (r) { if (ivars) free(ivars); return r; }
+            JAGridCollect(v, depth - 1, seen, cands);
         }
         if (ivars) free(ivars);
         cls = class_getSuperclass(cls);
         level++;
     }
-    return nil;
 }
 
-static NSArray *JAGridScanValue(id root, int depth, NSMutableSet *seen) {
-    if (!root || depth <= 0) return nil;
-    if ([root isKindOfClass:NSArray.class]) {
-        NSArray *arr = (NSArray *)root;
-        if (arr.count == 0) return nil;
-        if (JAGridLooksLikeEvent([arr objectAtIndex:0])) return arr;
-        for (id o in arr) {
-            NSArray *r = JAGridScanValue(o, depth - 1, seen);
-            if (r) return r;
-        }
-        return nil;
-    }
-    if (JAGridIsJunk(root)) return nil;
-    NSValue *k = [NSValue valueWithNonretainedObject:root];
-    if ([seen containsObject:k]) return nil;
-    [seen addObject:k];
-    return JAGridScanIvars(root, depth, seen);
-}
-
-// 在 VC（及其 viewModel/dataSource 等）里找出「事件模型数组」
+// 在 VC（及其 viewModel/dataSource 等）里找出「事件模型数组」（打分取代分最高的）
 static NSArray *JAGridFindEvents(id vc) {
     if (!vc) return nil;
+    NSMutableArray *cands = [NSMutableArray array];
     NSMutableSet *seen = [NSMutableSet set];
     NSArray *keys = @[@"eventList", @"eventLists", @"events", @"eventArray", @"eventModelList",
                       @"dataArray", @"dataList", @"listArray", @"records", @"recordList",
@@ -635,26 +661,30 @@ static NSArray *JAGridFindEvents(id vc) {
                       @"mEventList", @"allEvents", @"viewModel", @"mViewModel",
                       @"playerModel", @"sdModel", @"dataSource", @"adapter"];
     for (NSString *k in keys) {
-        NSArray *r = JAGridScanValue(JAVal(vc, k), 4, seen);
-        if (r) return r;
+        JAGridCollect(JAVal(vc, k), 4, seen, cands);
     }
-    return JAGridScanIvars(vc, 4, seen);
+    JAGridCollect(vc, 4, seen, cands);
+
+    NSArray *best = nil;
+    int bs = 2;                    // 阈值 3 分才认
+    for (NSArray *pair in cands) {
+        int sc = [(NSNumber *)pair[1] intValue];
+        if (sc > bs) { bs = sc; best = (NSArray *)pair[0]; }
+    }
+    return best;
 }
 
-// ---------- 诊断（找不到列表时把结构打到屏幕上，截图就能看到） ----------
+// ---------- 诊断（找不到列表时给出一份结构快照，自动复制到剪贴板） ----------
 
-static NSString *JAGridKeysOf(id obj) {
-    if (!obj) return @"(nil)";
-    if ([obj isKindOfClass:NSDictionary.class]) {
-        return [[(NSDictionary *)obj allKeys] componentsJoinedByString:@","];
-    }
+static NSString *JAGridIvarNames(id obj, int maxLevel, NSUInteger maxCount) {
+    if (!obj) return @"-";
     NSMutableArray *ks = [NSMutableArray array];
     Class cls = object_getClass(obj);
     int level = 0;
-    while (cls && cls != [NSObject class] && level < 2) {
+    while (cls && cls != [NSObject class] && level < maxLevel && ks.count < maxCount) {
         unsigned int n = 0;
         Ivar *iv = class_copyIvarList(cls, &n);
-        for (unsigned int i = 0; i < n && ks.count < 24; i++) {
+        for (unsigned int i = 0; i < n && ks.count < maxCount; i++) {
             const char *nm = ivar_getName(iv[i]);
             if (!nm) continue;
             NSString *s = [NSString stringWithUTF8String:nm];
@@ -667,47 +697,101 @@ static NSString *JAGridKeysOf(id obj) {
     return [ks componentsJoinedByString:@","];
 }
 
-static void JAGridProbeWalk(id root, int depth, NSMutableArray *out, NSMutableSet *seen) {
-    if (!root || depth <= 0 || out.count >= 26) return;
+// 只列和「事件/列表/天」有关的 selector，用来确认官方真实的取数方法名
+static NSString *JAGridMethodNames(id obj) {
+    if (!obj) return @"-";
+    NSMutableArray *ms = [NSMutableArray array];
+    Class cls = object_getClass(obj);
+    int level = 0;
+    while (cls && cls != [NSObject class] && level < 3 && ms.count < 70) {
+        unsigned int n = 0;
+        Method *m = class_copyMethodList(cls, &n);
+        for (unsigned int i = 0; i < n && ms.count < 70; i++) {
+            NSString *sel = NSStringFromSelector(method_getName(m[i]));
+            NSString *low = sel.lowercaseString;
+            if ([low rangeOfString:@"event"].location != NSNotFound ||
+                [low rangeOfString:@"record"].location != NSNotFound ||
+                [low rangeOfString:@"sdd"].location != NSNotFound ||
+                [low rangeOfString:@"day"].location != NSNotFound ||
+                [low rangeOfString:@"list"].location != NSNotFound ||
+                [low rangeOfString:@"warn"].location != NSNotFound) {
+                [ms addObject:sel];
+            }
+        }
+        if (m) free(m);
+        cls = class_getSuperclass(cls);
+        level++;
+    }
+    return [ms componentsJoinedByString:@" "];
+}
+
+// 把所有「数组」列出来（条数:元素类名），看数据到底装在哪一层
+static void JAGridArrayWalk(id root, int depth, NSMutableSet *seen, NSMutableArray *out) {
+    if (!root || depth <= 0 || out.count >= 40) return;
+    if ([root isKindOfClass:NSArray.class]) {
+        NSArray *a = (NSArray *)root;
+        NSString *cn = a.count ? NSStringFromClass(object_getClass([a objectAtIndex:0])) : @"-";
+        [out addObject:[NSString stringWithFormat:@"%lu:%@", (unsigned long)a.count, cn]];
+        return;
+    }
+    if (JAGridIsPlainJunk(root)) return;
     NSValue *k = [NSValue valueWithNonretainedObject:root];
     if ([seen containsObject:k]) return;
     [seen addObject:k];
-    if ([root isKindOfClass:NSArray.class]) {
-        NSArray *a = (NSArray *)root;
-        if (a.count > 0) {
-            id f = [a objectAtIndex:0];
-            [out addObject:[NSString stringWithFormat:@"[%lu] %@  keys=%@",
-                            (unsigned long)a.count,
-                            NSStringFromClass([f class]),
-                            JAGridKeysOf(f)]];
-        }
-        return;
-    }
-    if (JAGridIsJunk(root)) return;
     Class cls = object_getClass(root);
     int level = 0;
-    while (cls && cls != [NSObject class] && level < 2 && out.count < 26) {
+    while (cls && cls != [NSObject class] && level < 3 && out.count < 40) {
         unsigned int n = 0;
-        Ivar *iv = class_copyIvarList(cls, &n);
-        for (unsigned int i = 0; i < n && out.count < 26; i++) {
-            const char *enc = ivar_getTypeEncoding(iv[i]);
+        Ivar *ivars = class_copyIvarList(cls, &n);
+        for (unsigned int i = 0; i < n && out.count < 40; i++) {
+            const char *enc = ivars ? ivar_getTypeEncoding(ivars[i]) : NULL;
             if (!enc || enc[0] != '@') continue;
             id v = nil;
-            @try { v = object_getIvar(root, iv[i]); } @catch (NSException *e) { v = nil; }
-            JAGridProbeWalk(v, depth - 1, out, seen);
+            @try { v = object_getIvar(root, ivars[i]); } @catch (NSException *e) { v = nil; }
+            JAGridArrayWalk(v, depth - 1, seen, out);
         }
-        if (iv) free(iv);
+        if (ivars) free(ivars);
         cls = class_getSuperclass(cls);
         level++;
     }
 }
 
+static NSString *JAGridArraysText(id root, int depth, NSMutableSet *seen, NSMutableArray *out) {
+    JAGridArrayWalk(root, depth, seen, out);
+    return out.count ? [out componentsJoinedByString:@" | "] : @"-";
+}
+
 static NSString *JAGridProbeText(id vc) {
-    NSMutableArray *out = [NSMutableArray array];
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"VC=%@\n", NSStringFromClass(object_getClass(vc))];
+    [s appendFormat:@"IVAR=%@\n", JAGridIvarNames(vc, 3, 30)];
+    [s appendFormat:@"SEL=%@\n", JAGridMethodNames(vc)];
+
+    NSMutableArray *cands = [NSMutableArray array];
     NSMutableSet *seen = [NSMutableSet set];
-    [out addObject:NSStringFromClass([vc class])];
-    JAGridProbeWalk(vc, 4, out, seen);
-    return [out componentsJoinedByString:@"\n"];
+    JAGridCollect(vc, 4, seen, cands);
+    if (cands.count == 0) {
+        [s appendString:@"-- 全树没有候选数组 --\n"];
+    }
+    for (NSUInteger i = 0; i < cands.count && i < 8; i++) {
+        NSArray *pair = (NSArray *)cands[i];
+        NSArray *a = (NSArray *)pair[0];
+        int sc = [(NSNumber *)pair[1] intValue];
+        NSString *cn = a.count ? NSStringFromClass(object_getClass([a objectAtIndex:0])) : @"-";
+        [s appendFormat:@"#[%lu score=%d] %@\n", (unsigned long)a.count, sc, cn];
+        if (a.count) {
+            NSString *desc = [[a objectAtIndex:0] description];
+            if (desc.length > 240) desc = [desc substringToIndex:240];
+            [s appendFormat:@"  %@\n", desc];
+            [s appendFormat:@"  ivi=%@\n", JAGridIvarNames([a objectAtIndex:0], 2, 18)];
+        }
+    }
+
+    // 单独把「所有数组」列一遍（哪怕没到 3 分，也能看出到底哪层在装数据）
+    NSMutableArray *loose = [NSMutableArray array];
+    NSMutableSet *seen2 = [NSMutableSet set];
+    [s appendFormat:@"ARR=%@\n", JAGridArraysText(vc, 4, seen2, loose)];
+    return s;
 }
 
 // ---------- 事件字段读取 ----------
@@ -867,11 +951,14 @@ static NSString *JAGridImageURL(id ev) {
 @property (nonatomic, strong) NSMutableArray *flat;    // @[@{@"ev":id, @"sec":NSNumber, @"day":NSNumber}]
 @property (nonatomic, strong) UICollectionView *cv;
 @property (nonatomic, strong) UILabel *hintLab;
+@property (nonatomic, strong) UITextView *diag;          // 诊断快照（可选可滚，自动复制）
+@property (nonatomic, strong) UIBarButtonItem *autoItem;
 @property (nonatomic, strong) NSMutableArray *retained; // 借用中的官方 dataVC（保活）
 @property (nonatomic, assign) long long nextDay;
 @property (nonatomic, assign) BOOL loading;
 @property (nonatomic, assign) BOOL autoNext;
 @property (nonatomic, assign) NSInteger emptyStreak;
+@property (nonatomic, assign) BOOL gaveUp;
 @property (nonatomic, assign) NSInteger playIndex;
 @property (nonatomic, strong) id playingVC;
 @property (nonatomic, copy) NSString *lastProbe;
@@ -891,11 +978,15 @@ static NSString *JAGridImageURL(id ev) {
     self.emptyStreak = 0;
     self.nextDay = JAGridTodayStart();
 
-    self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"连播 开"
-                                         style:UIBarButtonItemStylePlain
-                                        target:self
-                                        action:@selector(toggleAutoNext)];
+    self.autoItem = [[UIBarButtonItem alloc] initWithTitle:@"连播 开"
+                                                    style:UIBarButtonItemStylePlain
+                                                   target:self
+                                                   action:@selector(toggleAutoNext)];
+    UIBarButtonItem *copyItem = [[UIBarButtonItem alloc] initWithTitle:@"复制"
+                                                                style:UIBarButtonItemStylePlain
+                                                               target:self
+                                                               action:@selector(copyDiag)];
+    self.navigationItem.rightBarButtonItems = @[copyItem, self.autoItem];
 
     UICollectionViewFlowLayout *lay = [[UICollectionViewFlowLayout alloc] init];
     lay.minimumInteritemSpacing = 9;
@@ -921,6 +1012,18 @@ static NSString *JAGridImageURL(id ev) {
     self.hintLab.textAlignment = NSTextAlignmentLeft;
     [self.view addSubview:self.hintLab];
     self.hintLab.hidden = YES;
+
+    self.diag = [[UITextView alloc] initWithFrame:CGRectZero];
+    self.diag.editable = NO;
+    self.diag.selectable = YES;
+    self.diag.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.94];
+    self.diag.textColor = [UIColor whiteColor];
+    UIFont *mono = [UIFont fontWithName:@"Menlo" size:10];
+    self.diag.font = mono ? mono : [UIFont systemFontOfSize:10];
+    self.diag.textContainerInset = UIEdgeInsetsMake(10, 10, 10, 10);
+    self.diag.layer.cornerRadius = 8;
+    self.diag.hidden = YES;
+    [self.view addSubview:self.diag];
 }
 
 - (void)viewDidLayoutSubviews {
@@ -932,6 +1035,7 @@ static NSString *JAGridImageURL(id ev) {
     lay.itemSize = CGSizeMake(itemW, itemW * 152.0 / 236.0 + 24);
     self.hintLab.frame = CGRectMake(20, 80, self.view.bounds.size.width - 40,
                                    self.view.bounds.size.height - 160);
+    self.diag.frame = CGRectInset(self.view.bounds, 12, 12);
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -941,7 +1045,7 @@ static NSString *JAGridImageURL(id ev) {
         self.hintLab.text = @"没拿到设备对象（myCamera 为空），格子页无法读取录像";
         return;
     }
-    if (self.days.count == 0) {
+    if (self.days.count == 0 && !self.gaveUp) {
         [self loadOneMoreDay];
     }
 }
@@ -955,27 +1059,42 @@ static NSString *JAGridImageURL(id ev) {
     id dataVC = [[rtc alloc] init];
     @try { [dataVC setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
     @try { [self.myCamera setValue:@(dayStart) forKey:@"sdSelectiontDay"]; } @catch (NSException *e) {}
-    @try { [dataVC loadViewIfNeeded]; } @catch (NSException *e) {}
+
+    // 关键（v2.1）：官方是在「页面出现之后」才去拉该日事件列表的。
+    // 只 loadViewIfNeeded 的话 viewWillAppear/viewDidAppear 永远不来 → 列表永远空。
+    // 这里把它塞成子控制器、视图挪到屏幕外并隐藏，让生命周期照常跑完。
+    UIViewController *dvc = (UIViewController *)dataVC;
+    @try {
+        [self addChildViewController:dvc];
+        dvc.view.frame = CGRectMake(-600, -600, 320, 568);
+        dvc.view.hidden = YES;
+        [self.view addSubview:dvc.view];
+        [dvc didMoveToParentViewController:self];
+    } @catch (NSException *e) {}
 
     [self.retained addObject:dataVC];
     while (self.retained.count > 4) [self.retained removeObjectAtIndex:0];
 
+    [self gridTryFetch:dataVC attempt:0 completion:cb];
+}
+
+// 轮询 3 次（每次 3.2s）：官方列表是异步回来的，给足时间；都不行就把诊断快照留下
+- (void)gridTryFetch:(id)dataVC attempt:(NSInteger)attempt completion:(void (^)(NSArray *events))cb {
+    if (!dataVC) { if (cb) cb(nil); return; }
     __weak typeof(self) ws = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        __strong typeof(ws) s = ws;
+        if (!s) return;
         NSArray *ev = JAGridFindEvents(dataVC);
-        if (ev.count > 0) { [self gridStopDataVC:dataVC]; if (cb) cb(ev); return; }
-        // 官方列表是异步的，第一次没拿到再等一次
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            NSArray *ev2 = JAGridFindEvents(dataVC);
-            if (ev2.count == 0) {
-                __strong typeof(ws) s = ws;
-                if (s) s.lastProbe = JAGridProbeText(dataVC);
-            }
-            [self gridStopDataVC:dataVC];
-            if (cb) cb(ev2);
-        });
+        if (ev.count > 0) { [s gridStopDataVC:dataVC]; if (cb) cb(ev); return; }
+        if (attempt + 1 < 3) {
+            [s gridTryFetch:dataVC attempt:attempt + 1 completion:cb];
+            return;
+        }
+        @try { s.lastProbe = JAGridProbeText(dataVC); } @catch (NSException *e) {}
+        [s gridStopDataVC:dataVC];
+        if (cb) cb(nil);
     });
 }
 
@@ -987,6 +1106,13 @@ static NSString *JAGridImageURL(id ev) {
         if ([dataVC respondsToSelector:st]) {
             ((void (*)(id, SEL))objc_msgSend)(dataVC, st);
         }
+    } @catch (NSException *e) {}
+    // 从父控制器摘掉（否则每拉一天都会挂着一个隐藏播放页）
+    UIViewController *dvc = (UIViewController *)dataVC;
+    @try {
+        [dvc willMoveToParentViewController:nil];
+        [dvc.view removeFromSuperview];
+        [dvc removeFromParentViewController];
     } @catch (NSException *e) {}
     @try { [self.retained removeObject:dataVC]; } @catch (NSException *e) {}
 }
@@ -1013,10 +1139,13 @@ static NSString *JAGridImageURL(id ev) {
         } else {
             s.emptyStreak++;
             if (s.emptyStreak >= 3) {
-                s.hintLab.hidden = NO;
-                NSString *p = s.lastProbe.length ? [@"往前 3 天都没有录像了\n\n" stringByAppendingString:s.lastProbe]
-                                                 : @"往前 3 天都没有录像了";
-                s.hintLab.text = p;
+                s.gaveUp = YES;
+                if (s.lastProbe.length) {
+                    [s showDiag:s.lastProbe];
+                } else {
+                    s.hintLab.hidden = NO;
+                    s.hintLab.text = @"往前 3 天都没有录像（这三天没有事件记录）";
+                }
             } else {
                 [s loadOneMoreDay];
             }
@@ -1176,7 +1305,33 @@ static NSString *JAGridImageURL(id ev) {
 
 - (void)toggleAutoNext {
     self.autoNext = !self.autoNext;
-    self.navigationItem.rightBarButtonItem.title = self.autoNext ? @"连播 开" : @"连播 关";
+    self.autoItem.title = self.autoNext ? @"连播 开" : @"连播 关";
+}
+
+// ---------- 诊断展示 ----------
+
+- (void)showDiag:(NSString *)text {
+    if (!text.length) return;
+    self.diag.text = text;
+    self.diag.hidden = NO;
+    self.hintLab.hidden = YES;
+    @try { [[UIPasteboard generalPasteboard] setString:text]; } @catch (NSException *e) {}
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"没读到该日事件列表"
+                                                                message:@"诊断信息已自动复制到剪贴板，直接长按粘贴发我就行。也可以在这个黑框里上下滑动看。"
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+    @try { [self presentViewController:ac animated:YES completion:nil]; } @catch (NSException *e) {}
+}
+
+- (void)copyDiag {
+    NSString *t = self.diag.text;
+    if (!t.length) return;
+    @try { [[UIPasteboard generalPasteboard] setString:t]; } @catch (NSException *e) {}
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"已复制"
+                                                                message:@"诊断信息已在剪贴板，粘贴发我即可。"
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    @try { [self presentViewController:ac animated:YES completion:nil]; } @catch (NSException *e) {}
 }
 
 @end

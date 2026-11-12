@@ -7,5 +7,5 @@ xcrun --sdk iphoneos clang -arch arm64 -dynamiclib -fobjc-arc \
   -miphoneos-version-min=13.0 \
   -isysroot "$SDK" \
   -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore \
-  Tweak.m -o JoolinkSDReplay-v2.0.dylib
-echo "OK -> JoolinkSDReplay-v2.0.dylib"
+  Tweak.m -o JoolinkSDReplay-v2.1.dylib
+echo "OK -> JoolinkSDReplay-v2.1.dylib"
