@@ -26,6 +26,13 @@
 //   switchToSDDay → 2.5s 定位 → 1.5s 时间轴），定位 100% 可靠；官方 viewDidLoad 自动流
 //   的短暂显示（读取进度/实时）为官方固有行为，接受三段观感，换取定位正确。
 //   保留 viewDidDisappear 0.3s 停流（返回流量不再跑，v1.30，无副作用）。
+// v2.0（云回放式格子页）：在官方本地回放页右上角加「格子」入口，进入自绘 3 列栅格回放页
+//   —— 按天分组、抓拍图当封面、精确到秒，点卡片直接 push 官方 RTC 播放器定位到该秒，
+//   35 秒后自动 pop 回来并播下一格（连播可关）。
+//   数据层不自己拼接口：造一个不显示的官方 JANewRtcSDPlayViewController（dataVC），
+//   把 myCamera.sdSelectiontDay 设成某天 0 点 → 官方 viewModel 拉该日事件 →
+//   运行时在 VC/ivm 里找「事件数组」（JAGridFindEvents），取 event_file_url 当封面
+//   + 文件名内嵌秒当时间（复用 JABuildTimestamp）。找不到列表时把结构打到屏幕上供截图诊断。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -508,6 +515,718 @@ static void ja_rtc_viewDidDisappear(id self, SEL _cmd) {
     });
 }
 
+// =========================================================
+// v2.0：云回放式「格子」页面
+//   3 列 · 按天分组 · 抓拍图当封面 · 精确到秒 · 点开即播 35 秒自动下一格
+// 数据来源：借用官方 JANewRtcSDPlayViewController 的按天事件列表
+//   （把 myCamera.sdSelectiontDay 设成某天 0 点，官方 viewModel 就会拉该日事件）
+// 播放：完全复用 v1.28 定位链路（g_rtcTargetSec + g_activeSDPlayer + ja_rtc_viewDidAppear）
+// =========================================================
+
+static void ja_openGrid(id self, SEL _cmd);
+
+// ---------- 时间/日期 ----------
+
+static long long JAGridTodayStart(void) {
+    return JADayStartSec(@((long long)[[NSDate date] timeIntervalSince1970]));
+}
+
+static NSString *JAGridDayText(long long dayStart) {
+    static NSDateFormatter *df = nil;
+    if (!df) {
+        df = [[NSDateFormatter alloc] init];
+        df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        df.dateFormat = @"yyyy年M月d日";
+    }
+    return [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)dayStart]];
+}
+
+static NSString *JAGridTimeText(long long sec) {
+    static NSDateFormatter *tf = nil;
+    if (!tf) {
+        tf = [[NSDateFormatter alloc] init];
+        tf.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        tf.dateFormat = @"HH:mm:ss";
+    }
+    return [tf stringFromDate:[NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)sec]];
+}
+
+// ---------- 事件对象识别 / 数组查找 ----------
+
+static BOOL JAGridIsJunk(id o) {
+    if (!o) return YES;
+    if ([o isKindOfClass:NSString.class]) return YES;
+    if ([o isKindOfClass:NSNumber.class]) return YES;
+    if ([o isKindOfClass:NSDate.class]) return YES;
+    if ([o isKindOfClass:NSData.class]) return YES;
+    if ([o isKindOfClass:UIImage.class]) return YES;
+    if ([o isKindOfClass:UIColor.class]) return YES;
+    if ([o isKindOfClass:UIFont.class]) return YES;
+    if ([o isKindOfClass:UIView.class]) return YES;
+    if ([o isKindOfClass:UIViewController.class]) return YES;
+    if ([o isKindOfClass:NSNull.class]) return YES;
+    return NO;
+}
+
+static BOOL JAGridLooksLikeEvent(id o) {
+    if (!o || JAGridIsJunk(o)) return NO;
+    if ([o isKindOfClass:NSArray.class]) return NO;
+    if ([o isKindOfClass:NSDictionary.class]) {
+        NSDictionary *d = (NSDictionary *)o;
+        if (d[@"event_file_url"] || d[@"event_time"] || d[@"eventTimeUTC"] || d[@"event_date"]) return YES;
+        return NO;
+    }
+    NSArray *keys = @[@"event_file_url", @"event_time", @"eventTimeUTC", @"event_date"];
+    for (NSString *k in keys) {
+        if (JAVal(o, k)) return YES;
+    }
+    return NO;
+}
+
+static NSArray *JAGridScanValue(id root, int depth, NSMutableSet *seen);
+
+static NSArray *JAGridScanIvars(id root, int depth, NSMutableSet *seen) {
+    Class cls = object_getClass(root);
+    int level = 0;
+    while (cls && cls != [NSObject class] && level < 3) {
+        unsigned int n = 0;
+        Ivar *ivars = class_copyIvarList(cls, &n);
+        for (unsigned int i = 0; i < n; i++) {
+            const char *enc = ivar_getTypeEncoding(ivars[i]);
+            if (!enc || enc[0] != '@') continue;   // 只读对象型 ivar
+            id v = nil;
+            @try { v = object_getIvar(root, ivars[i]); } @catch (NSException *e) { v = nil; }
+            NSArray *r = JAGridScanValue(v, depth - 1, seen);
+            if (r) { if (ivars) free(ivars); return r; }
+        }
+        if (ivars) free(ivars);
+        cls = class_getSuperclass(cls);
+        level++;
+    }
+    return nil;
+}
+
+static NSArray *JAGridScanValue(id root, int depth, NSMutableSet *seen) {
+    if (!root || depth <= 0) return nil;
+    if ([root isKindOfClass:NSArray.class]) {
+        NSArray *arr = (NSArray *)root;
+        if (arr.count == 0) return nil;
+        if (JAGridLooksLikeEvent([arr objectAtIndex:0])) return arr;
+        for (id o in arr) {
+            NSArray *r = JAGridScanValue(o, depth - 1, seen);
+            if (r) return r;
+        }
+        return nil;
+    }
+    if (JAGridIsJunk(root)) return nil;
+    NSValue *k = [NSValue valueWithNonretainedObject:root];
+    if ([seen containsObject:k]) return nil;
+    [seen addObject:k];
+    return JAGridScanIvars(root, depth, seen);
+}
+
+// 在 VC（及其 viewModel/dataSource 等）里找出「事件模型数组」
+static NSArray *JAGridFindEvents(id vc) {
+    if (!vc) return nil;
+    NSMutableSet *seen = [NSMutableSet set];
+    NSArray *keys = @[@"eventList", @"eventLists", @"events", @"eventArray", @"eventModelList",
+                      @"dataArray", @"dataList", @"listArray", @"records", @"recordList",
+                      @"warnList", @"warningList", @"currentEventList", @"sdEventList",
+                      @"mEventList", @"allEvents", @"viewModel", @"mViewModel",
+                      @"playerModel", @"sdModel", @"dataSource", @"adapter"];
+    for (NSString *k in keys) {
+        NSArray *r = JAGridScanValue(JAVal(vc, k), 4, seen);
+        if (r) return r;
+    }
+    return JAGridScanIvars(vc, 4, seen);
+}
+
+// ---------- 诊断（找不到列表时把结构打到屏幕上，截图就能看到） ----------
+
+static NSString *JAGridKeysOf(id obj) {
+    if (!obj) return @"(nil)";
+    if ([obj isKindOfClass:NSDictionary.class]) {
+        return [[(NSDictionary *)obj allKeys] componentsJoinedByString:@","];
+    }
+    NSMutableArray *ks = [NSMutableArray array];
+    Class cls = object_getClass(obj);
+    int level = 0;
+    while (cls && cls != [NSObject class] && level < 2) {
+        unsigned int n = 0;
+        Ivar *iv = class_copyIvarList(cls, &n);
+        for (unsigned int i = 0; i < n && ks.count < 24; i++) {
+            const char *nm = ivar_getName(iv[i]);
+            if (!nm) continue;
+            NSString *s = [NSString stringWithUTF8String:nm];
+            if (s) [ks addObject:s];
+        }
+        if (iv) free(iv);
+        cls = class_getSuperclass(cls);
+        level++;
+    }
+    return [ks componentsJoinedByString:@","];
+}
+
+static void JAGridProbeWalk(id root, int depth, NSMutableArray *out, NSMutableSet *seen) {
+    if (!root || depth <= 0 || out.count >= 26) return;
+    NSValue *k = [NSValue valueWithNonretainedObject:root];
+    if ([seen containsObject:k]) return;
+    [seen addObject:k];
+    if ([root isKindOfClass:NSArray.class]) {
+        NSArray *a = (NSArray *)root;
+        if (a.count > 0) {
+            id f = [a objectAtIndex:0];
+            [out addObject:[NSString stringWithFormat:@"[%lu] %@  keys=%@",
+                            (unsigned long)a.count,
+                            NSStringFromClass([f class]),
+                            JAGridKeysOf(f)]];
+        }
+        return;
+    }
+    if (JAGridIsJunk(root)) return;
+    Class cls = object_getClass(root);
+    int level = 0;
+    while (cls && cls != [NSObject class] && level < 2 && out.count < 26) {
+        unsigned int n = 0;
+        Ivar *iv = class_copyIvarList(cls, &n);
+        for (unsigned int i = 0; i < n && out.count < 26; i++) {
+            const char *enc = ivar_getTypeEncoding(iv[i]);
+            if (!enc || enc[0] != '@') continue;
+            id v = nil;
+            @try { v = object_getIvar(root, iv[i]); } @catch (NSException *e) { v = nil; }
+            JAGridProbeWalk(v, depth - 1, out, seen);
+        }
+        if (iv) free(iv);
+        cls = class_getSuperclass(cls);
+        level++;
+    }
+}
+
+static NSString *JAGridProbeText(id vc) {
+    NSMutableArray *out = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    [out addObject:NSStringFromClass([vc class])];
+    JAGridProbeWalk(vc, 4, out, seen);
+    return [out componentsJoinedByString:@"\n"];
+}
+
+// ---------- 事件字段读取 ----------
+
+static NSString *JAGridImageURL(id ev) {
+    NSArray *keys = @[@"event_file_url", @"event_pic_url", @"event_pic", @"picUrl",
+                      @"pic_url", @"event_img", @"imageUrl", @"snapUrl", @"eventImagePath"];
+    for (NSString *k in keys) {
+        id v = JAVal(ev, k);
+        if ([v isKindOfClass:NSString.class] && [(NSString *)v length] > 8) return (NSString *)v;
+    }
+    return nil;
+}
+
+// ---------- 图片缓存（内存 + 并发限流） ----------
+
+@interface JAGridImageCache : NSObject
+@property (nonatomic, strong) NSCache *mem;
++ (instancetype)shared;
+- (UIImage *)imageForKey:(NSString *)key;
+- (void)loadURL:(NSString *)url completion:(void (^)(UIImage *img, NSString *key))cb;
+@end
+
+@implementation JAGridImageCache
++ (instancetype)shared {
+    static JAGridImageCache *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [[JAGridImageCache alloc] init]; });
+    return s;
+}
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _mem = [[NSCache alloc] init];
+        _mem.countLimit = 160;
+    }
+    return self;
+}
+- (UIImage *)imageForKey:(NSString *)key {
+    if (!key) return nil;
+    return [self.mem objectForKey:key];
+}
+- (void)loadURL:(NSString *)url completion:(void (^)(UIImage *, NSString *))cb {
+    if (!url.length || ![url hasPrefix:@"http"]) { if (cb) cb(nil, url); return; }
+    UIImage *c = [self.mem objectForKey:url];
+    if (c) { if (cb) cb(c, url); return; }
+    NSURL *u = [NSURL URLWithString:url];
+    if (!u) { if (cb) cb(nil, url); return; }
+    NSURLSessionDataTask *t = [[NSURLSession sharedSession]
+        dataTaskWithURL:u completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+            UIImage *img = nil;
+            if (data) { @autoreleasepool { img = [UIImage imageWithData:data]; } }
+            if (img) [self.mem setObject:img forKey:url];
+            dispatch_async(dispatch_get_main_queue(), ^{ if (cb) cb(img, url); });
+        }];
+    [t resume];
+}
+@end
+
+// ---------- 单元格 ----------
+
+@interface JAGridCell : UICollectionViewCell
+@property (nonatomic, strong) UIImageView *thumb;
+@property (nonatomic, strong) UILabel *timeLab;
+@property (nonatomic, strong) UIView *playDot;
+@property (nonatomic, copy) NSString *imgURL;
+- (void)setImageURL:(NSString *)url;
+@end
+
+@implementation JAGridCell
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        _thumb = [[UIImageView alloc] initWithFrame:CGRectZero];
+        _thumb.contentMode = UIViewContentModeScaleAspectFill;
+        _thumb.clipsToBounds = YES;
+        _thumb.backgroundColor = [UIColor colorWithWhite:0.10 alpha:1.0];
+        _thumb.layer.cornerRadius = 8;
+        [self.contentView addSubview:_thumb];
+
+        _playDot = [[UIView alloc] initWithFrame:CGRectZero];
+        _playDot.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
+        _playDot.layer.cornerRadius = 9;
+        _playDot.clipsToBounds = YES;
+        [self.contentView addSubview:_playDot];
+
+        UILabel *tri = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 18, 18)];
+        tri.text = @"▶";
+        tri.textColor = [UIColor whiteColor];
+        tri.font = [UIFont systemFontOfSize:8];
+        tri.textAlignment = NSTextAlignmentCenter;
+        [_playDot addSubview:tri];
+
+        _timeLab = [[UILabel alloc] initWithFrame:CGRectZero];
+        _timeLab.font = [UIFont systemFontOfSize:12];
+        _timeLab.textColor = [UIColor colorWithWhite:0.40 alpha:1.0];
+        [self.contentView addSubview:_timeLab];
+    }
+    return self;
+}
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat w = self.contentView.bounds.size.width;
+    CGFloat h = self.contentView.bounds.size.height;
+    CGFloat thumbH = w * 152.0 / 236.0;
+    self.thumb.frame = CGRectMake(0, 0, w, thumbH);
+    self.playDot.frame = CGRectMake(w - 24, thumbH - 24, 18, 18);
+    self.timeLab.frame = CGRectMake(0, thumbH + 5, w, h - thumbH - 5);
+}
+- (void)prepareForReuse {
+    [super prepareForReuse];
+    self.imgURL = nil;
+    self.thumb.image = nil;
+    self.timeLab.text = nil;
+}
+- (void)setImageURL:(NSString *)url {
+    self.imgURL = [url copy];
+    UIImage *cached = [[JAGridImageCache shared] imageForKey:url];
+    if (cached) { self.thumb.image = cached; return; }
+    self.thumb.image = nil;
+    if (!url) return;
+    __weak typeof(self) ws = self;
+    NSString *key = [url copy];
+    [[JAGridImageCache shared] loadURL:url completion:^(UIImage *img, NSString *k) {
+        __strong typeof(ws) s = ws;
+        if (!s) return;
+        if (key && [s.imgURL isEqualToString:key]) s.thumb.image = img;
+    }];
+}
+@end
+
+// ---------- 日期分组头 ----------
+
+@interface JAGridHeader : UICollectionReusableView
+@property (nonatomic, strong) UILabel *lab;
+@end
+
+@implementation JAGridHeader
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        _lab = [[UILabel alloc] initWithFrame:CGRectMake(16, 6, frame.size.width - 32, 26)];
+        _lab.font = [UIFont boldSystemFontOfSize:19];
+        _lab.textColor = [UIColor colorWithWhite:0.10 alpha:1.0];
+        _lab.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+        [self addSubview:_lab];
+    }
+    return self;
+}
+@end
+
+// ---------- 格子页本体 ----------
+
+@interface JAGridReplayViewController : UIViewController <UICollectionViewDataSource, UICollectionViewDelegateFlowLayout>
+@property (nonatomic, strong) id myCamera;
+@property (nonatomic, strong) NSMutableArray *days;    // @[@{@"day":NSNumber, @"items":NSArray}]
+@property (nonatomic, strong) NSMutableArray *flat;    // @[@{@"ev":id, @"sec":NSNumber, @"day":NSNumber}]
+@property (nonatomic, strong) UICollectionView *cv;
+@property (nonatomic, strong) UILabel *hintLab;
+@property (nonatomic, strong) NSMutableArray *retained; // 借用中的官方 dataVC（保活）
+@property (nonatomic, assign) long long nextDay;
+@property (nonatomic, assign) BOOL loading;
+@property (nonatomic, assign) BOOL autoNext;
+@property (nonatomic, assign) NSInteger emptyStreak;
+@property (nonatomic, assign) NSInteger playIndex;
+@property (nonatomic, strong) id playingVC;
+@property (nonatomic, copy) NSString *lastProbe;
+@end
+
+@implementation JAGridReplayViewController
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor whiteColor];
+    self.title = @"回放";
+    self.days = [NSMutableArray array];
+    self.flat = [NSMutableArray array];
+    self.retained = [NSMutableArray array];
+    self.autoNext = YES;
+    self.playIndex = -1;
+    self.emptyStreak = 0;
+    self.nextDay = JAGridTodayStart();
+
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"连播 开"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(toggleAutoNext)];
+
+    UICollectionViewFlowLayout *lay = [[UICollectionViewFlowLayout alloc] init];
+    lay.minimumInteritemSpacing = 9;
+    lay.minimumLineSpacing = 11;
+    lay.sectionInset = UIEdgeInsetsMake(0, 16, 16, 16);
+    lay.headerReferenceSize = CGSizeMake(0, 38);
+
+    self.cv = [[UICollectionView alloc] initWithFrame:CGRectZero collectionViewLayout:lay];
+    self.cv.backgroundColor = [UIColor whiteColor];
+    self.cv.alwaysBounceVertical = YES;
+    self.cv.dataSource = self;
+    self.cv.delegate = self;
+    [self.cv registerClass:[JAGridCell class] forCellWithReuseIdentifier:@"cell"];
+    [self.cv registerClass:[JAGridHeader class]
+        forSupplementaryViewOfKind:UICollectionElementKindSectionHeader
+               withReuseIdentifier:@"head"];
+    [self.view addSubview:self.cv];
+
+    self.hintLab = [[UILabel alloc] initWithFrame:CGRectZero];
+    self.hintLab.numberOfLines = 0;
+    self.hintLab.font = [UIFont systemFontOfSize:12];
+    self.hintLab.textColor = [UIColor colorWithWhite:0.45 alpha:1.0];
+    self.hintLab.textAlignment = NSTextAlignmentLeft;
+    [self.view addSubview:self.hintLab];
+    self.hintLab.hidden = YES;
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    self.cv.frame = self.view.bounds;
+    CGFloat usable = self.view.bounds.size.width - 32 - 18;
+    CGFloat itemW = floor(usable / 3.0);
+    UICollectionViewFlowLayout *lay = (UICollectionViewFlowLayout *)self.cv.collectionViewLayout;
+    lay.itemSize = CGSizeMake(itemW, itemW * 152.0 / 236.0 + 24);
+    self.hintLab.frame = CGRectMake(20, 80, self.view.bounds.size.width - 40,
+                                   self.view.bounds.size.height - 160);
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    if (!self.myCamera) {
+        self.hintLab.hidden = NO;
+        self.hintLab.text = @"没拿到设备对象（myCamera 为空），格子页无法读取录像";
+        return;
+    }
+    if (self.days.count == 0) {
+        [self loadOneMoreDay];
+    }
+}
+
+// ---------- 拉一天事件（借官方数据层） ----------
+
+- (void)fetchDay:(long long)dayStart completion:(void (^)(NSArray *events))cb {
+    Class rtc = NSClassFromString(@"JANewRtcSDPlayViewController");
+    if (!rtc) { if (cb) cb(nil); return; }
+
+    id dataVC = [[rtc alloc] init];
+    @try { [dataVC setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
+    @try { [self.myCamera setValue:@(dayStart) forKey:@"sdSelectiontDay"]; } @catch (NSException *e) {}
+    @try { [dataVC loadViewIfNeeded]; } @catch (NSException *e) {}
+
+    [self.retained addObject:dataVC];
+    while (self.retained.count > 4) [self.retained removeObjectAtIndex:0];
+
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NSArray *ev = JAGridFindEvents(dataVC);
+        if (ev.count > 0) { [self gridStopDataVC:dataVC]; if (cb) cb(ev); return; }
+        // 官方列表是异步的，第一次没拿到再等一次
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            NSArray *ev2 = JAGridFindEvents(dataVC);
+            if (ev2.count == 0) {
+                __strong typeof(ws) s = ws;
+                if (s) s.lastProbe = JAGridProbeText(dataVC);
+            }
+            [self gridStopDataVC:dataVC];
+            if (cb) cb(ev2);
+        });
+    });
+}
+
+// 借用的 dataVC 用完即停流（官方 viewDidLoad 可能自动起流，不停会白跑流量）
+- (void)gridStopDataVC:(id)dataVC {
+    if (!dataVC) return;
+    SEL st = NSSelectorFromString(@"stopSDPlay");
+    @try {
+        if ([dataVC respondsToSelector:st]) {
+            ((void (*)(id, SEL))objc_msgSend)(dataVC, st);
+        }
+    } @catch (NSException *e) {}
+    @try { [self.retained removeObject:dataVC]; } @catch (NSException *e) {}
+}
+
+- (void)loadOneMoreDay {
+    if (self.loading || !self.myCamera) return;
+    if (self.nextDay <= 0) self.nextDay = JAGridTodayStart();
+    long long day = self.nextDay;
+    self.loading = YES;
+    self.hintLab.hidden = NO;
+    self.hintLab.text = @"正在读取该日录像…";
+
+    __weak typeof(self) ws = self;
+    [self fetchDay:day completion:^(NSArray *events) {
+        __strong typeof(ws) s = ws;
+        if (!s) return;
+        s.loading = NO;
+        s.nextDay = day - 86400;
+
+        if (events.count > 0) {
+            s.emptyStreak = 0;
+            [s appendDay:day events:events];
+            s.hintLab.hidden = YES;
+        } else {
+            s.emptyStreak++;
+            if (s.emptyStreak >= 3) {
+                s.hintLab.hidden = NO;
+                NSString *p = s.lastProbe.length ? [@"往前 3 天都没有录像了\n\n" stringByAppendingString:s.lastProbe]
+                                                 : @"往前 3 天都没有录像了";
+                s.hintLab.text = p;
+            } else {
+                [s loadOneMoreDay];
+            }
+        }
+    }];
+}
+
+- (void)appendDay:(long long)day events:(NSArray *)events {
+    NSMutableArray *items = [NSMutableArray array];
+    for (id ev in events) {
+        NSNumber *ts = JABuildTimestamp(ev);
+        if (!ts) continue;
+        long long sec = ts.longLongValue;
+        if (sec < 1000000000LL || sec > 10000000000LL) continue;   // 只要 10 位秒
+        [items addObject:@{@"ev": ev, @"sec": ts, @"day": @(day)}];
+    }
+    if (items.count == 0) return;
+    [self.days addObject:@{@"day": @(day), @"items": items}];
+    [self.flat addObjectsFromArray:items];
+    [self.cv reloadData];
+}
+
+// ---------- 集合视图 ----------
+
+- (NSInteger)numberOfSectionsInCollectionView:(UICollectionView *)collectionView {
+    return (NSInteger)self.days.count;
+}
+
+- (NSInteger)collectionView:(UICollectionView *)collectionView numberOfItemsInSection:(NSInteger)section {
+    if (section < 0 || section >= (NSInteger)self.days.count) return 0;
+    NSDictionary *d = self.days[section];
+    NSArray *items = d[@"items"];
+    return (NSInteger)items.count;
+}
+
+- (UICollectionViewCell *)collectionView:(UICollectionView *)collectionView cellForItemAtIndexPath:(NSIndexPath *)ip {
+    JAGridCell *c = [collectionView dequeueReusableCellWithReuseIdentifier:@"cell" forIndexPath:ip];
+    if (ip.section < (NSInteger)self.days.count) {
+        NSDictionary *dayDict = (NSDictionary *)self.days[ip.section];
+        NSArray *items = (NSArray *)dayDict[@"items"];
+        if (ip.item < (NSInteger)items.count) {
+            NSDictionary *e = (NSDictionary *)items[ip.item];
+            NSNumber *sec = (NSNumber *)e[@"sec"];
+            c.timeLab.text = JAGridTimeText(sec.longLongValue);
+            [c setImageURL:JAGridImageURL(e[@"ev"])];
+        }
+    }
+    return c;
+}
+
+- (UICollectionReusableView *)collectionView:(UICollectionView *)collectionView
+           viewForSupplementaryElementOfKind:(NSString *)kind
+                                 atIndexPath:(NSIndexPath *)ip {
+    JAGridHeader *h = [collectionView dequeueReusableSupplementaryViewOfKind:kind
+                                                          withReuseIdentifier:@"head"
+                                                                 forIndexPath:ip];
+    if (ip.section < (NSInteger)self.days.count) {
+        NSDictionary *dayDict = (NSDictionary *)self.days[ip.section];
+        NSNumber *day = (NSNumber *)dayDict[@"day"];
+        h.lab.text = JAGridDayText(day.longLongValue);
+    }
+    return h;
+}
+
+- (void)scrollViewDidScroll:(UIScrollView *)scrollView {
+    if (scrollView.contentSize.height < 1) return;
+    if (scrollView.contentOffset.y + scrollView.bounds.size.height >
+        scrollView.contentSize.height - 320) {
+        [self loadOneMoreDay];
+    }
+}
+
+// ---------- 点开播放 ----------
+
+- (void)collectionView:(UICollectionView *)collectionView didSelectItemAtIndexPath:(NSIndexPath *)ip {
+    [collectionView deselectItemAtIndexPath:ip animated:NO];
+    if (ip.section >= (NSInteger)self.days.count) return;
+    NSDictionary *dayDict = (NSDictionary *)self.days[ip.section];
+    NSArray *items = (NSArray *)dayDict[@"items"];
+    if (ip.item >= (NSInteger)items.count) return;
+    NSDictionary *entry = (NSDictionary *)items[ip.item];
+    NSInteger gi = [self flatIndexOfEntry:entry];
+    if (gi < 0) return;
+    [self openPlayerAtIndex:gi];
+}
+
+- (NSInteger)flatIndexOfEntry:(NSDictionary *)entry {
+    NSNumber *sec = (NSNumber *)entry[@"sec"];
+    for (NSInteger i = 0; i < (NSInteger)self.flat.count; i++) {
+        NSDictionary *e = (NSDictionary *)self.flat[i];
+        NSNumber *s2 = (NSNumber *)e[@"sec"];
+        if ([s2 isEqualToNumber:sec]) return i;
+    }
+    return -1;
+}
+
+- (NSIndexPath *)indexPathForFlat:(NSInteger)index {
+    NSInteger left = index;
+    for (NSInteger s = 0; s < (NSInteger)self.days.count; s++) {
+        NSDictionary *dayDict = (NSDictionary *)self.days[s];
+        NSArray *items = (NSArray *)dayDict[@"items"];
+        if (left < (NSInteger)items.count) return [NSIndexPath indexPathForItem:left inSection:s];
+        left -= (NSInteger)items.count;
+    }
+    return nil;
+}
+
+- (void)openPlayerAtIndex:(NSInteger)index {
+    if (index < 0 || index >= (NSInteger)self.flat.count) return;
+    NSDictionary *entry = self.flat[index];
+    long long sec = [(NSNumber *)entry[@"sec"] longLongValue];
+
+    Class rtc = NSClassFromString(@"JANewRtcSDPlayViewController");
+    if (!rtc) return;
+
+    id vc = [[rtc alloc] init];
+    @try { [vc setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
+    JASet(vc, @"currentTimeStamp", @(sec));
+    JASet(self.myCamera, @"sdSelectiontDay", @(JADayStartSec(@(sec))));
+
+    // 复用 v1.28 定位链路：viewDidAppear 后 3.0s 自动定位到 g_rtcTargetSec
+    g_rtcTargetSec = sec;
+    g_activeSDPlayer = vc;
+    self.playIndex = index;
+    self.playingVC = vc;
+
+    NSIndexPath *ip = [self indexPathForFlat:index];
+    if (ip) [self.cv scrollToItemAtIndexPath:ip
+                           atScrollPosition:UICollectionViewScrollPositionCenteredVertically
+                                   animated:NO];
+
+    UINavigationController *nav = self.navigationController;
+    if (!nav) return;
+    [nav pushViewController:vc animated:YES];
+
+    // 定位 3.0s + 播 35s ≈ 38s 后自动跳下一格
+    if (self.autoNext) {
+        __weak typeof(self) ws = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(38.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            __strong typeof(ws) s = ws;
+            if (!s) return;
+            if (vc != g_activeSDPlayer) return;         // 用户已手动返回或切了别的
+            if (nav.topViewController != vc) return;
+            [nav popViewControllerAnimated:NO];
+            if (index + 1 < (NSInteger)s.flat.count) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    [s openPlayerAtIndex:index + 1];
+                });
+            } else {
+                [s loadOneMoreDay];
+            }
+        });
+    }
+}
+
+- (void)toggleAutoNext {
+    self.autoNext = !self.autoNext;
+    self.navigationItem.rightBarButtonItem.title = self.autoNext ? @"连播 开" : @"连播 关";
+}
+
+- (void)toggleAutoNext {
+    self.autoNext = !self.autoNext;
+    self.navigationItem.rightBarButtonItem.title = self.autoNext ? @"连播 开" : @"连播 关";
+}
+
+@end
+
+// 官方本地回放页右上角加一个「格子」入口（不替换官方任何按钮）
+static IMP g_orig_rtc_vwa = NULL;
+
+static void ja_rtc_viewWillAppear(id self, SEL _cmd) {
+    if (g_orig_rtc_vwa) ((void (*)(id, SEL))g_orig_rtc_vwa)(self, _cmd);
+    @try {
+        UIViewController *vc = (UIViewController *)self;
+        NSArray *items = vc.navigationItem.rightBarButtonItems;
+        for (UIBarButtonItem *it in (items ? items : @[])) {
+            if ([it.title isEqualToString:@"格子"]) return;
+        }
+        UIBarButtonItem *bi = [[UIBarButtonItem alloc] initWithTitle:@"格子"
+                                                               style:UIBarButtonItemStylePlain
+                                                              target:(id)self
+                                                              action:@selector(ja_openGrid:)];
+        NSMutableArray *arr = [NSMutableArray arrayWithArray:(items ? items : @[])];
+        [arr insertObject:bi atIndex:0];
+        vc.navigationItem.rightBarButtonItems = arr;
+    } @catch (NSException *e) {}
+}
+
+// 打开格子页：沿用当前设备的 camera
+static void ja_openGrid(id self, SEL _cmd) {
+    id cam = JAVal(self, @"myCamera");
+    if (!cam) {
+        NSString *src = nil;
+        cam = JAFindCamera((UIViewController *)self, nil, &src);
+    }
+    if (!cam) return;
+
+    JAGridReplayViewController *grid = [[JAGridReplayViewController alloc] init];
+    grid.myCamera = cam;
+    UINavigationController *nav = [(UIViewController *)self navigationController];
+    if (nav) {
+        [nav pushViewController:grid animated:YES];
+    } else {
+        UINavigationController *n2 = [[UINavigationController alloc] initWithRootViewController:grid];
+        [(UIViewController *)self presentViewController:n2 animated:YES completion:nil];
+    }
+}
+
 // ---------- hook 安装 ----------
 
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved) {
@@ -540,6 +1259,17 @@ static void JAHook(void) {
         if (rtcCls) {
             JASetImp(rtcCls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
             JASetImp(rtcCls, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
+            // v2.0：入口 —— 给官方回放页加「格子」按钮（viewWillAppear 可能继承自
+            // UIViewController，所以用 class_addMethod 只挂在本类，避免污染全局）
+            if (!g_orig_rtc_vwa) {
+                Method m = class_getInstanceMethod([UIViewController class], @selector(viewWillAppear:));
+                if (m) g_orig_rtc_vwa = method_getImplementation(m);
+            }
+            if (!class_addMethod(rtcCls, @selector(viewWillAppear:),
+                                 (IMP)ja_rtc_viewWillAppear, "v@:B")) {
+                JASetImp(rtcCls, @selector(viewWillAppear:), (IMP)ja_rtc_viewWillAppear, &g_orig_rtc_vwa);
+            }
+            class_addMethod(rtcCls, @selector(ja_openGrid:), (IMP)ja_openGrid, "v@:@");
             g_rtcHooked = YES;
         }
     }
