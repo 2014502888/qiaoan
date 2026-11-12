@@ -1377,6 +1377,294 @@ static void ja_openGrid(id self, SEL _cmd) {
     }
 }
 
+// ---------- v2.2：首页设备卡片「云存储 / AI分析」中间插入「格子回放」入口 ----------
+// 不去绑死某个类名：首页是设备卡片列表（每台一卡），卡片底部一行两个入口、中间空着。
+// 这里扫可见视图里「云存储 / 云储存」和「AI分析」两个文字，同一行中间插自己的入口；
+// 点击时从这张卡片自身的模型对象里解析 camera（uid → JAGroupManager.getMyCameraWithUid:），
+// 所以 5 台设备各进各的，不会串台。
+
+static const NSInteger JAGridEntryTag = 0x1A63;
+
+@interface JAGridEntryHub : NSObject
++ (instancetype)shared;
+- (void)tick;
+- (void)onTapEntry:(UITapGestureRecognizer *)g;
+@end
+
+static id JAGridAsCamera(id o) {
+    if (!o) return nil;
+    if ([o respondsToSelector:NSSelectorFromString(@"sdSelectiontDay")]) return o;
+    if ([o respondsToSelector:NSSelectorFromString(@"setSdSelectiontDay:")]) return o;
+    return nil;
+}
+
+static NSString *JAGridViewText(UIView *v) {
+    if ([v isKindOfClass:UILabel.class]) return ((UILabel *)v).text;
+    if ([v isKindOfClass:UIButton.class]) return [((UIButton *)v) currentTitle];
+    return nil;
+}
+
+static BOOL JAGridIsCloudText(NSString *t) {
+    if (!t.length) return NO;
+    return ([t rangeOfString:@"云存储"].location != NSNotFound ||
+            [t rangeOfString:@"云储存"].location != NSNotFound);
+}
+
+static BOOL JAGridIsAIText(NSString *t) {
+    if (!t.length) return NO;
+    return ([t rangeOfString:@"AI分析"].location != NSNotFound ||
+            [t rangeOfString:@"AI 分析"].location != NSNotFound ||
+            [t rangeOfString:@"Ai分析"].location != NSNotFound);
+}
+
+static void JAGridCollectTexts(UIView *v, int depth, NSMutableArray *out, NSInteger *budget) {
+    if (!v || depth > 8 || *budget <= 0) return;
+    (*budget)--;
+    NSString *t = JAGridViewText(v);
+    if (t.length && t.length <= 24 && (JAGridIsCloudText(t) || JAGridIsAIText(t))) {
+        [out addObject:v];
+    }
+    for (UIView *s in v.subviews) {
+        JAGridCollectTexts(s, depth + 1, out, budget);
+    }
+}
+
+static UIView *JAGridCommonAncestor(UIView *a, UIView *b) {
+    UIView *x = a;
+    while (x) {
+        if ([b isDescendantOfView:x]) return x;
+        x = x.superview;
+    }
+    return nil;
+}
+
+// 从这张卡片往上找设备对象：先看自有属性，再看 uid 去 JAGroupManager 换 camera
+static id JAGridCameraForView(UIView *v) {
+    NSArray *keys = @[@"myCamera", @"camera", @"myDevice", @"device", @"deviceModel",
+                      @"dataModel", @"model", @"devModel", @"deviceInfo"];
+    UIView *x = v;
+    int level = 0;
+    while (x && level < 8) {
+        id owner = x;
+        for (NSString *k in keys) {
+            id cand = JAVal(owner, k);
+            if (!cand) continue;
+            id cam = JAGridAsCamera(cand);
+            if (cam) return cam;
+            id uidRaw = JAVal(cand, @"uid");
+            if (!uidRaw) uidRaw = JAVal(cand, @"deviceId");
+            NSString *uid = JANormId(uidRaw);
+            if (uid.length) {
+                id gm = JAGroupManagerShared();
+                @try {
+                    id c2 = [gm performSelector:NSSelectorFromString(@"getMyCameraWithUid:")
+                                      withObject:uidRaw];
+                    if (c2) return c2;
+                } @catch (NSException *e) {}
+            }
+        }
+        id ownUid = JANormId(JAVal(owner, @"uid"));
+        if (ownUid.length) {
+            id gm = JAGroupManagerShared();
+            @try {
+                id c3 = [gm performSelector:NSSelectorFromString(@"getMyCameraWithUid:")
+                                  withObject:JAVal(owner, @"uid")];
+                if (c3) return c3;
+            } @catch (NSException *e) {}
+        }
+        x = x.superview;
+        level++;
+    }
+    return nil;
+}
+
+static void JAGridInstallEntryInRow(UIView *cloud, UIView *ai) {
+    if (!cloud || !ai) return;
+    if ([cloud isDescendantOfView:ai] || [ai isDescendantOfView:cloud]) return;
+    UIView *host = JAGridCommonAncestor(cloud, ai);
+    if (!host) return;
+
+    CGRect rc = [cloud convertRect:cloud.bounds toView:host];
+    CGRect ra = [ai convertRect:ai.bounds toView:host];
+    if (fabs(CGRectGetMidY(rc) - CGRectGetMidY(ra)) > 10) return;   // 不在同一行
+    if (CGRectGetMinX(ra) <= CGRectGetMinX(rc)) return;             // AI 应在右边
+
+    CGFloat midX = (CGRectGetMidX(rc) + CGRectGetMidX(ra)) / 2.0;
+    CGFloat midY = (CGRectGetMidY(rc) + CGRectGetMidY(ra)) / 2.0;
+    for (UIView *sv in host.subviews) {
+        if (sv.tag == JAGridEntryTag && fabs(CGRectGetMidX(sv.frame) - midX) < 8) return;
+    }
+
+    CGFloat h = MAX(36.0, MAX(CGRectGetHeight(rc), CGRectGetHeight(ra)) + 10.0);
+    CGFloat w = 104.0;
+    CGFloat hostW = CGRectGetWidth(host.bounds);
+    if (hostW > 0 && w > hostW * 0.40) w = hostW * 0.40;
+
+    UIView *box = [[UIView alloc] initWithFrame:CGRectMake(midX - w / 2.0, midY - h / 2.0, w, h)];
+    box.tag = JAGridEntryTag;
+    box.backgroundColor = [UIColor clearColor];
+    box.userInteractionEnabled = YES;
+    box.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
+                           UIViewAutoresizingFlexibleTopMargin | UIViewAutoresizingFlexibleBottomMargin;
+
+    // 样式跟「AI分析」那一项走（云存储有时是灰色/红色禁用态）
+    UIColor *tint = [UIColor darkGrayColor];
+    UIFont *font = [UIFont systemFontOfSize:13.0];
+    if ([ai isKindOfClass:UILabel.class]) {
+        UILabel *al = (UILabel *)ai;
+        if (al.textColor) tint = al.textColor;
+        if (al.font) font = al.font;
+    } else if ([ai isKindOfClass:UIButton.class]) {
+        UIButton *ab = (UIButton *)ai;
+        UIColor *c = [ab titleColorForState:UIControlStateNormal];
+        if (c) tint = c;
+        if (ab.titleLabel.font) font = ab.titleLabel.font;
+    }
+
+    UIImageView *icon = [[UIImageView alloc] initWithFrame:CGRectMake(0, 0, 18, 18)];
+    UIImage *img = [UIImage systemImageNamed:@"square.grid.3x3.fill"];
+    if (!img) img = [UIImage systemImageNamed:@"square.grid.3x3"];
+    icon.image = img;
+    icon.tintColor = tint;
+    icon.contentMode = UIViewContentModeScaleAspectFit;
+
+    UILabel *lab = [[UILabel alloc] initWithFrame:CGRectZero];
+    lab.text = @"格子回放";
+    lab.font = font;
+    lab.textColor = tint;
+    [lab sizeToFit];
+
+    CGFloat totalW = 18 + 4 + CGRectGetWidth(lab.frame);
+    CGFloat startX = (w - totalW) / 2.0;
+    icon.frame = CGRectMake(startX, (h - 18) / 2.0, 18, 18);
+    lab.frame = CGRectMake(startX + 18 + 4, (h - CGRectGetHeight(lab.frame)) / 2.0,
+                           CGRectGetWidth(lab.frame), CGRectGetHeight(lab.frame));
+    [box addSubview:icon];
+    [box addSubview:lab];
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:[JAGridEntryHub shared]
+                                                                         action:@selector(onTapEntry:)];
+    [box addGestureRecognizer:tap];
+    [host addSubview:box];
+}
+
+static UIViewController *JAGridTopVC(void) {
+    UIWindow *keyWin = nil;
+    NSArray *wins = [UIApplication sharedApplication].windows;
+    for (UIWindow *w in wins) {
+        if (w.isKeyWindow) { keyWin = w; break; }
+    }
+    if (!keyWin && wins.count) keyWin = [wins lastObject];
+    UIViewController *vc = keyWin.rootViewController;
+    int guard = 0;
+    while (vc && guard < 8) {
+        guard++;
+        UIViewController *next = nil;
+        if (vc.presentedViewController) {
+            next = vc.presentedViewController;
+        } else if ([vc isKindOfClass:UINavigationController.class]) {
+            next = ((UINavigationController *)vc).topViewController;
+        } else if ([vc isKindOfClass:UITabBarController.class]) {
+            next = ((UITabBarController *)vc).selectedViewController;
+        }
+        if (!next || next == vc) break;
+        vc = next;
+    }
+    return vc;
+}
+
+static void JAGridScanVisible(void) {
+    if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+    UIViewController *vc = JAGridTopVC();
+    if (!vc || !vc.isViewLoaded) return;
+    NSMutableArray *hits = [NSMutableArray array];
+    NSInteger budget = 500;
+    JAGridCollectTexts(vc.view, 0, hits, &budget);
+    if (hits.count < 2) return;
+
+    NSMutableArray *clouds = [NSMutableArray array];
+    NSMutableArray *ais = [NSMutableArray array];
+    for (UIView *v in hits) {
+        NSString *t = JAGridViewText(v);
+        if (JAGridIsCloudText(t)) [clouds addObject:v];
+        else if (JAGridIsAIText(t)) [ais addObject:v];
+    }
+    if (clouds.count == 0 || ais.count == 0) return;
+
+    for (UIView *c in clouds) {
+        UIView *best = nil;
+        CGFloat bestDy = 1e9;
+        for (UIView *a in ais) {
+            UIView *host = JAGridCommonAncestor(c, a);
+            if (!host) continue;
+            CGRect rc = [c convertRect:c.bounds toView:host];
+            CGRect ra = [a convertRect:a.bounds toView:host];
+            if (CGRectGetMinX(ra) <= CGRectGetMinX(rc)) continue;
+            CGFloat dy = fabs(CGRectGetMidY(rc) - CGRectGetMidY(ra));
+            if (dy < 10 && dy < bestDy) { bestDy = dy; best = a; }
+        }
+        if (best) JAGridInstallEntryInRow(c, best);
+    }
+}
+
+@implementation JAGridEntryHub
+
++ (instancetype)shared {
+    static JAGridEntryHub *s = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [[JAGridEntryHub alloc] init]; });
+    return s;
+}
+
+- (void)tick {
+    @try { JAGridScanVisible(); } @catch (NSException *e) {}
+}
+
+- (void)onTapEntry:(UITapGestureRecognizer *)g {
+    UIView *box = g.view;
+    if (!box) return;
+    id cam = JAGridCameraForView(box);
+    UIViewController *from = JAGridTopVC();
+    if (!cam) {
+        NSString *src = nil;
+        if (from) cam = JAFindCamera(from, nil, &src);
+    }
+    if (!cam) {
+        UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"没找到这台设备"
+                                                                    message:@"没解析到该卡片的设备对象，先点进设备再试。"
+                                                             preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
+        @try { [from presentViewController:ac animated:YES completion:nil]; } @catch (NSException *e) {}
+        return;
+    }
+    JAGridReplayViewController *grid = [[JAGridReplayViewController alloc] init];
+    grid.myCamera = cam;
+    if (!from) return;
+    if (from.navigationController) {
+        @try { [from.navigationController pushViewController:grid animated:YES]; } @catch (NSException *e) {}
+    } else {
+        UINavigationController *n = [[UINavigationController alloc] initWithRootViewController:grid];
+        @try { [from presentViewController:n animated:YES completion:nil]; } @catch (NSException *e) {}
+    }
+}
+
+@end
+
+static void JAGridStartWatcher(void) {
+    static BOOL started = NO;
+    if (started) return;
+    started = YES;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NSTimer *t = [NSTimer timerWithTimeInterval:0.8
+                                              target:[JAGridEntryHub shared]
+                                            selector:@selector(tick)
+                                            userInfo:nil
+                                             repeats:YES];
+        [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
+    });
+}
+
 // ---------- hook 安装 ----------
 
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved) {
@@ -1423,11 +1711,14 @@ static void JAHook(void) {
             g_rtcHooked = YES;
         }
     }
+    // v2.2：首页卡片入口（定时扫可见视图，插在「云存储 / AI分析」中间）
+    JAGridStartWatcher();
 }
 
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
+    JAGridStartWatcher();       // v2.2：首页卡片入口不依赖上面这些类，先挂上
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
         JAHook();
