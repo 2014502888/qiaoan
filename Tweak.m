@@ -33,6 +33,16 @@
 //   把 myCamera.sdSelectiontDay 设成某天 0 点 → 官方 viewModel 拉该日事件 →
 //   运行时在 VC/ivm 里找「事件数组」（JAGridFindEvents），取 event_file_url 当封面
 //   + 文件名内嵌秒当时间（复用 JABuildTimestamp）。找不到列表时把结构打到屏幕上供截图诊断。
+// v2.4（开通/关闭过云存储的设备定位兜底）：
+//   现象：某台开通云存储（后续关闭云功能、SD 可正常回放）的设备，点「看录像」后
+//   弹「当前时间无录像」，时间轴固定停在 16:23:33，画面为实时流；其它设备正常。
+//   已确认进入的就是本地 SD 回放页（有时间轴；云回放页是按天格子列表，界面不同），
+//   说明按钮 hook 生效，问题出在「精确定位」环节：报警秒在该设备当日 SD 事件列表里
+//   对不上（设备时钟偏差 / 列表只返回部分段）→ 官方定位失败 → 回退最新段/实时。
+//   本版：定位前先用运行时反射读该 VC 的当日事件列表（JAGridFindEvents），取与报警秒
+//   最接近的一段；差值 > 60s 改用该段起点定位，时间轴同步也按实际定位秒拨。
+//   同时写诊断日志 Documents/jasdreplay2.log（进入/定位/时间轴/返回四个节点），
+//   用来确认事件列表条数、时间范围与偏差；确认后可整段删除。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -64,6 +74,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <stdarg.h>
 
 // ---------- KVC 工具 ----------
 
@@ -272,6 +283,81 @@ static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
 static void ja_rtc_viewDidAppear(id self, SEL _cmd);
 static void ja_rtc_viewDidDisappear(id self, SEL _cmd);
 static void JATimeLineSyncToSec(id sdVC, long long sec);
+static NSArray *JAGridFindEvents(id vc);
+static NSNumber *JAGridTimestamp(id ev);
+
+// ---------- v2.4 诊断日志（临时，排查「开通过云存储的设备」定位失败） ----------
+// 写沙盒 Documents/jasdreplay2.log，只记关键节点，量很小；确认问题后可整段删除。
+static NSString *JALogPath(void) {
+    static NSString *p = nil;
+    if (!p) {
+        NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                             NSUserDomainMask, YES) firstObject];
+        p = [doc stringByAppendingPathComponent:@"jasdreplay2.log"];
+    }
+    return p;
+}
+
+static void JALog(NSString *fmt, ...) {
+    @autoreleasepool {
+        va_list ap;
+        va_start(ap, fmt);
+        NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+        va_end(ap);
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.dateFormat = @"HH:mm:ss.SSS";
+        NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
+                          [df stringFromDate:[NSDate date]], s];
+        NSString *path = JALogPath();
+        NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
+            [d writeToFile:path atomically:YES];
+        } else {
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+            @try {
+                [fh seekToEndOfFile];
+                [fh writeData:d];
+            } @catch (NSException *e) {
+            } @finally {
+                [fh closeFile];
+            }
+        }
+    }
+}
+
+static NSString *JATimeStr(long long sec) {
+    if (sec < 1000000000LL || sec >= 10000000000LL) return @"-";
+    static NSDateFormatter *df = nil;
+    if (!df) {
+        df = [[NSDateFormatter alloc] init];
+        df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+        df.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    }
+    return [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)sec]];
+}
+
+// v2.4：读该 VC 当前的 SD 录像段列表，返回与目标秒最接近的一段起始秒。
+// 同时回传事件条数与时间范围（日志用）。事件条数 0 或列表读不到时返回 0。
+static long long JAPickNearestEventSec(id vc, long long target, NSInteger *countOut,
+                                       long long *firstOut, long long *lastOut) {
+    NSArray *evs = JAGridFindEvents(vc);
+    if (countOut) *countOut = (NSInteger)evs.count;
+    long long best = 0, bestDiff = 0;
+    long long first = 0, last = 0;
+    for (id ev in evs) {
+        NSNumber *t = JAGridTimestamp(ev);
+        if (!t) continue;
+        long long s = t.longLongValue;
+        if (s < 1000000000LL || s >= 10000000000LL) continue;
+        if (first == 0 || s < first) first = s;
+        if (s > last) last = s;
+        long long d = s > target ? (s - target) : (target - s);
+        if (best == 0 || d < bestDiff) { bestDiff = d; best = s; }
+    }
+    if (firstOut) *firstOut = first;
+    if (lastOut) *lastOut = last;
+    return best;
+}
 
 // v1.15：当前活跃 RTC SD 播放器指针（纯 C 比较守卫，不向对象发消息）
 static id g_activeSDPlayer = nil;
@@ -309,6 +395,10 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
         if (ts) JASet(vc, @"currentTimeStamp", ts);
         // 校验秒范围：10 位秒级（1.0e9 ~ 9.9e9），防止再传毫秒
         long long tv = ts ? ts.longLongValue : 0;
+        // v2.4 诊断：进入时把报警时间/设备标识记下来（云存储设备排查用）
+        JALog(@"open: warn ts=%lld(%@) eid=%@ uid=%@",
+              tv, JATimeStr(tv),
+              [JAVal(warn, @"eid") description], [JAVal(cam, @"uid") description]);
         // 记录报警时间戳（秒），RTC viewDidAppear 后自动 startSDPlayWithSelectTimeStamp:
         if (tv >= 1000000000LL && tv < 10000000000LL) g_rtcTargetSec = tv;
         // 预设设备 SD 选中日期 = 报警日 0 点秒 —— RTC setupData（0x100af6104）会
@@ -361,6 +451,7 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     if (sec < 1000000000LL) return;
     // v1.20：世代去重 —— 官方可能多次触发 viewDidAppear，只保留最后一次生效
     unsigned long long myGen = ++g_rtcVdaGen;
+    JALog(@"vda: appear sec=%lld(%@) gen=%llu", sec, JATimeStr(sec), myGen);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
@@ -397,15 +488,37 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+            // v2.4：定位前先读该设备「当天 SD 录像段」列表。
+            // 开通（后又关闭）过云存储的设备常见两种情况：① 设备时钟与手机/服务器
+            // 时间不一致 → 报警秒落在所有录像段之外；② 该日事件列表只返回部分段。
+            // 官方 startSDPlayWithSelectTimeStamp: 找不到该时间点 → 弹「当前时间无
+            // 录像」并回退到最新段/实时（实测固定停在设备端的"现在"或最后一段）。
+            // 修复：取事件列表里与报警秒最接近的一段，差值 > 60s 就改用该段起点定位。
+            NSInteger evCount = 0;
+            long long evFirst = 0, evLast = 0;
+            long long nearSec = JAPickNearestEventSec(self, sec, &evCount, &evFirst, &evLast);
+            long long useSec = sec;
+            if (nearSec > 0) {
+                long long diff = nearSec > sec ? (nearSec - sec) : (sec - nearSec);
+                if (diff > 60) useSec = nearSec;
+                JALog(@"locate: alarm=%lld(%@) events=%ld range=[%@ ~ %@] nearest=%lld(%@) diff=%lld -> use=%lld(%@)",
+                      sec, JATimeStr(sec), (long)evCount, JATimeStr(evFirst), JATimeStr(evLast),
+                      nearSec, JATimeStr(nearSec), diff, useSec, JATimeStr(useSec));
+            } else {
+                JALog(@"locate: alarm=%lld(%@) events=%ld range=[%@ ~ %@] -> use=alarm (no event ts)",
+                      sec, JATimeStr(sec), (long)evCount, JATimeStr(evFirst), JATimeStr(evLast));
+            }
             SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
             if ([self respondsToSelector:s]) {
-                ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
+                ((void(*)(id, SEL, long long))objc_msgSend)(self, s, useSec);
+                JALog(@"locate: startSDPlayWithSelectTimeStamp(%lld) sent", useSec);
             }
-            // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到报警时间点
+            // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到定位时间点
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                JATimeLineSyncToSec(self, sec);
+                JATimeLineSyncToSec(self, useSec);
+                JALog(@"locate: timeline sync -> %lld(%@)", useSec, JATimeStr(useSec));
             });
         });
     });
@@ -505,6 +618,7 @@ static void ja_handleJumpToOpenCloud(id self, SEL _cmd) {
 static void ja_rtc_viewDidDisappear(id self, SEL _cmd) {
     if (g_orig_rtc_vdd) ((void(*)(id, SEL))g_orig_rtc_vdd)(self, _cmd);
     if (self != g_activeSDPlayer) return;
+    JALog(@"vdd: disappear -> stop sd play");
     g_activeSDPlayer = nil;  // 先清标记：后续 viewDidAppear/定位闭包不再执行
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
