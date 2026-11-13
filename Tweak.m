@@ -90,6 +90,13 @@
 //   这样条数、抓拍图、跨天、分页结果与用户在消息列表里看到的完全一致；
 //   格子页只负责「3 列 + 小时分隔」重排。官方通道不通时才依次退回直连消息
 //   模型、官方 SD 段（v2.7 原链路），保证不会比之前更差。
+// v2.9.1（修 v2.9 闪退）：
+//   v2.9 是「新建一个隐藏实例当引擎」，实测点格子回放、数据刚开始读就闪退 ——
+//   官方这页的 viewDidLoad 要建 tableView/顶部条/日历，依赖真实导航栈与窗口尺寸，
+//   屏外隐藏跑不干净。改成「捕获 + 复用」：hook 它的 viewDidLoad，把用户真打开过
+//   的那个实例按设备分桶留下来（强引用，最多 8 台），格子页直接借它自己的
+//   loadDataFirstWithDate: / loadMoreFirstDateWith... 取数。实例生命周期由官方
+//   自己管理，不再新建，从根上不会闪退；没捕获到时退回 v2.8 直连 + SD 段。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -948,6 +955,28 @@ static NSNumber *JAGridTimestamp(id ev) {
     return nil;
 }
 
+// ---------- v2.9.1：复用用户真实打开过的「消息列表」页 ----------
+// v2.9 是新建一个隐藏实例当数据引擎，实测点格子回放后闪退：官方这页的
+// viewDidLoad 要建 tableView/顶部条/日历，依赖真实导航栈与窗口尺寸，屏外隐藏
+// 跑不干净。改成「捕获 + 复用」：用户真打开过一次这页，就把这个实例留下来
+// （强引用、按设备分桶），格子页直接借它自己的 loadDataFirstWithDate: /
+// loadMoreFirstDateWith... 去取数。实例生命周期是官方自己管理的，最稳，
+// 而且它内部就是消息列表正在用的那份数据与分页，天然一致。
+static NSMutableDictionary *g_msgListVCs = nil;
+static IMP g_orig_msgList_vdl = NULL;
+
+static NSString *JAMsgListKey(id cam) {
+    NSString *k = JAGridDeviceId(cam);
+    return k.length ? k : nil;
+}
+
+static id JAMsgListVCFor(id cam) {
+    if (!g_msgListVCs) return nil;
+    NSString *k = JAMsgListKey(cam);
+    if (!k.length) return nil;
+    @try { return g_msgListVCs[k]; } @catch (NSException *e) { return nil; }
+}
+
 // ---------- v2.8：报警消息数据源（与「消息列表」同源，自带抓拍图） ----------
 // 为什么换源：官方 SD 事件列表只对「当前选中那天」生效，跨天拉取拿到的是上一天的旧
 // 数组（v2.6「12 号显示 13 号内容」、v2.7「往前 3 天都没录像」都是它）；而且它走本地
@@ -1685,90 +1714,54 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     [self gridTryFetch:dataVC attempt:0 day:dayStart best:nil stable:0 completion:cb];
 }
 
-// ---------- v2.9：直接用官方「消息列表」页当数据源 ----------
+// ---------- v2.9：借用官方「消息列表」页的取数能力 ----------
 // 之前的做法是「照着消息列表的行为自己重写一遍」（先猜 JAMessageModel 的参数，
-// 再回退 SD 段），参数一猜错就整体不对。这里改成把官方页面本身拉起来当数据引擎：
+// 再回退 SD 段），参数一猜错就整体不对。这里改成直接借官方页面自己的取数链路：
 //   * 它是 JABasicViewController 子类，设备走父类的 myCamera（dump 已确认）
 //   * loadDataFirstWithDate:showHud:isTableRefresh:finish: 是它自己的按天首屏
 //   * loadMoreFirstDateWithShowHud:isTableRefresh:finish: 是它自己的翻页
 //   * warnInfoListArr 就是它 tableView 的数据源，isSelfEndMoreData 是"没有更多"
 // 这样条数、抓拍图、跨天、分页结果与用户在消息列表里看到的完全一致。
-
-// 摘掉隐藏页：补一次 disappear，再真正从父控制器移除
-- (void)jaDetachNativeVC:(UIViewController *)mvc {
-    if (!mvc) return;
-    @try { [mvc beginAppearanceTransition:NO animated:NO]; [mvc endAppearanceTransition]; }
-    @catch (NSException *e) {}
-    @try {
-        [mvc willMoveToParentViewController:nil];
-        [mvc.view removeFromSuperview];
-        [mvc removeFromParentViewController];
-    } @catch (NSException *e) {}
-}
+// v2.9.1：不再新建隐藏实例（会在它 viewDidLoad 时闪退），改为复用用户真打开过
+// 的那个实例（见 JAMsgListVCFor / ja_msgList_viewDidLoad）。
 
 - (void)fetchDayMessageNative:(long long)day completion:(void (^)(NSArray *items))cb {
-    Class mc = NSClassFromString(@"JANewDevWarnInfoListVC");
     // 返回约定：cb(nil) = 这条通道走不通；cb(@[]) = 官方明确说这天没有消息
-    if (!mc || !self.myCamera) { if (cb) cb(nil); return; }
-    id vc = nil;
-    @try { vc = [[mc alloc] init]; } @catch (NSException *e) { vc = nil; }
-    if (!vc) { if (cb) cb(nil); return; }
+    // v2.9.1：只借用用户真实打开过的那个实例，不再新建（新建会在它 viewDidLoad
+    // 时闪退）。没捕获到就交回上层，走直连消息模型 + SD 段兜底。
+    id mvc = JAMsgListVCFor(self.myCamera);
+    if (!mvc || ![mvc isKindOfClass:UIViewController.class]) { if (cb) cb(nil); return; }
+    UIViewController *vc = (UIViewController *)mvc;
 
-    // 顺序关键：设备 + 日期都要在它的 viewDidLoad 之前设好。
-    // 它在 viewDidLoad 里会自己发起一次首屏加载（fristLoadDataActionWithDataShowHud:），
-    // 如果那时候 currentDateStr 还是「今天」，就会跟我们随后要的历史日期抢同一个数组。
-    @try { [vc setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
     NSString *ds = JAGridDayStr(day);
-    @try { [vc setValue:ds forKey:@"currentDateStr"]; } @catch (NSException *e) {}
-    UIViewController *mvc = (UIViewController *)vc;
+    @try { [mvc setValue:ds forKey:@"currentDateStr"]; } @catch (NSException *e) {}
+    // 先清掉它上次留下的数据，免得把别的天/别的设备的结果当成本天结果
     @try {
-        SEL sm = NSSelectorFromString(@"setMyCamera:");
-        if ([mvc respondsToSelector:sm]) {
-            ((void (*)(id, SEL, id))objc_msgSend)(mvc, sm, self.myCamera);
-        }
-    } @catch (NSException *e) {}
-
-    // 和 v2.7 借 SD 数据页同一套手法：塞成子控制器 + 挪到屏幕外 + 隐藏，
-    // 让 viewDidLoad / 布局照常跑完，但它一个像素都不显示
-    @try {
-        [self addChildViewController:mvc];
-        mvc.view.frame = CGRectMake(-900, -900, 375, 812);
-        mvc.view.hidden = YES;
-        [self.view addSubview:mvc.view];
-        [mvc didMoveToParentViewController:self];
-        // addChildViewController 不会自动走 appear 回调；官方页在 viewWillAppear/
-        // viewDidAppear 里做了一部分状态初始化，手动补一次，行为更贴近真实打开
-        [mvc beginAppearanceTransition:YES animated:NO];
-        [mvc endAppearanceTransition];
+        id arr = [mvc valueForKey:@"warnInfoListArr"];
+        if ([arr isKindOfClass:NSMutableArray.class]) [(NSMutableArray *)arr removeAllObjects];
     } @catch (NSException *e) {}
 
     SEL ldf = NSSelectorFromString(@"loadDataFirstWithDate:showHud:isTableRefresh:finish:");
-    if (![mvc respondsToSelector:ldf]) {
-        [self jaDetachNativeVC:mvc];
-        if (cb) cb(nil);
-        return;
-    }
+    if (![vc respondsToSelector:ldf]) { if (cb) cb(nil); return; }
     // finish 的 block 签名未知（@?），传一个无参空 block 最安全：
     // 就算它按 (BOOL) 调用，多余参数也被忽略
     id noopFinish = ^{};
+    BOOL sent = NO;
     @try {
-        ((void (*)(id, SEL, id, BOOL, BOOL, id))objc_msgSend)(mvc, ldf, ds, NO, NO, noopFinish);
-    } @catch (NSException *e) {
+        ((void (*)(id, SEL, id, BOOL, BOOL, id))objc_msgSend)(vc, ldf, ds, NO, NO, noopFinish);
+        sent = YES;
+    } @catch (NSException *e) {}
+    if (!sent) {
         // 首参也可能是 NSDate；字符串版本抛了就用 NSDate 再试一次
-        BOOL retried = NO;
         @try {
             NSDate *d = [NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)day];
-            ((void (*)(id, SEL, id, BOOL, BOOL, id))objc_msgSend)(mvc, ldf, d, NO, NO, noopFinish);
-            retried = YES;
+            ((void (*)(id, SEL, id, BOOL, BOOL, id))objc_msgSend)(vc, ldf, d, NO, NO, noopFinish);
+            sent = YES;
         } @catch (NSException *e2) {}
-        if (!retried) {
-            [self jaDetachNativeVC:mvc];
-            if (cb) cb(nil);
-            return;
-        }
     }
+    if (!sent) { if (cb) cb(nil); return; }
 
-    [self pollNativeMessageVC:mvc day:day round:0 lastN:0 stable:0 moreLoads:0 completion:cb];
+    [self pollNativeMessageVC:vc day:day round:0 lastN:0 stable:0 moreLoads:0 completion:cb];
 }
 
 // 轮询官方页的数据源：条数不再增长就收工；还有更多页就替它调翻页
@@ -1814,8 +1807,6 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         BOOL done = (st >= 3) || (round >= 16) || (st >= 2 && (end || ml >= 6));
         if (done) {
             NSArray *items = JAGridEntriesFromMessages(arr, day);
-            // 收工：把隐藏页摘掉，别让它一直挂着
-            [s jaDetachNativeVC:mvc];
             // 一条都没拿到、官方也没说自己「无数据」→ 当作通道没跑起来，
             // 交回上层继续试，避免把「网络没回来」误判成「这天没有报警」
             if (n == 0 && !noData) { if (cb) cb(nil); return; }
@@ -1897,7 +1888,13 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         self.hintLab.hidden = YES;
     } else if (!cached.count && self.days.count == 0) {
         self.hintLab.hidden = NO;
-        self.hintLab.text = @"正在读取该日录像…";
+        // v2.9.1：要复用官方消息列表的实例才谈得上「完全一样」。还没打开过那页时
+        // 给一句明确引导，不然用户会以为这版没生效。
+        if (!JAMsgListVCFor(self.myCamera)) {
+            self.hintLab.text = @"正在读取该日录像…\n（先在「消息列表」打开一次这台设备，这里的条数就会和它完全一致）";
+        } else {
+            self.hintLab.text = @"正在读取该日录像…";
+        }
     }
 
     __weak typeof(self) ws = self;
@@ -2867,6 +2864,21 @@ static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved) {
 
 static BOOL JAHooked = NO;  // 详情页 hook（clickCloudRecordAction 主链）
 
+static void ja_msgList_viewDidLoad(id self, SEL _cmd) {
+    if (g_orig_msgList_vdl) ((void (*)(id, SEL))g_orig_msgList_vdl)(self, _cmd);
+    @try {
+        NSString *k = JAMsgListKey(JAVal(self, @"myCamera"));
+        if (!k.length) return;
+        if (!g_msgListVCs) g_msgListVCs = [NSMutableDictionary dictionary];
+        // 每台设备留一份；超过 8 台就丢最早的那份，别让多个页面常驻
+        if (g_msgListVCs.count >= 8 && !g_msgListVCs[k]) {
+            id oldest = [[g_msgListVCs allKeys] firstObject];
+            if (oldest) [g_msgListVCs removeObjectForKey:oldest];
+        }
+        g_msgListVCs[k] = self;
+    } @catch (NSException *e) {}
+}
+
 static void JAHook(void) {
     // 详情页主链
     if (!JAHooked) {
@@ -2877,6 +2889,14 @@ static void JAHook(void) {
             JASetImp(detailCls, @selector(handleJumpToOpenCloud), (IMP)ja_handleJumpToOpenCloud,
                      &g_orig_handleJumpToOpenCloud);
             JAHooked = YES;
+        }
+    }
+    // v2.9.1：捕获用户真实打开过的「消息列表」页（按设备分桶留用）
+    {
+        Class msgCls = NSClassFromString(@"JANewDevWarnInfoListVC");
+        if (msgCls) {
+            JASetImp(msgCls, @selector(viewDidLoad), (IMP)ja_msgList_viewDidLoad,
+                     &g_orig_msgList_vdl);
         }
     }
     // RTC SD 播放器 hooks（viewDidAppear 自动定位 / viewDidDisappear 返回停流；
