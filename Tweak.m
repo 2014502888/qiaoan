@@ -955,28 +955,6 @@ static NSNumber *JAGridTimestamp(id ev) {
     return nil;
 }
 
-// ---------- v2.9.1：复用用户真实打开过的「消息列表」页 ----------
-// v2.9 是新建一个隐藏实例当数据引擎，实测点格子回放后闪退：官方这页的
-// viewDidLoad 要建 tableView/顶部条/日历，依赖真实导航栈与窗口尺寸，屏外隐藏
-// 跑不干净。改成「捕获 + 复用」：用户真打开过一次这页，就把这个实例留下来
-// （强引用、按设备分桶），格子页直接借它自己的 loadDataFirstWithDate: /
-// loadMoreFirstDateWith... 去取数。实例生命周期是官方自己管理的，最稳，
-// 而且它内部就是消息列表正在用的那份数据与分页，天然一致。
-static NSMutableDictionary *g_msgListVCs = nil;
-static IMP g_orig_msgList_vdl = NULL;
-
-static NSString *JAMsgListKey(id cam) {
-    NSString *k = JAGridDeviceId(cam);
-    return k.length ? k : nil;
-}
-
-static id JAMsgListVCFor(id cam) {
-    if (!g_msgListVCs) return nil;
-    NSString *k = JAMsgListKey(cam);
-    if (!k.length) return nil;
-    @try { return g_msgListVCs[k]; } @catch (NSException *e) { return nil; }
-}
-
 // ---------- v2.8：报警消息数据源（与「消息列表」同源，自带抓拍图） ----------
 // 为什么换源：官方 SD 事件列表只对「当前选中那天」生效，跨天拉取拿到的是上一天的旧
 // 数组（v2.6「12 号显示 13 号内容」、v2.7「往前 3 天都没录像」都是它）；而且它走本地
@@ -998,6 +976,29 @@ static NSString *JAGridDeviceId(id cam) {
         if (s.length >= 6) return s;
     }
     return nil;
+}
+
+// ---------- v2.9.1：复用用户真实打开过的「消息列表」页 ----------
+// v2.9 是新建一个隐藏实例当数据引擎，实测点格子回放后闪退：官方这页的
+// viewDidLoad 要建 tableView/顶部条/日历，依赖真实导航栈与窗口尺寸，屏外隐藏
+// 跑不干净。改成「捕获 + 复用」：用户真打开过一次这页，就把这个实例留下来
+// （强引用、按设备分桶），格子页直接借它自己的 loadDataFirstWithDate: /
+// loadMoreFirstDateWith... 去取数。实例生命周期是官方自己管理的，最稳，
+// 而且它内部就是消息列表正在用的那份数据与分页，天然一致。
+// 注意：这里的定义必须排在 JAGridDeviceId 之后（它要按设备 id 分桶）。
+static NSMutableDictionary *g_msgListVCs = nil;
+static IMP g_orig_msgList_vdl = NULL;
+
+static NSString *JAMsgListKey(id cam) {
+    NSString *k = JAGridDeviceId(cam);
+    return k.length ? k : nil;
+}
+
+static id JAMsgListVCFor(id cam) {
+    if (!g_msgListVCs) return nil;
+    NSString *k = JAMsgListKey(cam);
+    if (!k.length) return nil;
+    @try { return g_msgListVCs[k]; } @catch (NSException *e) { return nil; }
 }
 
 static NSString *JAGridDeviceName(id cam) {
