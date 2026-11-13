@@ -69,6 +69,27 @@
 //      13 号内容」与「同一天重复」）；
 //   ④ 条数偏少：gridTryFetch 改为多次采样、取「该天有效条数最多」的那次，连续两次
 //      不再增长才收工（官方列表异步/分段回来，一拿到非空就返回会少条）。
+// v2.8 / v2.8.1（数据源改「报警消息」+ 当日空态）：
+//   ① 抓拍图优先 eventPicThumbUrl；新增按天消息源 JAGridFetchMessageDay（直连
+//      JAMessageModel）+ 按天磁盘缓存 Caches/JAGridDays；
+//   ② 入口去重改窗口坐标 ±14 判定；播放页补 RTC hooks 与「目标 HH:mm:ss」角标；
+//   ③ 过了 24 点当天还没有报警时不再误报「往前 3 天都没录像」，改成保留当天
+//      抬头 + 灰色说明「当日还没有任何报警消息」，往上拉才去读前一天。
+// v2.9（定案：数据 100% 照搬官方「消息列表」页）：
+//   之前是自己照着消息列表的行为重写一遍（接口参数只能猜），一猜错就整体不对，
+//   所以怎么修都不完美。本版直接把官方那个页面拉起来当数据引擎：
+//     · 类：JANewDevWarnInfoListVC（前面几版 dump 已确认：44 个 ivar 里没有
+//       camera/device 字段，设备来自父类 JABasicViewController 的 myCamera）；
+//     · 塞成子控制器 + 挪到屏幕外 + hidden，让它 viewDidLoad/布局照常跑完，
+//       但一个像素都不显示；
+//     · 日期走它自己的 currentDateStr（yyyy-MM-dd，北京时区）；
+//     · 首屏调它自己的 loadDataFirstWithDate:showHud:isTableRefresh:finish:；
+//     · 补分页替它调 loadMoreFirstDateWithShowHud:isTableRefresh:finish:；
+//     · 结果直接读它的 warnInfoListArr（= 它 tableView 的数据源），
+//       isSelfEndMoreData 判「还有更多」、isSelfNoData 判「这天真没有」。
+//   这样条数、抓拍图、跨天、分页结果与用户在消息列表里看到的完全一致；
+//   格子页只负责「3 列 + 小时分隔」重排。官方通道不通时才依次退回直连消息
+//   模型、官方 SD 段（v2.7 原链路），保证不会比之前更差。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1664,6 +1685,148 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     [self gridTryFetch:dataVC attempt:0 day:dayStart best:nil stable:0 completion:cb];
 }
 
+// ---------- v2.9：直接用官方「消息列表」页当数据源 ----------
+// 之前的做法是「照着消息列表的行为自己重写一遍」（先猜 JAMessageModel 的参数，
+// 再回退 SD 段），参数一猜错就整体不对。这里改成把官方页面本身拉起来当数据引擎：
+//   * 它是 JABasicViewController 子类，设备走父类的 myCamera（dump 已确认）
+//   * loadDataFirstWithDate:showHud:isTableRefresh:finish: 是它自己的按天首屏
+//   * loadMoreFirstDateWithShowHud:isTableRefresh:finish: 是它自己的翻页
+//   * warnInfoListArr 就是它 tableView 的数据源，isSelfEndMoreData 是"没有更多"
+// 这样条数、抓拍图、跨天、分页结果与用户在消息列表里看到的完全一致。
+
+// 摘掉隐藏页：补一次 disappear，再真正从父控制器移除
+- (void)jaDetachNativeVC:(UIViewController *)mvc {
+    if (!mvc) return;
+    @try { [mvc beginAppearanceTransition:NO animated:NO]; [mvc endAppearanceTransition]; }
+    @catch (NSException *e) {}
+    @try {
+        [mvc willMoveToParentViewController:nil];
+        [mvc.view removeFromSuperview];
+        [mvc removeFromParentViewController];
+    } @catch (NSException *e) {}
+}
+
+- (void)fetchDayMessageNative:(long long)day completion:(void (^)(NSArray *items))cb {
+    Class mc = NSClassFromString(@"JANewDevWarnInfoListVC");
+    // 返回约定：cb(nil) = 这条通道走不通；cb(@[]) = 官方明确说这天没有消息
+    if (!mc || !self.myCamera) { if (cb) cb(nil); return; }
+    id vc = nil;
+    @try { vc = [[mc alloc] init]; } @catch (NSException *e) { vc = nil; }
+    if (!vc) { if (cb) cb(nil); return; }
+
+    // 顺序关键：设备 + 日期都要在它的 viewDidLoad 之前设好。
+    // 它在 viewDidLoad 里会自己发起一次首屏加载（fristLoadDataActionWithDataShowHud:），
+    // 如果那时候 currentDateStr 还是「今天」，就会跟我们随后要的历史日期抢同一个数组。
+    @try { [vc setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
+    NSString *ds = JAGridDayStr(day);
+    @try { [vc setValue:ds forKey:@"currentDateStr"]; } @catch (NSException *e) {}
+    UIViewController *mvc = (UIViewController *)vc;
+    @try {
+        SEL sm = NSSelectorFromString(@"setMyCamera:");
+        if ([mvc respondsToSelector:sm]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(mvc, sm, self.myCamera);
+        }
+    } @catch (NSException *e) {}
+
+    // 和 v2.7 借 SD 数据页同一套手法：塞成子控制器 + 挪到屏幕外 + 隐藏，
+    // 让 viewDidLoad / 布局照常跑完，但它一个像素都不显示
+    @try {
+        [self addChildViewController:mvc];
+        mvc.view.frame = CGRectMake(-900, -900, 375, 812);
+        mvc.view.hidden = YES;
+        [self.view addSubview:mvc.view];
+        [mvc didMoveToParentViewController:self];
+        // addChildViewController 不会自动走 appear 回调；官方页在 viewWillAppear/
+        // viewDidAppear 里做了一部分状态初始化，手动补一次，行为更贴近真实打开
+        [mvc beginAppearanceTransition:YES animated:NO];
+        [mvc endAppearanceTransition];
+    } @catch (NSException *e) {}
+
+    SEL ldf = NSSelectorFromString(@"loadDataFirstWithDate:showHud:isTableRefresh:finish:");
+    if (![mvc respondsToSelector:ldf]) {
+        [self jaDetachNativeVC:mvc];
+        if (cb) cb(nil);
+        return;
+    }
+    // finish 的 block 签名未知（@?），传一个无参空 block 最安全：
+    // 就算它按 (BOOL) 调用，多余参数也被忽略
+    id noopFinish = ^{};
+    @try {
+        ((void (*)(id, SEL, id, BOOL, BOOL, id))objc_msgSend)(mvc, ldf, ds, NO, NO, noopFinish);
+    } @catch (NSException *e) {
+        // 首参也可能是 NSDate；字符串版本抛了就用 NSDate 再试一次
+        BOOL retried = NO;
+        @try {
+            NSDate *d = [NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)day];
+            ((void (*)(id, SEL, id, BOOL, BOOL, id))objc_msgSend)(mvc, ldf, d, NO, NO, noopFinish);
+            retried = YES;
+        } @catch (NSException *e2) {}
+        if (!retried) {
+            [self jaDetachNativeVC:mvc];
+            if (cb) cb(nil);
+            return;
+        }
+    }
+
+    [self pollNativeMessageVC:mvc day:day round:0 lastN:0 stable:0 moreLoads:0 completion:cb];
+}
+
+// 轮询官方页的数据源：条数不再增长就收工；还有更多页就替它调翻页
+- (void)pollNativeMessageVC:(UIViewController *)mvc day:(long long)day
+                       round:(NSInteger)round lastN:(NSInteger)lastN
+                      stable:(NSInteger)stable moreLoads:(NSInteger)moreLoads
+                  completion:(void (^)(NSArray *items))cb {
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(ws) s = ws;
+        if (!s) return;
+        NSArray *arr = nil;
+        @try { arr = [mvc valueForKey:@"warnInfoListArr"]; } @catch (NSException *e) {}
+        NSInteger n = [arr isKindOfClass:NSArray.class] ? (NSInteger)arr.count : 0;
+        BOOL end = NO;
+        @try { end = [[mvc valueForKey:@"isSelfEndMoreData"] boolValue]; } @catch (NSException *e) {}
+        // 官方自己判定的「我这台设备这天没有消息」，是这个页面唯一的权威空答案
+        BOOL noData = NO;
+        @try { noData = [[mvc valueForKey:@"isSelfNoData"] boolValue]; } @catch (NSException *e) {}
+
+        NSInteger ls = lastN;
+        NSInteger st = stable;
+        NSInteger ml = moreLoads;
+        if (n > ls) { ls = n; st = 0; } else { st += 1; }
+
+        // 数据停了但官方说还有更多 → 替它翻一页（最多 6 页，防止死循环）
+        if (st >= 2 && n > 0 && !end && ml < 6) {
+            SEL lm = NSSelectorFromString(@"loadMoreFirstDateWithShowHud:isTableRefresh:finish:");
+            if ([mvc respondsToSelector:lm]) {
+                @try {
+                    id noop2 = ^{};
+                    ((void (*)(id, SEL, BOOL, BOOL, id))objc_msgSend)(mvc, lm, NO, NO, noop2);
+                    ml += 1;
+                    st = 0;
+                } @catch (NSException *e) { end = YES; }
+            } else {
+                end = YES;
+            }
+        }
+
+        // 收工条件只看「数据稳定」，noData 只用来区分「权威空」还是「通道没跑起来」
+        BOOL done = (st >= 3) || (round >= 16) || (st >= 2 && (end || ml >= 6));
+        if (done) {
+            NSArray *items = JAGridEntriesFromMessages(arr, day);
+            // 收工：把隐藏页摘掉，别让它一直挂着
+            [s jaDetachNativeVC:mvc];
+            // 一条都没拿到、官方也没说自己「无数据」→ 当作通道没跑起来，
+            // 交回上层继续试，避免把「网络没回来」误判成「这天没有报警」
+            if (n == 0 && !noData) { if (cb) cb(nil); return; }
+            if (cb) cb(items ?: @[]);
+            return;
+        }
+        [s pollNativeMessageVC:mvc day:day round:round + 1 lastN:ls
+                          stable:st moreLoads:ml completion:cb];
+    });
+}
+
 // v2.7：多次采样，取「该天有效条数最多」的那次，连续 2 次不再增长才收工。
 // 官方列表是异步/分段回来的，一拿到非空就返回会少条 —— 这正对应
 // 「翻过报警消息再回格子页就变多」的现象。
@@ -1738,21 +1901,27 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     }
 
     __weak typeof(self) ws = self;
-    // ② 报警消息源（按天查询，自带抓拍图）—— 跨天也能拿到正确的一天
-    JAGridFetchMessageDay(self.myCamera, day, ^(NSArray *items) {
+    // ② v2.9：官方消息列表页（隐藏实例）—— 数据/分页/抓拍图与它自己完全一致
+    [self fetchDayMessageNative:day completion:^(NSArray *items) {
         __strong typeof(ws) s = ws;
         if (!s) return;
-        if (items.count > 0) {
+        if (items) {              // 非 nil（哪怕是空数组）= 官方给了权威答案
             [s onDayLoaded:day items:items];
             return;
         }
-        // ③ 回退：官方 SD 段（v2.7 原链路，失败也不会比原来差）
-        [s fetchDaySD:day completion:^(NSArray *events) {
+        // ③ 通道走不通才退到「直连 JAMessageModel」（v2.8 那层）
+        JAGridFetchMessageDay(s.myCamera, day, ^(NSArray *a2) {
             __strong typeof(ws) s2 = ws;
             if (!s2) return;
-            [s2 onDayLoaded:day items:JAGridEntriesFromEvents(events, day)];
-        }];
-    });
+            if (a2.count > 0) { [s2 onDayLoaded:day items:a2]; return; }
+            // ④ 最后回退官方 SD 段（v2.7 原链路，保证不比之前差）
+            [s2 fetchDaySD:day completion:^(NSArray *events) {
+                __strong typeof(ws) s3 = ws;
+                if (!s3) return;
+                [s3 onDayLoaded:day items:JAGridEntriesFromEvents(events, day)];
+            }];
+        });
+    }];
 }
 
 - (void)onDayLoaded:(long long)day items:(NSArray *)items {
