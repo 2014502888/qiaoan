@@ -1454,7 +1454,9 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         y += 34;
     }
     self.clockView.frame = CGRectMake(16, y + 3, 20, 20);
-    self.hourLab.frame = CGRectMake(42, y, MAX(0, w - 58), 26);
+    // v2.8.1：没有时钟的「空天说明」从左边 16 起排，和日期标题左对齐
+    CGFloat hx = self.clockView.hidden ? 16 : 42;
+    self.hourLab.frame = CGRectMake(hx, y, MAX(0, w - hx - 16), 26);
 }
 - (void)refreshDash {
     self.dashLine.layer.sublayers = nil;
@@ -1756,6 +1758,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 - (void)onDayLoaded:(long long)day items:(NSArray *)items {
     self.loading = NO;
     self.nextDay = day - 86400;
+    long long today = JAGridTodayStart();
     if (items.count > 0) {
         self.emptyStreak = 0;
         [self.knownDays addObject:@(day)];
@@ -1770,6 +1773,15 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         self.hintLab.hidden = YES;
         return;
     }
+    // v2.8.1：刚过 0 点时「今天还没有任何报警」是完全正常的状态 —— 显示当天抬头 +
+    // 一句说明，不累加“连续空”，也不自动往前翻；用户往下拉才去读前一天。
+    if (day >= today) {
+        self.emptyStreak = 0;
+        self.gaveUp = NO;
+        [self appendDay:day items:@[] note:@"当日还没有任何报警消息，往下拉可读取前一天"];
+        self.hintLab.hidden = YES;
+        return;
+    }
     self.emptyStreak++;
     if (self.emptyStreak >= 3) {
         self.gaveUp = YES;
@@ -1781,19 +1793,28 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 }
 
 - (void)appendDay:(long long)day items:(NSArray *)items {
-    if (items.count == 0) return;
+    [self appendDay:day items:items note:nil];
+}
+
+- (void)appendDay:(long long)day items:(NSArray *)items note:(NSString *)note {
+    // v2.8.1：空天也允许入组 —— 只为了显示「2026年11月14日 + 当日还没有任何报警消息」
+    // 这样一个抬头，不下发任何格子
+    if (items.count == 0 && note.length == 0) return;
+    NSDictionary *bucket = @{@"day": @(day),
+                             @"items": (items ?: @[]),
+                             @"note": (note ?: @"")};
     // v2.7：同一天已经加过就整体替换（防同一天出现两个分组）
     BOOL replaced = NO;
     for (NSUInteger i = 0; i < self.days.count; i++) {
         NSDictionary *old = (NSDictionary *)self.days[i];
         long long oldDay = [(NSNumber *)old[@"day"] longLongValue];
         if (oldDay == day) {
-            self.days[i] = @{@"day": @(day), @"items": items};
+            self.days[i] = bucket;
             replaced = YES;
             break;
         }
     }
-    if (!replaced) [self.days addObject:@{@"day": @(day), @"items": items}];
+    if (!replaced) [self.days addObject:bucket];
     [self rebuildLayout];
 }
 
@@ -1813,6 +1834,17 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         NSDictionary *dayDict = (NSDictionary *)self.days[di];
         long long day = [(NSNumber *)dayDict[@"day"] longLongValue];
         NSArray *items = (NSArray *)dayDict[@"items"];
+        // v2.8.1：当天还没有任何报警 → 仍给一个「日期抬头 + 说明」的空分组
+        if (items.count == 0) {
+            NSString *note = (NSString *)dayDict[@"note"];
+            if (note.length) {
+                [secs addObject:@{@"day": @(day), @"hour": @(-1),
+                                  @"dayTitle": JAGridDayText(day),
+                                  @"hourTitle": @"", @"items": @[],
+                                  @"note": note}];
+            }
+            continue;
+        }
         NSMutableDictionary *byHour = [NSMutableDictionary dictionary];
         for (NSDictionary *e in items) {
             long long sec = [(NSNumber *)e[@"sec"] longLongValue];
@@ -1892,8 +1924,21 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
                                                                  forIndexPath:ip];
     if (ip.section < (NSInteger)self.secs.count) {
         NSDictionary *secDict = (NSDictionary *)self.secs[ip.section];
-        [h configDayTitle:(NSString *)secDict[@"dayTitle"]
-                 hourTitle:(NSString *)secDict[@"hourTitle"]];
+        NSString *note = (NSString *)secDict[@"note"];
+        if (note.length) {
+            // v2.8.1：空天 —— 只留日期抬头，时钟换成一句灰色说明
+            [h configDayTitle:(NSString *)secDict[@"dayTitle"] hourTitle:@""];
+            h.clockView.hidden = YES;
+            h.hourLab.text = note;
+            h.hourLab.font = [UIFont systemFontOfSize:13];
+            h.hourLab.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
+        } else {
+            [h configDayTitle:(NSString *)secDict[@"dayTitle"]
+                     hourTitle:(NSString *)secDict[@"hourTitle"]];
+            h.clockView.hidden = NO;
+            h.hourLab.font = [UIFont systemFontOfSize:16];
+            h.hourLab.textColor = [UIColor colorWithRed:0.13 green:0.55 blue:0.95 alpha:1.0];
+        }
     }
     return h;
 }
