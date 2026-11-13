@@ -863,6 +863,13 @@ static NSString *JAGridNormalizeURL(NSString *u) {
 }
 
 static NSString *JAGridImageURL(id ev) {
+    // v2.8：消息模型（JAEMWarnInfoEntityModel）的抓拍图就是消息列表里那张缩略图，
+    // 键名 eventPicThumbUrl 优先；其次 event_file_url（原图/大图）。
+    id thumb = JAVal(ev, @"eventPicThumbUrl");
+    if ([thumb isKindOfClass:NSString.class]) {
+        NSString *u = JAGridNormalizeURL((NSString *)thumb);
+        if (u) return u;
+    }
     // v2.6：键名扩到常见的封面/抓拍字段（不同设备的报警模型字段不一样）
     NSArray *keys = @[@"event_file_url", @"event_pic_url", @"event_pic", @"picUrl",
                       @"pic_url", @"event_img", @"imageUrl", @"snapUrl", @"eventImagePath",
@@ -918,6 +925,234 @@ static NSNumber *JAGridTimestamp(id ev) {
         }
     }
     return nil;
+}
+
+// ---------- v2.8：报警消息数据源（与「消息列表」同源，自带抓拍图） ----------
+// 为什么换源：官方 SD 事件列表只对「当前选中那天」生效，跨天拉取拿到的是上一天的旧
+// 数组（v2.6「12 号显示 13 号内容」、v2.7「往前 3 天都没录像」都是它）；而且它走本地
+// 缓存（isLoadCacheEventList），首读不全、翻过报警消息后才变全（「条数比报警消息少、
+// 翻完再回来变多」）。报警消息接口本身按天查询、可分页、每条都带 eventPicThumbUrl，
+// 所以格子页的数据源优先走它，失败再回退官方 SD 段（不会比 v2.7 更差）。
+
+static NSString *JAGridDayStr(long long day) {
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    df.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:8 * 3600];
+    df.dateFormat = @"yyyy-MM-dd";
+    return [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)day]];
+}
+
+static NSString *JAGridDeviceId(id cam) {
+    for (NSString *k in @[@"uid", @"deviceId", @"devId", @"sn", @"deviceSn", @"snStr", @"iotId"]) {
+        NSString *s = JANormId(JAVal(cam, k));
+        if (s.length >= 6) return s;
+    }
+    return nil;
+}
+
+static NSString *JAGridDeviceName(id cam) {
+    for (NSString *k in @[@"name", @"deviceName", @"devName", @"nickName", @"remark"]) {
+        id v = JAVal(cam, k);
+        if ([v isKindOfClass:NSString.class] && [(NSString *)v length]) return (NSString *)v;
+    }
+    return @"";
+}
+
+// 一条报警消息 → 格子 entry（sec 复用 v2.5 已验证的解析链）
+static NSDictionary *JAGridEntryFromMessage(id msg, long long day) {
+    if (!msg) return nil;
+    NSNumber *ts = JABuildTimestamp(msg);
+    if (!ts) return nil;
+    long long sec = ts.longLongValue;
+    if (sec < day || sec >= day + 86400LL) return nil;     // 只收本天
+    NSMutableDictionary *e = [NSMutableDictionary dictionary];
+    e[@"sec"] = @(sec);
+    e[@"day"] = @(day);
+    e[@"ev"] = msg;
+    NSString *u = JAGridImageURL(msg);
+    if (u) e[@"img"] = u;
+    id im = JAVal(msg, @"thumbImg");
+    if ([im isKindOfClass:UIImage.class]) e[@"imgObj"] = im;
+    return e;
+}
+
+// 消息数组 → 按天过滤 + 按秒去重 + 最新在上
+static NSArray *JAGridEntriesFromMessages(NSArray *list, long long day) {
+    if (![list isKindOfClass:NSArray.class] || list.count == 0) return nil;
+    NSMutableArray *items = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    for (id m in list) {
+        NSDictionary *e = JAGridEntryFromMessage(m, day);
+        if (!e) continue;
+        NSNumber *sec = (NSNumber *)e[@"sec"];
+        if ([seen containsObject:sec]) continue;
+        [seen addObject:sec];
+        [items addObject:e];
+    }
+    if (items.count == 0) return nil;
+    [items sortUsingComparator:^NSComparisonResult(id a, id b) {
+        long long sa = [(NSNumber *)[(NSDictionary *)a objectForKey:@"sec"] longLongValue];
+        long long sb = [(NSNumber *)[(NSDictionary *)b objectForKey:@"sec"] longLongValue];
+        if (sa == sb) return NSOrderedSame;
+        return sa > sb ? NSOrderedAscending : NSOrderedDescending;
+    }];
+    return items;
+}
+
+// 官方消息模型是异步网络拉取：warnMessageList 会分段变长，连续 2 次不再增长才收工
+static void JAGridPollMessageModel(id model, long long day, NSInteger round,
+                                   NSArray *best, NSInteger bestN, NSInteger stable,
+                                   void (^cb)(NSArray *items)) {
+    if (round > 10) { if (cb) cb(bestN > 0 ? best : nil); return; }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NSArray *list = nil;
+        @try { list = [model valueForKey:@"warnMessageList"]; } @catch (NSException *e) {}
+        NSArray *items = JAGridEntriesFromMessages(list, day);
+        NSInteger n = items ? (NSInteger)items.count : 0;
+        __block NSArray *cand = best;
+        __block NSInteger bn = bestN;
+        __block NSInteger st = stable;
+        if (n > bn) { cand = items; bn = n; st = 0; }
+        else { st += 1; }
+        if (bn > 0 && st >= 2) { if (cb) cb(cand); return; }
+        JAGridPollMessageModel(model, day, round + 1, cand, bn, st, cb);
+    });
+}
+
+// 拉「某设备某天」的报警消息；cb(nil) 表示这条通道走不通（调用方回退官方 SD 段）
+static void JAGridFetchMessageDay(id cam, long long day, void (^cb)(NSArray *items)) {
+    Class mc = NSClassFromString(@"JAMessageModel");
+    NSString *devId = JAGridDeviceId(cam);
+    if (!mc || !devId.length) { if (cb) cb(nil); return; }
+    id model = nil;
+    @try { model = [[mc alloc] init]; } @catch (NSException *e) { model = nil; }
+    if (!model) { if (cb) cb(nil); return; }
+
+    NSString *ds = JAGridDayStr(day);
+    NSString *dn = JAGridDeviceName(cam);
+    @try { [model setValue:cam forKey:@"selectedCamera"]; } @catch (NSException *e) {}
+    @try { [model setValue:ds forKey:@"selectedDayString"]; } @catch (NSException *e) {}
+    @try { [model setValue:@(0) forKey:@"searchFrom"]; } @catch (NSException *e) {}
+
+    SEL f1 = NSSelectorFromString(@"fetchJooanMessagesWithDay:searchFrom:devId:devName:");
+    SEL f2 = NSSelectorFromString(@"fetchAliMessagesWithDay:searchFrom:iotId:devName:");
+    __block BOOL triedAli = NO;
+    BOOL sent = NO;
+    if ([model respondsToSelector:f1]) {
+        @try {
+            ((void (*)(id, SEL, id, int, id, id))objc_msgSend)(model, f1, ds, 0, devId, dn);
+            sent = YES;
+        } @catch (NSException *e) { sent = NO; }
+    }
+    if (!sent && [model respondsToSelector:f2]) {
+        @try {
+            ((void (*)(id, SEL, id, int, id, id))objc_msgSend)(model, f2, ds, 1, devId, dn);
+            sent = YES;
+            triedAli = YES;
+        } @catch (NSException *e) { sent = NO; }
+    }
+    if (!sent) { if (cb) cb(nil); return; }
+
+    JAGridPollMessageModel(model, day, 0, nil, 0, 0, ^(NSArray *items) {
+        if (items.count > 0 || triedAli || ![model respondsToSelector:f2]) {
+            if (cb) cb(items);
+            return;
+        }
+        // Jooan 通道空了再换 Ali 通道试一次（部分设备是阿里云存量）
+        triedAli = YES;
+        @try { [model setValue:[NSMutableArray array] forKey:@"warnMessageList"]; }
+        @catch (NSException *e) {}
+        BOOL ok = NO;
+        @try {
+            ((void (*)(id, SEL, id, int, id, id))objc_msgSend)(model, f2, ds, 1, devId, dn);
+            ok = YES;
+        } @catch (NSException *e) { ok = NO; }
+        if (!ok) { if (cb) cb(nil); return; }
+        JAGridPollMessageModel(model, day, 0, nil, 0, 0, cb);
+    });
+}
+
+// ---------- v2.8：按天磁盘缓存（第二次进格子页秒开） ----------
+
+static NSString *JAGridDayCacheDir(NSString *devKey) {
+    NSString *caches = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory,
+                                                            NSUserDomainMask, YES) firstObject];
+    if (!caches.length || !devKey.length) return nil;
+    NSString *dir = [[caches stringByAppendingPathComponent:@"JAGridDays"]
+                     stringByAppendingPathComponent:devKey];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
+static NSString *JAGridDayCachePath(NSString *devKey, long long day) {
+    NSString *dir = JAGridDayCacheDir(devKey);
+    if (!dir.length) return nil;
+    return [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%lld.plist", day]];
+}
+
+static NSArray *JAGridDayCacheRead(NSString *devKey, long long day) {
+    NSString *p = JAGridDayCachePath(devKey, day);
+    if (!p.length) return nil;
+    NSArray *arr = [NSArray arrayWithContentsOfFile:p];
+    if (![arr isKindOfClass:NSArray.class] || arr.count == 0) return nil;
+    NSMutableArray *out = [NSMutableArray array];
+    for (id o in arr) {
+        if (![o isKindOfClass:NSDictionary.class]) continue;
+        NSNumber *sec = ((NSDictionary *)o)[@"sec"];
+        if (![sec isKindOfClass:NSNumber.class]) continue;
+        NSMutableDictionary *e = [NSMutableDictionary dictionaryWithDictionary:(NSDictionary *)o];
+        e[@"day"] = @(day);
+        [out addObject:e];
+    }
+    return out.count ? out : nil;
+}
+
+static void JAGridDayCacheWrite(NSString *devKey, long long day, NSArray *items) {
+    if (!items.count || !devKey.length) return;
+    NSString *p = JAGridDayCachePath(devKey, day);
+    if (!p.length) return;
+    NSMutableArray *arr = [NSMutableArray array];
+    for (NSDictionary *e in items) {
+        NSNumber *sec = e[@"sec"];
+        if (![sec isKindOfClass:NSNumber.class]) continue;
+        NSMutableDictionary *o = [NSMutableDictionary dictionary];
+        o[@"sec"] = sec;
+        NSString *img = e[@"img"];
+        if ([img isKindOfClass:NSString.class]) o[@"img"] = img;
+        [arr addObject:o];
+    }
+    [arr writeToFile:p atomically:YES];
+}
+
+// 官方 SD 段数组 → 格子 entry（回退路径用；按天过滤 + 去重 + 最新在上）
+static NSArray *JAGridEntriesFromEvents(NSArray *events, long long day) {
+    NSMutableArray *items = [NSMutableArray array];
+    NSMutableSet *seen = [NSMutableSet set];
+    for (id ev in events) {
+        NSNumber *ts = JAGridTimestamp(ev);
+        if (!ts) continue;
+        long long sec = ts.longLongValue;
+        if (sec < day || sec >= day + 86400LL) continue;
+        if ([seen containsObject:@(sec)]) continue;
+        [seen addObject:@(sec)];
+        NSMutableDictionary *e = [NSMutableDictionary dictionary];
+        e[@"sec"] = @(sec);
+        e[@"day"] = @(day);
+        e[@"ev"] = ev;
+        NSString *u = JAGridImageURL(ev);
+        if (u) e[@"img"] = u;
+        [items addObject:e];
+    }
+    if (items.count == 0) return nil;
+    [items sortUsingComparator:^NSComparisonResult(id a, id b) {
+        long long sa = [(NSNumber *)[(NSDictionary *)a objectForKey:@"sec"] longLongValue];
+        long long sb = [(NSNumber *)[(NSDictionary *)b objectForKey:@"sec"] longLongValue];
+        if (sa == sb) return NSOrderedSame;
+        return sa > sb ? NSOrderedAscending : NSOrderedDescending;
+    }];
+    return items;
 }
 
 // 按运行时类型编码调「单参数」方法：参数可能是 long long，也可能是对象，猜错会崩
@@ -1028,6 +1263,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 @property (nonatomic, strong) UIView *playDot;
 @property (nonatomic, copy) NSString *imgURL;
 - (void)setImageURL:(NSString *)url;
+- (void)showImage:(UIImage *)img;   // v2.8：消息模型自带 thumbImg，直接显示
 @end
 
 @implementation JAGridCell
@@ -1111,6 +1347,18 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         if (img) { s.thumb.image = img; s.noneLab.hidden = YES; }
         else { s.noneLab.hidden = NO; }
     }];
+}
+
+// v2.8：消息模型自带解码好的缩略图（thumbImg），直接显示，省一次下载
+- (void)showImage:(UIImage *)img {
+    self.imgURL = nil;
+    if (!img) {
+        self.thumb.image = nil;
+        self.noneLab.hidden = NO;
+        return;
+    }
+    self.thumb.image = img;
+    self.noneLab.hidden = YES;
 }
 @end
 
@@ -1243,6 +1491,12 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 @property (nonatomic, assign) BOOL gaveUp;
 @property (nonatomic, assign) NSInteger playIndex;
 @property (nonatomic, strong) id playingVC;
+@property (nonatomic, strong) NSMutableSet *knownDays;   // v2.8：已确认有录像的日期（日历红点）
+@property (nonatomic, copy) NSString *cacheKey;          // v2.8：该设备的按天缓存键
+@property (nonatomic, strong) UIBarButtonItem *calItem;  // v2.8：右上角日期选择器
+@property (nonatomic, strong) UIView *calPanel;          // v2.8：月历弹层
+@property (nonatomic, assign) BOOL didFirstLoad;          // v2.8：本次进入是否已发起首轮加载
+@property (nonatomic, strong) NSDate *calMonth;           // v2.8：日历当前显示的月份
 @end
 
 @implementation JAGridReplayViewController
@@ -1260,11 +1514,36 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     self.emptyStreak = 0;
     self.nextDay = JAGridTodayStart();
 
+    self.knownDays = [NSMutableSet set];
+    // v2.8：按设备做缓存目录键（FNV-1a，和封面缓存同一套思路）
+    NSString *devId = JAGridDeviceId(self.myCamera);
+    if (devId.length) {
+        uint32_t h = 2166136261u;
+        for (NSUInteger i = 0; i < devId.length; i++) {
+            h ^= (uint32_t)[devId characterAtIndex:i];
+            h *= 16777619u;
+        }
+        self.cacheKey = [NSString stringWithFormat:@"%08x", h];
+    }
+
     self.autoItem = [[UIBarButtonItem alloc] initWithTitle:@"连播 开"
                                                     style:UIBarButtonItemStylePlain
                                                    target:self
                                                    action:@selector(toggleAutoNext)];
-    self.navigationItem.rightBarButtonItems = @[self.autoItem];
+    // v2.8：右上角日期选择器（月历，有录像的日期带红点）
+    UIImage *calImg = [UIImage systemImageNamed:@"calendar"];
+    if (calImg) {
+        self.calItem = [[UIBarButtonItem alloc] initWithImage:calImg
+                                                       style:UIBarButtonItemStylePlain
+                                                      target:self
+                                                      action:@selector(showCalendarPanel)];
+    } else {
+        self.calItem = [[UIBarButtonItem alloc] initWithTitle:@"日期"
+                                                        style:UIBarButtonItemStylePlain
+                                                       target:self
+                                                       action:@selector(showCalendarPanel)];
+    }
+    self.navigationItem.rightBarButtonItems = @[self.calItem, self.autoItem];
 
     UICollectionViewFlowLayout *lay = [[UICollectionViewFlowLayout alloc] init];
     lay.minimumInteritemSpacing = 9;
@@ -1320,14 +1599,26 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         self.hintLab.text = @"没拿到设备对象（myCamera 为空），格子页无法读取录像";
         return;
     }
-    if (self.days.count == 0 && !self.gaveUp) {
+    long long today = JAGridTodayStart();
+    // v2.8：缓存先上屏 —— 第二次进页面直接有内容（不用等网络/等官方的隐藏数据页）
+    if (self.days.count == 0) {
+        NSArray *cached = JAGridDayCacheRead(self.cacheKey, today);
+        if (cached.count) {
+            [self appendDay:today items:cached];
+            [self.knownDays addObject:@(today)];
+            self.hintLab.hidden = YES;
+        }
+    }
+    if (!self.didFirstLoad && !self.gaveUp) {
+        self.didFirstLoad = YES;
+        if (self.nextDay <= 0 || self.nextDay > today) self.nextDay = today;
         [self loadOneMoreDay];
     }
 }
 
 // ---------- 拉一天事件（借官方数据层） ----------
 
-- (void)fetchDay:(long long)dayStart completion:(void (^)(NSArray *events))cb {
+- (void)fetchDaySD:(long long)dayStart completion:(void (^)(NSArray *events))cb {
     Class rtc = NSClassFromString(@"JANewRtcSDPlayViewController");
     if (!rtc) { if (cb) cb(nil); return; }
 
@@ -1420,62 +1711,77 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     @try { [self.retained removeObject:dataVC]; } @catch (NSException *e) {}
 }
 
+- (BOOL)hasDay:(long long)day {
+    for (NSDictionary *d in self.days) {
+        if ([(NSNumber *)d[@"day"] longLongValue] == day) return YES;
+    }
+    return NO;
+}
+
 - (void)loadOneMoreDay {
     if (self.loading || !self.myCamera) return;
     if (self.nextDay <= 0) self.nextDay = JAGridTodayStart();
     long long day = self.nextDay;
     self.loading = YES;
-    self.hintLab.hidden = NO;
-    self.hintLab.text = @"正在读取该日录像…";
+
+    // ① 有缓存就直接上屏（第二次进页面 = 秒开）
+    NSArray *cached = JAGridDayCacheRead(self.cacheKey, day);
+    if (cached.count && ![self hasDay:day]) {
+        [self appendDay:day items:cached];
+        [self.knownDays addObject:@(day)];
+        self.hintLab.hidden = YES;
+    } else if (!cached.count && self.days.count == 0) {
+        self.hintLab.hidden = NO;
+        self.hintLab.text = @"正在读取该日录像…";
+    }
 
     __weak typeof(self) ws = self;
-    [self fetchDay:day completion:^(NSArray *events) {
+    // ② 报警消息源（按天查询，自带抓拍图）—— 跨天也能拿到正确的一天
+    JAGridFetchMessageDay(self.myCamera, day, ^(NSArray *items) {
         __strong typeof(ws) s = ws;
         if (!s) return;
-        s.loading = NO;
-        s.nextDay = day - 86400;
-
-        if (events.count > 0) {
-            s.emptyStreak = 0;
-            [s appendDay:day events:events];
-            s.hintLab.hidden = YES;
-        } else {
-            s.emptyStreak++;
-            if (s.emptyStreak >= 3) {
-                s.gaveUp = YES;
-                s.hintLab.hidden = NO;
-                s.hintLab.text = @"往前 3 天都没有录像（这三天没有事件记录）";
-            } else {
-                [s loadOneMoreDay];
-            }
+        if (items.count > 0) {
+            [s onDayLoaded:day items:items];
+            return;
         }
-    }];
+        // ③ 回退：官方 SD 段（v2.7 原链路，失败也不会比原来差）
+        [s fetchDaySD:day completion:^(NSArray *events) {
+            __strong typeof(ws) s2 = ws;
+            if (!s2) return;
+            [s2 onDayLoaded:day items:JAGridEntriesFromEvents(events, day)];
+        }];
+    });
 }
 
-- (void)appendDay:(long long)day events:(NSArray *)events {
-    NSMutableArray *items = [NSMutableArray array];
-    NSMutableSet *seenSec = [NSMutableSet set];
-    for (id ev in events) {
-        NSNumber *ts = JAGridTimestamp(ev);
-        if (!ts) continue;
-        long long sec = ts.longLongValue;
-        if (sec < 1000000000LL || sec >= 10000000000LL) continue;   // 只要 10 位秒
-        // v2.7：只收「落在这一天内」的事件。借用官方对象取数时，上层可能还是上一天
-        // 的旧列表（或两天混在一起），不按天过滤就会出现「12 号显示 13 号的内容」
-        // 以及大量重复条目。
-        if (sec < day || sec >= day + 86400LL) continue;
-        if ([seenSec containsObject:@(sec)]) continue;              // 同一天内按秒去重
-        [seenSec addObject:@(sec)];
-        [items addObject:@{@"ev": ev, @"sec": @(sec), @"day": @(day)}];
+- (void)onDayLoaded:(long long)day items:(NSArray *)items {
+    self.loading = NO;
+    self.nextDay = day - 86400;
+    if (items.count > 0) {
+        self.emptyStreak = 0;
+        [self.knownDays addObject:@(day)];
+        [self appendDay:day items:items];
+        if (self.cacheKey.length) JAGridDayCacheWrite(self.cacheKey, day, items);
+        self.hintLab.hidden = YES;
+        return;
     }
+    // 网络这次没回，但缓存里已经有这天 → 保留缓存内容，不算“没录像”
+    if ([self hasDay:day]) {
+        self.emptyStreak = 0;
+        self.hintLab.hidden = YES;
+        return;
+    }
+    self.emptyStreak++;
+    if (self.emptyStreak >= 3) {
+        self.gaveUp = YES;
+        self.hintLab.hidden = NO;
+        self.hintLab.text = @"往前 3 天都没有读到录像记录（设备可能没上报这几天的报警）";
+    } else {
+        [self loadOneMoreDay];
+    }
+}
+
+- (void)appendDay:(long long)day items:(NSArray *)items {
     if (items.count == 0) return;
-    // v2.6：格子顺序「最新在最上」（官方返回是升序）
-    [items sortUsingComparator:^NSComparisonResult(id a, id b) {
-        long long sa = [(NSNumber *)[(NSDictionary *)a objectForKey:@"sec"] longLongValue];
-        long long sb = [(NSNumber *)[(NSDictionary *)b objectForKey:@"sec"] longLongValue];
-        if (sa == sb) return NSOrderedSame;
-        return sa > sb ? NSOrderedAscending : NSOrderedDescending;
-    }];
     // v2.7：同一天已经加过就整体替换（防同一天出现两个分组）
     BOOL replaced = NO;
     for (NSUInteger i = 0; i < self.days.count; i++) {
@@ -1565,7 +1871,14 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
             NSDictionary *e = (NSDictionary *)items[ip.item];
             NSNumber *sec = (NSNumber *)e[@"sec"];
             c.timeLab.text = JAGridTimeText(sec.longLongValue);
-            [c setImageURL:JAGridImageURL(e[@"ev"])];
+            id imgObj = e[@"imgObj"];
+            if ([imgObj isKindOfClass:UIImage.class]) {
+                [c showImage:(UIImage *)imgObj];
+            } else {
+                id u = e[@"img"];
+                if (![u isKindOfClass:NSString.class]) u = JAGridImageURL(e[@"ev"]);
+                [c setImageURL:([u isKindOfClass:NSString.class] ? (NSString *)u : nil)];
+            }
         }
     }
     return c;
@@ -1646,6 +1959,14 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     Class rtc = NSClassFromString(@"JANewRtcSDPlayViewController");
     if (!rtc) return;
 
+    // v2.8：RTC hooks 补装（和详情页链路一致）—— 少了这个，viewDidAppear 不会
+    // 触发定位，进去就只剩官方自动播的最新实时画面
+    if (!g_rtcHooked) {
+        JASetImp(rtc, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
+        JASetImp(rtc, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
+        g_rtcHooked = YES;
+    }
+
     id vc = [[rtc alloc] init];
     @try { [vc setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
     JASet(vc, @"currentTimeStamp", @(sec));
@@ -1682,6 +2003,28 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         } @catch (NSException *e) {}
     });
 
+    // v2.8：画面右上角标出这一格的目标时间 —— 时间轴被隐藏了，定位有没有生效
+    // 只能靠这个角标和画面做对照
+    __weak id wvc2 = vc;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        UIViewController *p = (UIViewController *)wvc2;
+        if (!p || !p.isViewLoaded) return;
+        for (UIView *sv in p.view.subviews) if (sv.tag == 0x1A65) return;
+        UILabel *lab = [[UILabel alloc] initWithFrame:CGRectZero];
+        lab.tag = 0x1A65;
+        lab.font = [UIFont systemFontOfSize:12];
+        lab.textColor = [UIColor whiteColor];
+        lab.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
+        lab.textAlignment = NSTextAlignmentCenter;
+        lab.layer.cornerRadius = 6;
+        lab.clipsToBounds = YES;
+        lab.text = [NSString stringWithFormat:@"目标 %@", JAGridTimeText(sec)];
+        CGFloat w = p.view.bounds.size.width;
+        lab.frame = CGRectMake(w - 122, 96, 110, 22);
+        [p.view addSubview:lab];
+    });
+
     // 35 秒后自动跳下一格
     if (self.autoNext) {
         __weak typeof(self) ws = self;
@@ -1707,6 +2050,189 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 - (void)toggleAutoNext {
     self.autoNext = !self.autoNext;
     self.autoItem.title = self.autoNext ? @"连播 开" : @"连播 关";
+}
+
+// ---------- v2.8：右上角日期选择器（月历 + 有录像日期红点） ----------
+
+- (void)showCalendarPanel {
+    if (self.calPanel) { [self hideCalendarPanel]; return; }
+    if (!self.calMonth) self.calMonth = [NSDate date];
+
+    UIView *mask = [[UIView alloc] initWithFrame:self.view.bounds];
+    mask.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.35];
+    mask.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view addSubview:mask];
+    self.calPanel = mask;
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self
+                                                                         action:@selector(hideCalendarPanel)];
+    [mask addGestureRecognizer:tap];
+
+    CGFloat sw = self.view.bounds.size.width;
+    CGFloat w = MIN(sw - 24, 356);
+    UIView *card = [[UIView alloc] initWithFrame:CGRectMake((sw - w) / 2.0, 74, w, 356)];
+    card.tag = 0x1A64;
+    card.backgroundColor = [UIColor whiteColor];
+    card.layer.cornerRadius = 14;
+    card.clipsToBounds = YES;
+    // 卡片吞掉点击，避免点卡片本体就关掉
+    [card addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self
+                                                                       action:@selector(noopTap)]];
+    [mask addSubview:card];
+    [self renderCalendarCard:card];
+}
+
+- (void)noopTap {
+}
+
+- (void)hideCalendarPanel {
+    if (!self.calPanel) return;
+    [self.calPanel removeFromSuperview];
+    self.calPanel = nil;
+}
+
+- (NSCalendar *)calCalendar {
+    NSCalendar *cal = [NSCalendar calendarWithIdentifier:NSCalendarIdentifierGregorian];
+    cal.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:8 * 3600];
+    return cal;
+}
+
+- (void)renderCalendarCard:(UIView *)card {
+    for (UIView *v in [card.subviews copy]) [v removeFromSuperview];
+    CGFloat w = card.bounds.size.width;
+
+    NSCalendar *cal = [self calCalendar];
+    NSDateComponents *mc = [cal components:(NSCalendarUnitYear | NSCalendarUnitMonth)
+                                  fromDate:self.calMonth];
+    NSDateComponents *cm = [[NSDateComponents alloc] init];
+    cm.year = mc.year;
+    cm.month = mc.month;
+    cm.day = 1;
+    NSDate *firstDay = [cal dateFromComponents:cm];
+    NSInteger daysInMonth = [cal rangeOfUnit:NSCalendarUnitDay
+                                     inUnit:NSCalendarUnitMonth
+                                    forDate:firstDay].length;
+    NSInteger weekday = [cal component:NSCalendarUnitWeekday fromDate:firstDay];   // 1=周日
+
+    // 标题行
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, w - 120, 24)];
+    title.font = [UIFont boldSystemFontOfSize:16];
+    title.text = [NSString stringWithFormat:@"%ld年%ld月", (long)mc.year, (long)mc.month];
+    [card addSubview:title];
+
+    UIButton *prev = [UIButton buttonWithType:UIButtonTypeSystem];
+    prev.frame = CGRectMake(w - 112, 6, 40, 36);
+    prev.titleLabel.font = [UIFont systemFontOfSize:18];
+    [prev setTitle:@"‹" forState:UIControlStateNormal];
+    prev.tag = -1;
+    [prev addTarget:self action:@selector(onCalendarMonthButton:)
+   forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:prev];
+
+    UIButton *next = [UIButton buttonWithType:UIButtonTypeSystem];
+    next.frame = CGRectMake(w - 72, 6, 40, 36);
+    next.titleLabel.font = [UIFont systemFontOfSize:18];
+    [next setTitle:@"›" forState:UIControlStateNormal];
+    next.tag = 1;
+    [next addTarget:self action:@selector(onCalendarMonthButton:)
+   forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:next];
+
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
+    close.frame = CGRectMake(w - 38, 6, 36, 36);
+    close.titleLabel.font = [UIFont systemFontOfSize:15];
+    [close setTitle:@"✕" forState:UIControlStateNormal];
+    close.tag = 99;
+    [close addTarget:self action:@selector(onCalendarMonthButton:)
+     forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:close];
+
+    // 星期行
+    NSArray *wks = @[@"日", @"一", @"二", @"三", @"四", @"五", @"六"];
+    CGFloat gridW = w - 24;
+    CGFloat colW = gridW / 7.0;
+    for (NSInteger i = 0; i < 7; i++) {
+        UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12 + colW * i, 44, colW, 20)];
+        l.font = [UIFont systemFontOfSize:12];
+        l.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
+        l.textAlignment = NSTextAlignmentCenter;
+        l.text = wks[i];
+        [card addSubview:l];
+    }
+
+    // 日期网格
+    CGFloat top = 68;
+    CGFloat rowH = 42;
+    NSInteger lead = (NSInteger)(weekday - 1);      // 周日开头，前面空几格
+    long long todayStart = JAGridTodayStart();
+    for (NSInteger d = 1; d <= daysInMonth; d++) {
+        NSInteger idx = lead + d - 1;
+        NSInteger row = idx / 7;
+        NSInteger col = idx % 7;
+        if (row > 5) break;
+        NSDateComponents *dc = [[NSDateComponents alloc] init];
+        dc.year = mc.year;
+        dc.month = mc.month;
+        dc.day = d;
+        NSDate *dd = [cal dateFromComponents:dc];
+        long long dayStart = (long long)[dd timeIntervalSince1970];
+        dayStart = dayStart - ((dayStart + 28800LL) % 86400LL);   // 对齐北京时间 0 点
+
+        UIButton *btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        btn.frame = CGRectMake(12 + colW * col, top + rowH * row, colW, rowH);
+        btn.tag = (NSInteger)dayStart;
+        [btn setTitle:[NSString stringWithFormat:@"%ld", (long)d] forState:UIControlStateNormal];
+        btn.titleLabel.font = [UIFont systemFontOfSize:15];
+        [btn setTitleColor:[UIColor colorWithWhite:0.15 alpha:1.0] forState:UIControlStateNormal];
+        if (dayStart == todayStart) {
+            [btn setTitleColor:[UIColor colorWithRed:0.13 green:0.55 blue:0.95 alpha:1.0]
+                       forState:UIControlStateNormal];
+        }
+        [btn addTarget:self action:@selector(onPickDayButton:)
+       forControlEvents:UIControlEventTouchUpInside];
+        [card addSubview:btn];
+
+        // 有录像的日期：数字下面一个红点
+        if ([self.knownDays containsObject:@(dayStart)]) {
+            UIView *dot = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 6, 6)];
+            dot.backgroundColor = [UIColor colorWithRed:0.92 green:0.24 blue:0.22 alpha:1.0];
+            dot.layer.cornerRadius = 3;
+            dot.center = CGPointMake(colW / 2.0, rowH - 9);
+            dot.userInteractionEnabled = NO;
+            [btn addSubview:dot];
+        }
+    }
+}
+
+- (void)onCalendarMonthButton:(UIButton *)b {
+    if (b.tag == 99) { [self hideCalendarPanel]; return; }
+    NSCalendar *cal = [self calCalendar];
+    self.calMonth = [cal dateByAddingUnit:NSCalendarUnitMonth value:(NSInteger)b.tag
+                                   toDate:self.calMonth options:0];
+    UIView *card = nil;
+    for (UIView *v in self.calPanel.subviews) {
+        if (v.tag == 0x1A64) { card = v; break; }
+    }
+    if (card) [self renderCalendarCard:card];
+}
+
+- (void)onPickDayButton:(UIButton *)b {
+    long long day = (long long)b.tag;
+    [self jumpToDay:day];
+}
+
+- (void)jumpToDay:(long long)day {
+    [self hideCalendarPanel];
+    if (day < 1000000000LL) return;
+    self.gaveUp = NO;
+    self.emptyStreak = 0;
+    self.didFirstLoad = YES;
+    self.loading = NO;
+    [self.days removeAllObjects];
+    self.nextDay = day;
+    [self rebuildLayout];
+    self.hintLab.hidden = YES;
+    [self loadOneMoreDay];
 }
 
 @end
@@ -1813,6 +2339,39 @@ static UIView *JAGridCommonAncestor(UIView *a, UIView *b) {
     return nil;
 }
 
+// v2.8：属性链拿不到 camera 时（第三台设备的卡片层级就是这样），退化为拿卡片上
+// 的设备名去 JAGroupManager.getAllMyCamera 里按名字匹配 —— 比"随便给一个 camera"
+// 可靠，不会再出现点进去提示「没找到这台设备」。
+static id JAGridCameraByNameNear(UIView *box) {
+    id gm = JAGroupManagerShared();
+    if (!gm || !box) return nil;
+    id all = nil;
+    @try { all = [gm performSelector:NSSelectorFromString(@"getAllMyCamera")]; }
+    @catch (NSException *e) {}
+    if (![all isKindOfClass:NSArray.class] || [all count] == 0) return nil;
+
+    NSMutableArray *names = [NSMutableArray array];
+    UIView *x = box;
+    int level = 0;
+    while (x && level < 10) {
+        for (UIView *s in x.subviews) {
+            NSString *t = JAGridViewText(s);
+            if (t.length >= 2 && t.length <= 20) [names addObject:t];
+        }
+        x = x.superview;
+        level++;
+    }
+    if (names.count == 0) return nil;
+    for (NSString *n in names) {
+        for (id cam in all) {
+            NSString *cn = JAGridDeviceName(cam);
+            if (!cn.length) continue;
+            if ([cn isEqualToString:n] || [n containsString:cn] || [cn containsString:n]) return cam;
+        }
+    }
+    return nil;
+}
+
 // 从这张卡片往上找设备对象：先看自有属性，再看 uid 去 JAGroupManager 换 camera
 static id JAGridCameraForView(UIView *v) {
     NSArray *keys = @[@"myCamera", @"camera", @"myDevice", @"device", @"deviceModel",
@@ -1850,11 +2409,37 @@ static id JAGridCameraForView(UIView *v) {
         x = x.superview;
         level++;
     }
-    return nil;
+    return JAGridCameraByNameNear(v);   // v2.8：属性链走不通就按设备名匹配
+}
+
+// v2.8：入口去重 —— cell 复用会让卡片的视图层级重建，旧的入口 box 可能留在
+// 上一层容器里，只按「同一 host + midX」判重会漏掉，结果一张卡片上叠出两个
+// 「格子回放」（其中一个是旧层级里的残影，点它自然解析不到设备）。
+static void JAGridCollectEntriesNear(UIView *root, CGPoint pt, NSMutableArray *out, int depth) {
+    if (!root || depth > 8) return;
+    for (UIView *s in root.subviews) {
+        if (s.tag == JAGridEntryTag && s.window) {
+            CGRect rw = [s convertRect:s.bounds toView:s.window];
+            if (fabs(CGRectGetMidX(rw) - pt.x) < 14 && fabs(CGRectGetMidY(rw) - pt.y) < 14) {
+                [out addObject:s];
+            }
+        }
+        JAGridCollectEntriesNear(s, pt, out, depth + 1);
+    }
+}
+
+static void JAGridPurgeEntriesUnder(UIView *v, int depth) {
+    if (!v || depth > 4) return;
+    NSMutableArray *del = [NSMutableArray array];
+    for (UIView *s in v.subviews) {
+        if (s.tag == JAGridEntryTag) [del addObject:s];
+        else JAGridPurgeEntriesUnder(s, depth + 1);
+    }
+    for (UIView *d in del) [d removeFromSuperview];
 }
 
 static void JAGridInstallEntryInRow(UIView *cloud, UIView *ai) {
-    if (!cloud || !ai) return;
+    if (!cloud || !ai || !cloud.window) return;
     if ([cloud isDescendantOfView:ai] || [ai isDescendantOfView:cloud]) return;
     UIView *host = JAGridCommonAncestor(cloud, ai);
     if (!host) return;
@@ -1866,9 +2451,21 @@ static void JAGridInstallEntryInRow(UIView *cloud, UIView *ai) {
 
     CGFloat midX = (CGRectGetMidX(rc) + CGRectGetMidX(ra)) / 2.0;
     CGFloat midY = (CGRectGetMidY(rc) + CGRectGetMidY(ra)) / 2.0;
-    for (UIView *sv in host.subviews) {
-        if (sv.tag == JAGridEntryTag && fabs(CGRectGetMidX(sv.frame) - midX) < 8) return;
+
+    // 已在同一位置装过就什么都不做（避免每 0.3s 重建一次导致闪烁）
+    CGRect rcw = [cloud convertRect:cloud.bounds toView:nil];
+    CGRect raw = [ai convertRect:ai.bounds toView:nil];
+    CGPoint wp = CGPointMake((CGRectGetMidX(rcw) + CGRectGetMidX(raw)) / 2.0,
+                             (CGRectGetMidY(rcw) + CGRectGetMidY(raw)) / 2.0);
+    NSMutableArray *found = [NSMutableArray array];
+    JAGridCollectEntriesNear(cloud.window, wp, found, 0);
+    if (found.count > 0) {
+        // 多余的重影全部删掉，只留第一个
+        for (NSUInteger i = 1; i < found.count; i++) [found[i] removeFromSuperview];
+        return;
     }
+    // 这张卡片所在容器里的旧入口一律清掉，再装新的（保证一卡一口）
+    JAGridPurgeEntriesUnder(host, 0);
 
     CGFloat h = MAX(36.0, MAX(CGRectGetHeight(rc), CGRectGetHeight(ra)) + 10.0);
     CGFloat w = 104.0;
