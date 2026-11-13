@@ -59,6 +59,16 @@
 //      并连播下一格 —— 观感对齐云回放的「看一小段」；
 //   ⑥ 清理：删除 v2.3/v2.4 遗留的整套诊断（JALog/jasdreplay2.log、JAGridProbeText
 //      结构快照、自动复制剪贴板、「复制」按钮、黑框 TextView、lastProbe）。
+// v2.7（格子页按小时归类 + 取数修正）：
+//   ① 分组改「天 → 小时」两级：一天一个大标题（右侧虚线），小时内小标题（蓝色时钟 +
+//      HH:00），一小时一组 3 列格子 —— 样式对齐官方云回放页；
+//   ② 顶部被压：collectionView 按 safeAreaInsets 布局，「2026年11月13日」这类日期
+//      分组不再被顶部「回放 / 连播」那条导航栏遮住；
+//   ③ 跨天串数据：借用官方对象取数时列表可能还是上一天的，appendDay 只收落在本天
+//      00:00~24:00 的事件，并按秒去重、同一天重复出现则整体替换（修掉「12 号显示
+//      13 号内容」与「同一天重复」）；
+//   ④ 条数偏少：gridTryFetch 改为多次采样、取「该天有效条数最多」的那次，连续两次
+//      不再增长才收工（官方列表异步/分段回来，一拿到非空就返回会少条）。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -394,6 +404,18 @@ static NSInteger JAGridValidEventCount(id vc) {
         if (!t) continue;
         long long s = t.longLongValue;
         if (s >= 1000000000LL && s < 10000000000LL) n++;
+    }
+    return n;
+}
+
+// v2.7：某天内的有效事件条数（采样比较用）
+static NSInteger JAGridDayEventCount(NSArray *evs, long long day) {
+    NSInteger n = 0;
+    for (id ev in evs) {
+        NSNumber *t = JAGridTimestamp(ev);
+        if (!t) continue;
+        long long s = t.longLongValue;
+        if (s >= day && s < day + 86400LL) n++;
     }
     return n;
 }
@@ -1092,23 +1114,114 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 }
 @end
 
-// ---------- 日期分组头 ----------
+// ---------- 分组头（v2.7：一天大标题 + 按小时小标题，样式对齐云回放） ----------
+
+// 云回放那个蓝色小时时钟图标（圆环 + 两根指针，纯 drawRect 自绘，不依赖图片资源）
+@interface JAGridClockView : UIView
+@end
+@implementation JAGridClockView
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor clearColor];
+        self.opaque = NO;
+    }
+    return self;
+}
+- (void)drawRect:(CGRect)rect {
+    UIColor *blue = [UIColor colorWithRed:0.13 green:0.55 blue:0.95 alpha:1.0];
+    [blue setStroke];
+    CGFloat w = rect.size.width;
+    CGFloat h = rect.size.height;
+    CGRect r = CGRectInset(rect, 1.0, 1.0);
+    UIBezierPath *circle = [UIBezierPath bezierPathWithOvalInRect:r];
+    circle.lineWidth = 1.4;
+    [circle stroke];
+    CGPoint c = CGPointMake(CGRectGetMidX(rect), CGRectGetMidY(rect));
+    UIBezierPath *handX = [UIBezierPath bezierPath];   // 指向 12 点
+    [handX moveToPoint:c];
+    [handX addLineToPoint:CGPointMake(c.x, c.y - h * 0.28)];
+    handX.lineWidth = 1.4;
+    [handX stroke];
+    UIBezierPath *handY = [UIBezierPath bezierPath];   // 指向 3 点
+    [handY moveToPoint:c];
+    [handY addLineToPoint:CGPointMake(c.x + w * 0.24, c.y)];
+    handY.lineWidth = 1.4;
+    [handY stroke];
+}
+@end
 
 @interface JAGridHeader : UICollectionReusableView
-@property (nonatomic, strong) UILabel *lab;
+@property (nonatomic, strong) UILabel *dayLab;         // 「2026年11月12日」（该天第一组才显示）
+@property (nonatomic, strong) UIView *dashLine;        // 日期右边的虚线
+@property (nonatomic, strong) JAGridClockView *clockView;
+@property (nonatomic, strong) UILabel *hourLab;        // 「22:00」
+- (void)configDayTitle:(NSString *)dayTitle hourTitle:(NSString *)hourTitle;
 @end
 
 @implementation JAGridHeader
 - (instancetype)initWithFrame:(CGRect)frame {
     self = [super initWithFrame:frame];
     if (self) {
-        _lab = [[UILabel alloc] initWithFrame:CGRectMake(16, 6, frame.size.width - 32, 26)];
-        _lab.font = [UIFont boldSystemFontOfSize:19];
-        _lab.textColor = [UIColor colorWithWhite:0.10 alpha:1.0];
-        _lab.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-        [self addSubview:_lab];
+        self.backgroundColor = [UIColor whiteColor];
+
+        _dayLab = [[UILabel alloc] initWithFrame:CGRectZero];
+        _dayLab.font = [UIFont boldSystemFontOfSize:20];
+        _dayLab.textColor = [UIColor colorWithWhite:0.10 alpha:1.0];
+        [self addSubview:_dayLab];
+
+        _dashLine = [[UIView alloc] initWithFrame:CGRectZero];
+        _dashLine.backgroundColor = [UIColor clearColor];
+        [self addSubview:_dashLine];
+
+        _clockView = [[JAGridClockView alloc] initWithFrame:CGRectZero];
+        [self addSubview:_clockView];
+
+        _hourLab = [[UILabel alloc] initWithFrame:CGRectZero];
+        _hourLab.font = [UIFont systemFontOfSize:16];
+        _hourLab.textColor = [UIColor colorWithRed:0.13 green:0.55 blue:0.95 alpha:1.0];
+        [self addSubview:_hourLab];
     }
     return self;
+}
+- (void)configDayTitle:(NSString *)dayTitle hourTitle:(NSString *)hourTitle {
+    BOOL hasDay = dayTitle.length > 0;
+    self.dayLab.text = hasDay ? dayTitle : nil;
+    self.dayLab.hidden = !hasDay;
+    self.dashLine.hidden = !hasDay;
+    self.hourLab.text = hourTitle;
+    [self setNeedsLayout];
+}
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    CGFloat w = self.bounds.size.width;
+    BOOL hasDay = !self.dayLab.hidden;
+    CGFloat y = 2;
+    if (hasDay) {
+        CGSize sz = [self.dayLab sizeThatFits:CGSizeMake(w - 70, 28)];
+        self.dayLab.frame = CGRectMake(16, y, sz.width, 28);
+        CGFloat dashX = 16 + sz.width + 12;
+        self.dashLine.frame = CGRectMake(dashX, y + 14, MAX(0, w - dashX - 16), 1);
+        [self refreshDash];
+        y += 34;
+    }
+    self.clockView.frame = CGRectMake(16, y + 3, 20, 20);
+    self.hourLab.frame = CGRectMake(42, y, MAX(0, w - 58), 26);
+}
+- (void)refreshDash {
+    self.dashLine.layer.sublayers = nil;
+    CGFloat len = self.dashLine.bounds.size.width;
+    if (len < 2) return;
+    CAShapeLayer *l = [CAShapeLayer layer];
+    l.strokeColor = [UIColor colorWithWhite:0.80 alpha:1.0].CGColor;
+    l.fillColor = nil;
+    l.lineWidth = 1.0;
+    l.lineDashPattern = @[@5, @5];
+    UIBezierPath *p = [UIBezierPath bezierPath];
+    [p moveToPoint:CGPointMake(0, 0.5)];
+    [p addLineToPoint:CGPointMake(len, 0.5)];
+    l.path = p.CGPath;
+    [self.dashLine.layer addSublayer:l];
 }
 @end
 
@@ -1116,8 +1229,9 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 
 @interface JAGridReplayViewController : UIViewController <UICollectionViewDataSource, UICollectionViewDelegateFlowLayout>
 @property (nonatomic, strong) id myCamera;
-@property (nonatomic, strong) NSMutableArray *days;    // @[@{@"day":NSNumber, @"items":NSArray}]
-@property (nonatomic, strong) NSMutableArray *flat;    // @[@{@"ev":id, @"sec":NSNumber, @"day":NSNumber}]
+@property (nonatomic, strong) NSMutableArray *days;    // 按天原始数据 @[@{@"day":NSNumber, @"items":NSArray}]（新→旧）
+@property (nonatomic, strong) NSMutableArray *secs;    // v2.7：展示用「小时组」，见 rebuildLayout
+@property (nonatomic, strong) NSMutableArray *flat;    // 与 secs 顺序完全一致，连播/翻页索引用
 @property (nonatomic, strong) UICollectionView *cv;
 @property (nonatomic, strong) UILabel *hintLab;
 @property (nonatomic, strong) UIBarButtonItem *autoItem;
@@ -1138,6 +1252,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     self.view.backgroundColor = [UIColor whiteColor];
     self.title = @"回放";
     self.days = [NSMutableArray array];
+    self.secs = [NSMutableArray array];
     self.flat = [NSMutableArray array];
     self.retained = [NSMutableArray array];
     self.autoNext = YES;
@@ -1180,13 +1295,22 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 
 - (void)viewDidLayoutSubviews {
     [super viewDidLayoutSubviews];
-    self.cv.frame = self.view.bounds;
-    CGFloat usable = self.view.bounds.size.width - 32 - 18;
+    // v2.7：内容避开安全区 —— 否则最上面的日期分组会被顶部「回放 / 连播」那条导航栏压住
+    UIEdgeInsets si = UIEdgeInsetsZero;
+    if (@available(iOS 11.0, *)) si = self.view.safeAreaInsets;
+    CGRect r = UIEdgeInsetsInsetRect(self.view.bounds, si);
+    self.cv.frame = r;
+    CGFloat usable = r.size.width - 32 - 18;
     CGFloat itemW = floor(usable / 3.0);
     UICollectionViewFlowLayout *lay = (UICollectionViewFlowLayout *)self.cv.collectionViewLayout;
     lay.itemSize = CGSizeMake(itemW, itemW * 152.0 / 236.0 + 24);
-    self.hintLab.frame = CGRectMake(20, (self.view.bounds.size.height - 64) / 2.0,
-                                    self.view.bounds.size.width - 40, 64);
+    self.hintLab.frame = CGRectMake(20, r.origin.y + (r.size.height - 64) / 2.0,
+                                    r.size.width - 40, 64);
+}
+
+- (void)viewSafeAreaInsetsDidChange {
+    [super viewSafeAreaInsetsDidChange];
+    [self.view setNeedsLayout];
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -1244,25 +1368,36 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     @try { JAGridCallOneArg(dvc, @"loadRecordListWithSelectiontDay:", dayStart, @(dayStart), NO); }
     @catch (NSException *e) {}
 
-    [self gridTryFetch:dataVC attempt:0 completion:cb];
+    [self gridTryFetch:dataVC attempt:0 day:dayStart best:nil stable:0 completion:cb];
 }
 
-// 轮询 3 次（每次 3.2s）：官方列表是异步回来的，给足时间
-- (void)gridTryFetch:(id)dataVC attempt:(NSInteger)attempt completion:(void (^)(NSArray *events))cb {
+// v2.7：多次采样，取「该天有效条数最多」的那次，连续 2 次不再增长才收工。
+// 官方列表是异步/分段回来的，一拿到非空就返回会少条 —— 这正对应
+// 「翻过报警消息再回格子页就变多」的现象。
+- (void)gridTryFetch:(id)dataVC attempt:(NSInteger)attempt day:(long long)day
+                 best:(NSArray *)bestCand stable:(NSInteger)stable
+           completion:(void (^)(NSArray *events))cb {
     if (!dataVC) { if (cb) cb(nil); return; }
     __weak typeof(self) ws = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.2 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         __strong typeof(ws) s = ws;
         if (!s) return;
         NSArray *ev = JAGridFindEvents(dataVC);
-        if (ev.count > 0) { [s gridStopDataVC:dataVC]; if (cb) cb(ev); return; }
-        if (attempt + 1 < 3) {
-            [s gridTryFetch:dataVC attempt:attempt + 1 completion:cb];
+        NSInteger n = JAGridDayEventCount(ev, day);
+        NSInteger bn = JAGridDayEventCount(bestCand, day);
+        NSArray *cand = bestCand;
+        NSInteger st = stable;
+        if (n > bn) { cand = ev; st = 0; } else { st += 1; }
+        NSInteger cn = JAGridDayEventCount(cand, day);
+        BOOL settled = (cn > 0 && st >= 2);
+        NSInteger limit = (cn > 0) ? 5 : 3;      // 已经拿到数据就多采两次；一直空就别耗着
+        if (settled || attempt + 1 >= limit) {
+            [s gridStopDataVC:dataVC];
+            if (cb) cb(cn > 0 ? cand : nil);
             return;
         }
-        [s gridStopDataVC:dataVC];
-        if (cb) cb(nil);
+        [s gridTryFetch:dataVC attempt:attempt + 1 day:day best:cand stable:st completion:cb];
     });
 }
 
@@ -1319,44 +1454,113 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 
 - (void)appendDay:(long long)day events:(NSArray *)events {
     NSMutableArray *items = [NSMutableArray array];
+    NSMutableSet *seenSec = [NSMutableSet set];
     for (id ev in events) {
         NSNumber *ts = JAGridTimestamp(ev);
         if (!ts) continue;
         long long sec = ts.longLongValue;
-        if (sec < 1000000000LL || sec > 10000000000LL) continue;   // 只要 10 位秒
-        [items addObject:@{@"ev": ev, @"sec": ts, @"day": @(day)}];
+        if (sec < 1000000000LL || sec >= 10000000000LL) continue;   // 只要 10 位秒
+        // v2.7：只收「落在这一天内」的事件。借用官方对象取数时，上层可能还是上一天
+        // 的旧列表（或两天混在一起），不按天过滤就会出现「12 号显示 13 号的内容」
+        // 以及大量重复条目。
+        if (sec < day || sec >= day + 86400LL) continue;
+        if ([seenSec containsObject:@(sec)]) continue;              // 同一天内按秒去重
+        [seenSec addObject:@(sec)];
+        [items addObject:@{@"ev": ev, @"sec": @(sec), @"day": @(day)}];
     }
     if (items.count == 0) return;
-    // v2.6：格子顺序改为「最新在最上」—— 官方返回的是升序（最早在前），这里统一降序
+    // v2.6：格子顺序「最新在最上」（官方返回是升序）
     [items sortUsingComparator:^NSComparisonResult(id a, id b) {
         long long sa = [(NSNumber *)[(NSDictionary *)a objectForKey:@"sec"] longLongValue];
         long long sb = [(NSNumber *)[(NSDictionary *)b objectForKey:@"sec"] longLongValue];
         if (sa == sb) return NSOrderedSame;
         return sa > sb ? NSOrderedAscending : NSOrderedDescending;
     }];
-    [self.days addObject:@{@"day": @(day), @"items": items}];
-    [self.flat addObjectsFromArray:items];
+    // v2.7：同一天已经加过就整体替换（防同一天出现两个分组）
+    BOOL replaced = NO;
+    for (NSUInteger i = 0; i < self.days.count; i++) {
+        NSDictionary *old = (NSDictionary *)self.days[i];
+        long long oldDay = [(NSNumber *)old[@"day"] longLongValue];
+        if (oldDay == day) {
+            self.days[i] = @{@"day": @(day), @"items": items};
+            replaced = YES;
+            break;
+        }
+    }
+    if (!replaced) [self.days addObject:@{@"day": @(day), @"items": items}];
+    [self rebuildLayout];
+}
+
+// v2.7：把「按天」的数据拍平成「天 → 小时」的展示分组（天新→旧、小时晚→早），
+// 同时按展示顺序重建 flat，保证连播 / scrollToItem / 点击定位三者顺序一致。
+- (void)rebuildLayout {
+    [self.days sortUsingComparator:^NSComparisonResult(id a, id b) {
+        long long da = [(NSNumber *)[(NSDictionary *)a objectForKey:@"day"] longLongValue];
+        long long db = [(NSNumber *)[(NSDictionary *)b objectForKey:@"day"] longLongValue];
+        if (da == db) return NSOrderedSame;
+        return da > db ? NSOrderedAscending : NSOrderedDescending;
+    }];
+
+    NSMutableArray *secs = [NSMutableArray array];
+    NSMutableArray *flat = [NSMutableArray array];
+    for (NSUInteger di = 0; di < self.days.count; di++) {
+        NSDictionary *dayDict = (NSDictionary *)self.days[di];
+        long long day = [(NSNumber *)dayDict[@"day"] longLongValue];
+        NSArray *items = (NSArray *)dayDict[@"items"];
+        NSMutableDictionary *byHour = [NSMutableDictionary dictionary];
+        for (NSDictionary *e in items) {
+            long long sec = [(NSNumber *)e[@"sec"] longLongValue];
+            NSInteger hour = (NSInteger)(((sec + 28800LL) % 86400LL) / 3600LL);   // 北京时区小时
+            NSMutableArray *bucket = (NSMutableArray *)byHour[@(hour)];
+            if (!bucket) {
+                bucket = [NSMutableArray array];
+                byHour[@(hour)] = bucket;
+            }
+            [bucket addObject:e];
+        }
+        NSArray *hours = [[byHour allKeys] sortedArrayUsingComparator:^NSComparisonResult(id a, id b) {
+            return [(NSNumber *)b compare:(NSNumber *)a];      // 小时从晚到早
+        }];
+        BOOL firstHourOfDay = YES;
+        for (NSNumber *h in hours) {
+            NSMutableArray *bucket = (NSMutableArray *)byHour[h];
+            [bucket sortUsingComparator:^NSComparisonResult(id a, id b) {
+                long long sa = [(NSNumber *)[(NSDictionary *)a objectForKey:@"sec"] longLongValue];
+                long long sb = [(NSNumber *)[(NSDictionary *)b objectForKey:@"sec"] longLongValue];
+                if (sa == sb) return NSOrderedSame;
+                return sa > sb ? NSOrderedAscending : NSOrderedDescending;
+            }];
+            NSString *dayTitle = firstHourOfDay ? JAGridDayText(day) : @"";
+            NSString *hourTitle = [NSString stringWithFormat:@"%02ld:00", (long)h.integerValue];
+            [secs addObject:@{@"day": @(day), @"hour": h, @"dayTitle": dayTitle,
+                              @"hourTitle": hourTitle, @"items": bucket}];
+            [flat addObjectsFromArray:bucket];
+            firstHourOfDay = NO;
+        }
+    }
+    self.secs = secs;
+    self.flat = flat;
     [self.cv reloadData];
 }
 
 // ---------- 集合视图 ----------
 
 - (NSInteger)numberOfSectionsInCollectionView:(UICollectionView *)collectionView {
-    return (NSInteger)self.days.count;
+    return (NSInteger)self.secs.count;
 }
 
 - (NSInteger)collectionView:(UICollectionView *)collectionView numberOfItemsInSection:(NSInteger)section {
-    if (section < 0 || section >= (NSInteger)self.days.count) return 0;
-    NSDictionary *d = self.days[section];
-    NSArray *items = d[@"items"];
+    if (section < 0 || section >= (NSInteger)self.secs.count) return 0;
+    NSDictionary *d = (NSDictionary *)self.secs[section];
+    NSArray *items = (NSArray *)d[@"items"];
     return (NSInteger)items.count;
 }
 
 - (UICollectionViewCell *)collectionView:(UICollectionView *)collectionView cellForItemAtIndexPath:(NSIndexPath *)ip {
     JAGridCell *c = [collectionView dequeueReusableCellWithReuseIdentifier:@"cell" forIndexPath:ip];
-    if (ip.section < (NSInteger)self.days.count) {
-        NSDictionary *dayDict = (NSDictionary *)self.days[ip.section];
-        NSArray *items = (NSArray *)dayDict[@"items"];
+    if (ip.section < (NSInteger)self.secs.count) {
+        NSDictionary *secDict = (NSDictionary *)self.secs[ip.section];
+        NSArray *items = (NSArray *)secDict[@"items"];
         if (ip.item < (NSInteger)items.count) {
             NSDictionary *e = (NSDictionary *)items[ip.item];
             NSNumber *sec = (NSNumber *)e[@"sec"];
@@ -1373,12 +1577,22 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     JAGridHeader *h = [collectionView dequeueReusableSupplementaryViewOfKind:kind
                                                           withReuseIdentifier:@"head"
                                                                  forIndexPath:ip];
-    if (ip.section < (NSInteger)self.days.count) {
-        NSDictionary *dayDict = (NSDictionary *)self.days[ip.section];
-        NSNumber *day = (NSNumber *)dayDict[@"day"];
-        h.lab.text = JAGridDayText(day.longLongValue);
+    if (ip.section < (NSInteger)self.secs.count) {
+        NSDictionary *secDict = (NSDictionary *)self.secs[ip.section];
+        [h configDayTitle:(NSString *)secDict[@"dayTitle"]
+                 hourTitle:(NSString *)secDict[@"hourTitle"]];
     }
     return h;
+}
+
+// v2.7：分组头高度 —— 有新的一天大标题就高一些（日期行 + 小时行），否则只有小时行
+- (CGSize)collectionView:(UICollectionView *)collectionView
+                    layout:(UICollectionViewLayout *)collectionViewLayout
+    referenceSizeForHeaderInSection:(NSInteger)section {
+    if (section < 0 || section >= (NSInteger)self.secs.count) return CGSizeZero;
+    NSDictionary *secDict = (NSDictionary *)self.secs[section];
+    BOOL hasDay = [(NSString *)secDict[@"dayTitle"] length] > 0;
+    return CGSizeMake(self.cv.bounds.size.width, hasDay ? 78 : 42);
 }
 
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
@@ -1393,9 +1607,9 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 
 - (void)collectionView:(UICollectionView *)collectionView didSelectItemAtIndexPath:(NSIndexPath *)ip {
     [collectionView deselectItemAtIndexPath:ip animated:NO];
-    if (ip.section >= (NSInteger)self.days.count) return;
-    NSDictionary *dayDict = (NSDictionary *)self.days[ip.section];
-    NSArray *items = (NSArray *)dayDict[@"items"];
+    if (ip.section >= (NSInteger)self.secs.count) return;
+    NSDictionary *secDict = (NSDictionary *)self.secs[ip.section];
+    NSArray *items = (NSArray *)secDict[@"items"];
     if (ip.item >= (NSInteger)items.count) return;
     NSDictionary *entry = (NSDictionary *)items[ip.item];
     NSInteger gi = [self flatIndexOfEntry:entry];
@@ -1415,9 +1629,9 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 
 - (NSIndexPath *)indexPathForFlat:(NSInteger)index {
     NSInteger left = index;
-    for (NSInteger s = 0; s < (NSInteger)self.days.count; s++) {
-        NSDictionary *dayDict = (NSDictionary *)self.days[s];
-        NSArray *items = (NSArray *)dayDict[@"items"];
+    for (NSInteger s = 0; s < (NSInteger)self.secs.count; s++) {
+        NSDictionary *secDict = (NSDictionary *)self.secs[s];
+        NSArray *items = (NSArray *)secDict[@"items"];
         if (left < (NSInteger)items.count) return [NSIndexPath indexPathForItem:left inSection:s];
         left -= (NSInteger)items.count;
     }
