@@ -33,16 +33,22 @@
 //   把 myCamera.sdSelectiontDay 设成某天 0 点 → 官方 viewModel 拉该日事件 →
 //   运行时在 VC/ivm 里找「事件数组」（JAGridFindEvents），取 event_file_url 当封面
 //   + 文件名内嵌秒当时间（复用 JABuildTimestamp）。找不到列表时把结构打到屏幕上供截图诊断。
-// v2.4（开通/关闭过云存储的设备定位兜底）：
-//   现象：某台开通云存储（后续关闭云功能、SD 可正常回放）的设备，点「看录像」后
-//   弹「当前时间无录像」，时间轴固定停在 16:23:33，画面为实时流；其它设备正常。
-//   已确认进入的就是本地 SD 回放页（有时间轴；云回放页是按天格子列表，界面不同），
-//   说明按钮 hook 生效，问题出在「精确定位」环节：报警秒在该设备当日 SD 事件列表里
-//   对不上（设备时钟偏差 / 列表只返回部分段）→ 官方定位失败 → 回退最新段/实时。
-//   本版：定位前先用运行时反射读该 VC 的当日事件列表（JAGridFindEvents），取与报警秒
-//   最接近的一段；差值 > 60s 改用该段起点定位，时间轴同步也按实际定位秒拨。
-//   同时写诊断日志 Documents/jasdreplay2.log（进入/定位/时间轴/返回四个节点），
-//   用来确认事件列表条数、时间范围与偏差；确认后可整段删除。
+// v2.4（云存储设备定位排查，日志版）：
+//   现象：某台开通云存储（后续关闭、SD 可正常回放）的设备，点「看录像」后弹
+//   「当前时间无录像」，时间轴固定停在 16:23:33，画面为实时流；其它设备正常。
+//   已确认进入的是本地 SD 回放页（有时间轴；云回放页是按天格子列表，界面不同），
+//   按钮 hook 生效。本版加诊断日志 Documents/jasdreplay2.log（进入/定位/时间轴/返回）。
+// v2.5（定案：报警时间解析错误）：
+//   日志实测 warn ts=1326615813 → 2012-01-15 16:23:33，正是用户看到的"固定
+//   16:23:33"；而 eid 里嵌着真实时间 ...2026111323:06:09...（=2026-11-13 23:06:09）。
+//   根因：该设备（云存储报警模型）字段结构与其它设备不同，旧解析链把非时间字段
+//   当成了秒 → 去查 2012-01-15 的 SD 录像（events=0）→ 官方定位失败 → 弹「当前
+//   时间无录像」→ 退回实时流；拖动任何时间点都同样失败，所以恒定停在 16:23:33。
+//   修复：① 所有候选秒过合理性闸（早于 2018-01-01 / 晚于当前 +2 天一律丢弃）；
+//   ② 时间字段扩到 eventTime/alarmTime/createTime/pushTime 等并加毫秒归一；
+//         ③ 兜底用 eid 内嵌 yyyyMMddHH:mm:ss 解析；④ 定位仍用报警秒原值
+//   （撤掉 v2.4"取最近段起点替换"的尝试：报警常落在段中间，替换会挪错画面）；
+//   ⑤ events=0（该日列表还没拉回来）时 2s 后补定位一次。日志先留着便于复核。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -212,50 +218,133 @@ static id JAFindCamera(UIViewController *detailVC, id warn, NSString **src) {
 
 // ---------- 时间戳 ----------
 
+// v2.5：秒值合理性校验。某台开通过云存储的设备，报警模型字段与其它设备不同，
+// 旧解析链把非时间字段当成了秒 → 得到 2012-01-15 16:23:33（正是用户实测
+// 「时间轴固定停在 16:23:33」的来源），于是去查 2012 年的 SD 录像（必然 events=0）
+// → 官方定位失败 → 弹「当前时间无录像」→ 退回实时流。
+// 现在任何候选秒都要过这道闸：不合理就丢弃，继续找下一个候选。
+static BOOL JASecSane(long long v) {
+    if (v <= 0) return NO;
+    if (v > 1000000000000LL) v /= 1000;      // 毫秒 → 秒
+    if (v < 1514764800LL) return NO;         // 早于 2018-01-01 → 可疑
+    long long now = (long long)[[NSDate date] timeIntervalSince1970];
+    if (v > now + 2 * 86400LL) return NO;    // 晚于当前 2 天 → 可疑
+    return YES;
+}
+
+// 数值 / 字符串 / "2026-11-13 23:06:09" 形式统一转秒，不合理返回 nil
+static NSNumber *JASecFromValue(id v) {
+    if (!v) return nil;
+    if ([v isKindOfClass:NSNumber.class]) {
+        long long n = [(NSNumber *)v longLongValue];
+        if (n > 1000000000000LL) n /= 1000;
+        return JASecSane(n) ? @(n) : nil;
+    }
+    if (![v isKindOfClass:NSString.class]) return nil;
+    NSString *s = (NSString *)v;
+    if (!s.length) return nil;
+    long long n = s.longLongValue;
+    if (n > 1000000000000LL) n /= 1000;
+    if (JASecSane(n)) return @(n);
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    fmt.timeZone = [NSTimeZone localTimeZone];
+    for (NSString *pat in @[@"yyyy-MM-dd HH:mm:ss", @"yyyy/MM/dd HH:mm:ss",
+                            @"yyyy-MM-dd'T'HH:mm:ss", @"yyyy-MM-dd HH:mm"]) {
+        fmt.dateFormat = pat;
+        NSDate *d = [fmt dateFromString:s];
+        if (!d) continue;
+        long long t = (long long)[d timeIntervalSince1970];
+        if (JASecSane(t)) return @(t);
+    }
+    return nil;
+}
+
+// v2.5：eid 内嵌时间兜底。实测云存储设备的 eid 形如
+//   f7054dad63177d78e8ee4ddb17b6941e2026111323:06:094f867671
+// （服务器生成，含 yyyyMMddHH:mm:ss），而它的 eventTimeUTC 给的是不可用值。
+// 这是这台设备唯一能拿到的权威时间，放在解析链最后兜底。
+static NSNumber *JASecFromEID(id warn) {
+    id e = JAVal(warn, @"eid");
+    if (![e isKindOfClass:NSString.class]) e = JAVal(warn, @"eventId");
+    if (![e isKindOfClass:NSString.class]) return nil;
+    NSString *s = (NSString *)e;
+    if (s.length < 14) return nil;
+    NSArray *pats = @[@"(20\\d{2})(\\d{2})(\\d{2})(\\d{2}):(\\d{2}):(\\d{2})",
+                      @"(20\\d{2})-(\\d{2})-(\\d{2})\\s+(\\d{2}):(\\d{2}):(\\d{2})",
+                      @"(20\\d{2})(\\d{2})(\\d{2})(\\d{2})(\\d{2})(\\d{2})"];
+    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+    fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    fmt.timeZone = [NSTimeZone localTimeZone];
+    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+    for (NSString *p in pats) {
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:p
+                                                                            options:0 error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:s options:0 range:NSMakeRange(0, s.length)];
+        if (!m || m.numberOfRanges < 7) continue;
+        NSString *built = [NSString stringWithFormat:@"%@-%@-%@ %@:%@:%@",
+                           [s substringWithRange:[m rangeAtIndex:1]],
+                           [s substringWithRange:[m rangeAtIndex:2]],
+                           [s substringWithRange:[m rangeAtIndex:3]],
+                           [s substringWithRange:[m rangeAtIndex:4]],
+                           [s substringWithRange:[m rangeAtIndex:5]],
+                           [s substringWithRange:[m rangeAtIndex:6]]];
+        NSDate *d = [fmt dateFromString:built];
+        if (!d) continue;
+        long long t = (long long)[d timeIntervalSince1970];
+        if (JASecSane(t)) return @(t);
+    }
+    return nil;
+}
+
 // 报警事件时间戳：秒（NSNumber）
-// 优先级：① event_file_url 文件名内嵌秒（服务器权威，如 -1792304458.jpg）
-//         ② eventTimeUTC（字符串直接取秒，NSNumber 原样）
-//         ③ event_date + event_time 拼本地秒
+// v2.5 链路（每一项都过 JASecSane，不合理继续下一项）：
+//  ① event_file_url 文件名内嵌 10 位秒（服务器权威，如 -1792304458.jpg）
+//  ② eventTimeUTC / eventTime / alarmTime / createTime / eventCreateTime / pushTime / time
+//  ③ event_date + event_time 拼本地秒
+//  ④ eid 内嵌 yyyyMMddHH:mm:ss（云存储设备兜底）
+// 报警事件时间戳：秒（NSNumber）
 static NSNumber *JABuildTimestamp(id warn) {
+    if (!warn) return nil;
     // ① event_file_url 文件名内嵌秒：xxx/2310111541-1792304458.jpg
     id url = JAVal(warn, @"event_file_url");
     if ([url isKindOfClass:NSString.class]) {
-        NSString *u = url;
+        NSString *u = (NSString *)url;
         NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"-(\\d{10})\\."
                                                                             options:0 error:nil];
         NSTextCheckingResult *m = [re firstMatchInString:u options:0
                                                    range:NSMakeRange(0, u.length)];
         if (m && m.numberOfRanges > 1) {
-            NSString *sec = [u substringWithRange:[m rangeAtIndex:1]];
-            return @(sec.longLongValue);
+            long long v = [u substringWithRange:[m rangeAtIndex:1]].longLongValue;
+            if (JASecSane(v)) return @(v);
         }
     }
-    // ② eventTimeUTC
-    id t = JAVal(warn, @"eventTimeUTC");
-    if (t) {
-        if ([t isKindOfClass:NSNumber.class]) {
-            return t; // 原样（秒）
-        }
-        if ([t isKindOfClass:NSString.class]) {
-            return @((long long)[t doubleValue]); // 秒字符串（不再 ×1000）
-        }
-        return nil;
+    // ② 明确的时间字段（按可信度排序，逐个校验）
+    for (NSString *k in @[@"eventTimeUTC", @"eventTime", @"alarmTime", @"eventCreateTime",
+                          @"createTime", @"pushTime", @"time", @"timestamp"]) {
+        NSNumber *n = JASecFromValue(JAVal(warn, k));
+        if (n) return n;
     }
-    // ③ event_date + event_time 拼秒（本地时区）
-    NSString *d = JAVal(warn, @"event_date");
-    NSString *tm = JAVal(warn, @"event_time");
-    if (d.length && tm.length) {
-        NSString *s = [NSString stringWithFormat:@"%@ %@", d, tm];
+    // ③ event_date + event_time 拼秒（本地时区；兼容 "HH:mm" 缺秒）
+    id d = JAVal(warn, @"event_date");
+    id tm = JAVal(warn, @"event_time");
+    if ([d isKindOfClass:NSString.class] && [tm isKindOfClass:NSString.class] &&
+        [(NSString *)d length] >= 8 && [(NSString *)tm length] >= 5) {
+        NSString *ts = (NSString *)tm;
+        if (ts.length == 5) ts = [ts stringByAppendingString:@":00"];
+        NSString *s = [NSString stringWithFormat:@"%@ %@", d, ts];
         NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
         fmt.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
         fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
         fmt.timeZone = [NSTimeZone localTimeZone];
         NSDate *date = [fmt dateFromString:s];
         if (date) {
-            return @((long long)[date timeIntervalSince1970]);
+            long long t = (long long)[date timeIntervalSince1970];
+            if (JASecSane(t)) return @(t);
         }
     }
-    return nil;
+    // ④ eid 内嵌时间兜底
+    return JASecFromEID(warn);
 }
 
 // 从秒级时间戳算"报警日 0 点秒"（本地时区语义 = 北京时间 00:00）
@@ -396,9 +485,15 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
         // 校验秒范围：10 位秒级（1.0e9 ~ 9.9e9），防止再传毫秒
         long long tv = ts ? ts.longLongValue : 0;
         // v2.4 诊断：进入时把报警时间/设备标识记下来（云存储设备排查用）
-        JALog(@"open: warn ts=%lld(%@) eid=%@ uid=%@",
+        // v2.5：同时打印原始字段，用来确认走的是哪条解析链
+        JALog(@"open: ts=%lld(%@) raw[url=%@ utc=%@ date=%@ time=%@ eid=%@] uid=%@",
               tv, JATimeStr(tv),
-              [JAVal(warn, @"eid") description], [JAVal(cam, @"uid") description]);
+              [JAVal(warn, @"event_file_url") description],
+              [JAVal(warn, @"eventTimeUTC") description],
+              [JAVal(warn, @"event_date") description],
+              [JAVal(warn, @"event_time") description],
+              [JAVal(warn, @"eid") description],
+              [JAVal(cam, @"uid") description]);
         // 记录报警时间戳（秒），RTC viewDidAppear 后自动 startSDPlayWithSelectTimeStamp:
         if (tv >= 1000000000LL && tv < 10000000000LL) g_rtcTargetSec = tv;
         // 预设设备 SD 选中日期 = 报警日 0 点秒 —— RTC setupData（0x100af6104）会
@@ -488,38 +583,57 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-            // v2.4：定位前先读该设备「当天 SD 录像段」列表。
-            // 开通（后又关闭）过云存储的设备常见两种情况：① 设备时钟与手机/服务器
-            // 时间不一致 → 报警秒落在所有录像段之外；② 该日事件列表只返回部分段。
-            // 官方 startSDPlayWithSelectTimeStamp: 找不到该时间点 → 弹「当前时间无
-            // 录像」并回退到最新段/实时（实测固定停在设备端的"现在"或最后一段）。
-            // 修复：取事件列表里与报警秒最接近的一段，差值 > 60s 就改用该段起点定位。
+            // v2.4：定位前先读该设备「当天 SD 录像段」列表，只做日志用。
+            // v2.5 修正：不再用"最近一段"替换报警秒 —— 报警秒通常落在某一段的
+            // 中间（段长几十分钟），按"起点最近"替换会把画面挪到段起点，反而破坏
+            // 正常设备。真正的根因是时间戳解析错误（已在 JABuildTimestamp 修好）。
             NSInteger evCount = 0;
             long long evFirst = 0, evLast = 0;
             long long nearSec = JAPickNearestEventSec(self, sec, &evCount, &evFirst, &evLast);
-            long long useSec = sec;
-            if (nearSec > 0) {
-                long long diff = nearSec > sec ? (nearSec - sec) : (sec - nearSec);
-                if (diff > 60) useSec = nearSec;
-                JALog(@"locate: alarm=%lld(%@) events=%ld range=[%@ ~ %@] nearest=%lld(%@) diff=%lld -> use=%lld(%@)",
-                      sec, JATimeStr(sec), (long)evCount, JATimeStr(evFirst), JATimeStr(evLast),
-                      nearSec, JATimeStr(nearSec), diff, useSec, JATimeStr(useSec));
-            } else {
-                JALog(@"locate: alarm=%lld(%@) events=%ld range=[%@ ~ %@] -> use=alarm (no event ts)",
-                      sec, JATimeStr(sec), (long)evCount, JATimeStr(evFirst), JATimeStr(evLast));
-            }
+            (void)nearSec;
+            JALog(@"locate: alarm=%lld(%@) events=%ld range=[%@ ~ %@]",
+                  sec, JATimeStr(sec), (long)evCount, JATimeStr(evFirst), JATimeStr(evLast));
             SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
             if ([self respondsToSelector:s]) {
-                ((void(*)(id, SEL, long long))objc_msgSend)(self, s, useSec);
-                JALog(@"locate: startSDPlayWithSelectTimeStamp(%lld) sent", useSec);
+                ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
+                JALog(@"locate: startSDPlayWithSelectTimeStamp(%lld) sent", sec);
             }
-            // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到定位时间点
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                JATimeLineSyncToSec(self, useSec);
-                JALog(@"locate: timeline sync -> %lld(%@)", useSec, JATimeStr(useSec));
-            });
+            if (evCount > 0) {
+                // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到定位时间点
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                    JATimeLineSyncToSec(self, sec);
+                    JALog(@"locate: timeline sync -> %lld(%@)", sec, JATimeStr(sec));
+                });
+            } else {
+                // v2.5：列表为空（多为该日事件还在网络拉取，2.5s 没到）→ 2s 后补一次定位。
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                    NSInteger c2 = 0;
+                    long long f2 = 0, l2 = 0;
+                    JAPickNearestEventSec(self, sec, &c2, &f2, &l2);
+                    JALog(@"locate: retry(day=%lld) events=%ld range=[%@ ~ %@]",
+                          dayStart, (long)c2, JATimeStr(f2), JATimeStr(l2));
+                    if (c2 > 0) {
+                        SEL s2 = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
+                        if ([self respondsToSelector:s2]) {
+                            ((void(*)(id, SEL, long long))objc_msgSend)(self, s2, sec);
+                        }
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                     (int64_t)(1.5 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{
+                            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                            JATimeLineSyncToSec(self, sec);
+                            JALog(@"locate: timeline sync(retry) -> %lld(%@)", sec, JATimeStr(sec));
+                        });
+                    } else {
+                        JATimeLineSyncToSec(self, sec);
+                        JALog(@"locate: retry still events=0 -> timeline sync only");
+                    }
+                });
+            }
         });
     });
 }
