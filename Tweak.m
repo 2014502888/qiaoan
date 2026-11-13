@@ -1879,9 +1879,22 @@ static void JAHook(void) {
     JAGridStartWatcher();
 }
 
+// v2.6：清掉历史版本在沙盒 Documents 里留下的诊断日志（幂等，删不到就算了）
+static void JAPurgeOldLogs(void) {
+    NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                         NSUserDomainMask, YES) firstObject];
+    if (!doc.length) return;
+    NSFileManager *fm = [NSFileManager defaultManager];
+    for (NSString *n in @[@"jasdreplay.log", @"jasdreplay2.log"]) {
+        NSString *p = [doc stringByAppendingPathComponent:n];
+        if ([fm fileExistsAtPath:p]) [fm removeItemAtPath:p error:nil];
+    }
+}
+
 // 类可能还没加载：等 App 启动完成后再尝试，最多 30 次，每次 0.5s
 __attribute__((constructor))
 static void JASDReplayInit(void) {
+    JAPurgeOldLogs();           // v2.6：先清旧诊断日志
     JAGridStartWatcher();       // v2.2：首页卡片入口不依赖上面这些类，先挂上
     if (NSClassFromString(@"JANewsWarnInfoDetailVC")
         && NSClassFromString(@"JANewRtcSDPlayViewController")) {
