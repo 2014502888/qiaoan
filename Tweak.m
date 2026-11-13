@@ -37,7 +37,7 @@
 //   现象：某台开通云存储（后续关闭、SD 可正常回放）的设备，点「看录像」后弹
 //   「当前时间无录像」，时间轴固定停在 16:23:33，画面为实时流；其它设备正常。
 //   已确认进入的是本地 SD 回放页（有时间轴；云回放页是按天格子列表，界面不同），
-//   按钮 hook 生效。本版加诊断日志 Documents/jasdreplay2.log（进入/定位/时间轴/返回）。
+//   按钮 hook 生效。本版曾加诊断日志 Documents/jasdreplay2.log（v2.6 已整段删除）。
 // v2.5（定案：报警时间解析错误）：
 //   日志实测 warn ts=1326615813 → 2012-01-15 16:23:33，正是用户看到的"固定
 //   16:23:33"；而 eid 里嵌着真实时间 ...2026111323:06:09...（=2026-11-13 23:06:09）。
@@ -48,7 +48,17 @@
 //   ② 时间字段扩到 eventTime/alarmTime/createTime/pushTime 等并加毫秒归一；
 //         ③ 兜底用 eid 内嵌 yyyyMMddHH:mm:ss 解析；④ 定位仍用报警秒原值
 //   （撤掉 v2.4"取最近段起点替换"的尝试：报警常落在段中间，替换会挪错画面）；
-//   ⑤ events=0（该日列表还没拉回来）时 2s 后补定位一次。日志先留着便于复核。
+//   ⑤ events=0（该日列表还没拉回来）时 2s 后补定位一次。
+// v2.6（格子回放体验修正 + 清理）：
+//   ① 入口按钮出现慢：watcher 首 tick 1.5s→0.2s，间隔 0.8s→0.3s；
+//   ② 「正在读取该日录像…」提示改居中（textAlignment 居中 + frame 落在页面正中）；
+//   ③ 格子顺序改「最新在最上」（appendDay 里按 sec 降序）；
+//   ④ 封面：JAGridImageURL 键名扩到常见封面/抓拍字段 + URL 归一；加磁盘缓存
+//      （Caches/JAGridCovers，重启后仍秒出图）；无封面显示浅灰底「无封面」占位；
+//   ⑤ 播放片段化：进官方播放页 1s 后隐藏 timeLineView（无拖动条），35s 自动回格子
+//      并连播下一格 —— 观感对齐云回放的「看一小段」；
+//   ⑥ 清理：删除 v2.3/v2.4 遗留的整套诊断（JALog/jasdreplay2.log、JAGridProbeText
+//      结构快照、自动复制剪贴板、「复制」按钮、黑框 TextView、lastProbe）。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -375,77 +385,17 @@ static void JATimeLineSyncToSec(id sdVC, long long sec);
 static NSArray *JAGridFindEvents(id vc);
 static NSNumber *JAGridTimestamp(id ev);
 
-// ---------- v2.4 诊断日志（临时，排查「开通过云存储的设备」定位失败） ----------
-// 写沙盒 Documents/jasdreplay2.log，只记关键节点，量很小；确认问题后可整段删除。
-static NSString *JALogPath(void) {
-    static NSString *p = nil;
-    if (!p) {
-        NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
-                                                             NSUserDomainMask, YES) firstObject];
-        p = [doc stringByAppendingPathComponent:@"jasdreplay2.log"];
-    }
-    return p;
-}
-
-static void JALog(NSString *fmt, ...) {
-    @autoreleasepool {
-        va_list ap;
-        va_start(ap, fmt);
-        NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
-        va_end(ap);
-        NSDateFormatter *df = [[NSDateFormatter alloc] init];
-        df.dateFormat = @"HH:mm:ss.SSS";
-        NSString *line = [NSString stringWithFormat:@"[%@] %@\n",
-                          [df stringFromDate:[NSDate date]], s];
-        NSString *path = JALogPath();
-        NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
-        if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
-            [d writeToFile:path atomically:YES];
-        } else {
-            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-            @try {
-                [fh seekToEndOfFile];
-                [fh writeData:d];
-            } @catch (NSException *e) {
-            } @finally {
-                [fh closeFile];
-            }
-        }
-    }
-}
-
-static NSString *JATimeStr(long long sec) {
-    if (sec < 1000000000LL || sec >= 10000000000LL) return @"-";
-    static NSDateFormatter *df = nil;
-    if (!df) {
-        df = [[NSDateFormatter alloc] init];
-        df.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-        df.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-    }
-    return [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)sec]];
-}
-
-// v2.4：读该 VC 当前的 SD 录像段列表，返回与目标秒最接近的一段起始秒。
-// 同时回传事件条数与时间范围（日志用）。事件条数 0 或列表读不到时返回 0。
-static long long JAPickNearestEventSec(id vc, long long target, NSInteger *countOut,
-                                       long long *firstOut, long long *lastOut) {
+// v2.6：统计该 VC 当前拿到的有效 SD 录像段条数（只用于判断列表是否已拉回来）
+static NSInteger JAGridValidEventCount(id vc) {
     NSArray *evs = JAGridFindEvents(vc);
-    if (countOut) *countOut = (NSInteger)evs.count;
-    long long best = 0, bestDiff = 0;
-    long long first = 0, last = 0;
+    NSInteger n = 0;
     for (id ev in evs) {
         NSNumber *t = JAGridTimestamp(ev);
         if (!t) continue;
         long long s = t.longLongValue;
-        if (s < 1000000000LL || s >= 10000000000LL) continue;
-        if (first == 0 || s < first) first = s;
-        if (s > last) last = s;
-        long long d = s > target ? (s - target) : (target - s);
-        if (best == 0 || d < bestDiff) { bestDiff = d; best = s; }
+        if (s >= 1000000000LL && s < 10000000000LL) n++;
     }
-    if (firstOut) *firstOut = first;
-    if (lastOut) *lastOut = last;
-    return best;
+    return n;
 }
 
 // v1.15：当前活跃 RTC SD 播放器指针（纯 C 比较守卫，不向对象发消息）
@@ -484,16 +434,6 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
         if (ts) JASet(vc, @"currentTimeStamp", ts);
         // 校验秒范围：10 位秒级（1.0e9 ~ 9.9e9），防止再传毫秒
         long long tv = ts ? ts.longLongValue : 0;
-        // v2.4 诊断：进入时把报警时间/设备标识记下来（云存储设备排查用）
-        // v2.5：同时打印原始字段，用来确认走的是哪条解析链
-        JALog(@"open: ts=%lld(%@) raw[url=%@ utc=%@ date=%@ time=%@ eid=%@] uid=%@",
-              tv, JATimeStr(tv),
-              [JAVal(warn, @"event_file_url") description],
-              [JAVal(warn, @"eventTimeUTC") description],
-              [JAVal(warn, @"event_date") description],
-              [JAVal(warn, @"event_time") description],
-              [JAVal(warn, @"eid") description],
-              [JAVal(cam, @"uid") description]);
         // 记录报警时间戳（秒），RTC viewDidAppear 后自动 startSDPlayWithSelectTimeStamp:
         if (tv >= 1000000000LL && tv < 10000000000LL) g_rtcTargetSec = tv;
         // 预设设备 SD 选中日期 = 报警日 0 点秒 —— RTC setupData（0x100af6104）会
@@ -546,7 +486,6 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     if (sec < 1000000000LL) return;
     // v1.20：世代去重 —— 官方可能多次触发 viewDidAppear，只保留最后一次生效
     unsigned long long myGen = ++g_rtcVdaGen;
-    JALog(@"vda: appear sec=%lld(%@) gen=%llu", sec, JATimeStr(sec), myGen);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
@@ -583,20 +522,13 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-            // v2.4：定位前先读该设备「当天 SD 录像段」列表，只做日志用。
-            // v2.5 修正：不再用"最近一段"替换报警秒 —— 报警秒通常落在某一段的
-            // 中间（段长几十分钟），按"起点最近"替换会把画面挪到段起点，反而破坏
-            // 正常设备。真正的根因是时间戳解析错误（已在 JABuildTimestamp 修好）。
-            NSInteger evCount = 0;
-            long long evFirst = 0, evLast = 0;
-            long long nearSec = JAPickNearestEventSec(self, sec, &evCount, &evFirst, &evLast);
-            (void)nearSec;
-            JALog(@"locate: alarm=%lld(%@) events=%ld range=[%@ ~ %@]",
-                  sec, JATimeStr(sec), (long)evCount, JATimeStr(evFirst), JATimeStr(evLast));
+            // v2.5 定案：定位一律用报警秒原值（不用"最近一段"替换 —— 报警常落在
+            // 某段中间，替换会把画面挪到段起点）。v2.6 只保留"列表是否已回来"的判断：
+            // 列表为空时 2s 后补一次定位，避免该日事件网络拉取稍慢导致定位失败。
+            NSInteger evCount = JAGridValidEventCount(self);
             SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
             if ([self respondsToSelector:s]) {
                 ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
-                JALog(@"locate: startSDPlayWithSelectTimeStamp(%lld) sent", sec);
             }
             if (evCount > 0) {
                 // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到定位时间点
@@ -604,18 +536,12 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
                                dispatch_get_main_queue(), ^{
                     if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
                     JATimeLineSyncToSec(self, sec);
-                    JALog(@"locate: timeline sync -> %lld(%@)", sec, JATimeStr(sec));
                 });
             } else {
-                // v2.5：列表为空（多为该日事件还在网络拉取，2.5s 没到）→ 2s 后补一次定位。
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
                     if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                    NSInteger c2 = 0;
-                    long long f2 = 0, l2 = 0;
-                    JAPickNearestEventSec(self, sec, &c2, &f2, &l2);
-                    JALog(@"locate: retry(day=%lld) events=%ld range=[%@ ~ %@]",
-                          dayStart, (long)c2, JATimeStr(f2), JATimeStr(l2));
+                    NSInteger c2 = JAGridValidEventCount(self);
                     if (c2 > 0) {
                         SEL s2 = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
                         if ([self respondsToSelector:s2]) {
@@ -626,11 +552,9 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
                                        dispatch_get_main_queue(), ^{
                             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
                             JATimeLineSyncToSec(self, sec);
-                            JALog(@"locate: timeline sync(retry) -> %lld(%@)", sec, JATimeStr(sec));
                         });
                     } else {
                         JATimeLineSyncToSec(self, sec);
-                        JALog(@"locate: retry still events=0 -> timeline sync only");
                     }
                 });
             }
@@ -732,7 +656,6 @@ static void ja_handleJumpToOpenCloud(id self, SEL _cmd) {
 static void ja_rtc_viewDidDisappear(id self, SEL _cmd) {
     if (g_orig_rtc_vdd) ((void(*)(id, SEL))g_orig_rtc_vdd)(self, _cmd);
     if (self != g_activeSDPlayer) return;
-    JALog(@"vdd: disappear -> stop sd play");
     g_activeSDPlayer = nil;  // 先清标记：后续 viewDidAppear/定位闭包不再执行
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -905,158 +828,31 @@ static NSArray *JAGridFindEvents(id vc) {
     return best;
 }
 
-// ---------- 诊断（找不到列表时给出一份结构快照，自动复制到剪贴板） ----------
-
-static NSString *JAGridIvarNames(id obj, int maxLevel, NSUInteger maxCount) {
-    if (!obj) return @"-";
-    NSMutableArray *ks = [NSMutableArray array];
-    Class cls = object_getClass(obj);
-    int level = 0;
-    while (cls && cls != [NSObject class] && level < maxLevel && ks.count < maxCount) {
-        unsigned int n = 0;
-        Ivar *iv = class_copyIvarList(cls, &n);
-        for (unsigned int i = 0; i < n && ks.count < maxCount; i++) {
-            const char *nm = ivar_getName(iv[i]);
-            if (!nm) continue;
-            NSString *s = [NSString stringWithUTF8String:nm];
-            if (s) [ks addObject:s];
-        }
-        if (iv) free(iv);
-        cls = class_getSuperclass(cls);
-        level++;
-    }
-    return [ks componentsJoinedByString:@","];
-}
-
-// 只列和「事件/列表/天」有关的 selector，用来确认官方真实的取数方法名
-static NSString *JAGridMethodNames(id obj) {
-    if (!obj) return @"-";
-    NSMutableArray *ms = [NSMutableArray array];
-    Class cls = object_getClass(obj);
-    int level = 0;
-    while (cls && cls != [NSObject class] && level < 3 && ms.count < 70) {
-        unsigned int n = 0;
-        Method *m = class_copyMethodList(cls, &n);
-        for (unsigned int i = 0; i < n && ms.count < 70; i++) {
-            NSString *sel = NSStringFromSelector(method_getName(m[i]));
-            NSString *low = sel.lowercaseString;
-            if ([low rangeOfString:@"event"].location != NSNotFound ||
-                [low rangeOfString:@"record"].location != NSNotFound ||
-                [low rangeOfString:@"sdd"].location != NSNotFound ||
-                [low rangeOfString:@"day"].location != NSNotFound ||
-                [low rangeOfString:@"list"].location != NSNotFound ||
-                [low rangeOfString:@"warn"].location != NSNotFound) {
-                [ms addObject:sel];
-            }
-        }
-        if (m) free(m);
-        cls = class_getSuperclass(cls);
-        level++;
-    }
-    return [ms componentsJoinedByString:@" "];
-}
-
-// 把所有「数组」列出来（条数:元素类名），看数据到底装在哪一层
-static void JAGridArrayWalk(id root, int depth, NSMutableSet *seen, NSMutableArray *out) {
-    if (!root || depth <= 0 || out.count >= 40) return;
-    if ([root isKindOfClass:NSArray.class]) {
-        NSArray *a = (NSArray *)root;
-        NSString *cn = a.count ? NSStringFromClass(object_getClass([a objectAtIndex:0])) : @"-";
-        [out addObject:[NSString stringWithFormat:@"%lu:%@", (unsigned long)a.count, cn]];
-        return;
-    }
-    if (JAGridIsPlainJunk(root)) return;
-    NSValue *k = [NSValue valueWithNonretainedObject:root];
-    if ([seen containsObject:k]) return;
-    [seen addObject:k];
-    Class cls = object_getClass(root);
-    int level = 0;
-    while (cls && cls != [NSObject class] && level < 3 && out.count < 40) {
-        unsigned int n = 0;
-        Ivar *ivars = class_copyIvarList(cls, &n);
-        for (unsigned int i = 0; i < n && out.count < 40; i++) {
-            const char *enc = ivars ? ivar_getTypeEncoding(ivars[i]) : NULL;
-            if (!enc || enc[0] != '@') continue;
-            id v = nil;
-            @try { v = object_getIvar(root, ivars[i]); } @catch (NSException *e) { v = nil; }
-            JAGridArrayWalk(v, depth - 1, seen, out);
-        }
-        if (ivars) free(ivars);
-        cls = class_getSuperclass(cls);
-        level++;
-    }
-}
-
-static NSString *JAGridArraysText(id root, int depth, NSMutableSet *seen, NSMutableArray *out) {
-    JAGridArrayWalk(root, depth, seen, out);
-    return out.count ? [out componentsJoinedByString:@" | "] : @"-";
-}
-
-static NSString *JAGridProbeText(id vc) {
-    NSMutableString *s = [NSMutableString string];
-    [s appendFormat:@"VC=%@\n", NSStringFromClass(object_getClass(vc))];
-    [s appendFormat:@"IVAR=%@\n", JAGridIvarNames(vc, 3, 30)];
-    [s appendFormat:@"SEL=%@\n", JAGridMethodNames(vc)];
-
-    // 直接看几个关键属性的值/条数（最有用：能立刻判断「列表有没有被拉回来」）
-    for (NSString *k in @[@"sdRecordFileArr", @"currentSelectedSDDay", @"currentSDDay",
-                         @"isLoadCacheEventList", @"isReLoadNormalEventList",
-                         @"currentEvent", @"todayMaxTimestamp"]) {
-        id v = JAVal(vc, k);
-        if (!v) continue;
-        if ([v isKindOfClass:NSArray.class]) {
-            NSArray *a = (NSArray *)v;
-            NSString *cn = a.count ? NSStringFromClass(object_getClass([a objectAtIndex:0])) : @"-";
-            [s appendFormat:@"KVC %@ count=%lu first=%@\n", k, (unsigned long)a.count, cn];
-            if (a.count) {
-                NSString *d = [[a objectAtIndex:0] description];
-                if (d.length > 200) d = [d substringToIndex:200];
-                [s appendFormat:@"   %@\n", d];
-            }
-        } else {
-            NSString *d = [v description];
-            if (d.length > 120) d = [d substringToIndex:120];
-            [s appendFormat:@"KVC %@ = %@\n", k, d];
-        }
-    }
-
-    NSMutableArray *cands = [NSMutableArray array];
-    NSMutableSet *seen = [NSMutableSet set];
-    JAGridCollect(vc, 4, seen, cands);
-    if (cands.count == 0) {
-        [s appendString:@"-- 全树没有候选数组 --\n"];
-    }
-    for (NSUInteger i = 0; i < cands.count && i < 8; i++) {
-        NSArray *pair = (NSArray *)cands[i];
-        NSArray *a = (NSArray *)pair[0];
-        int sc = [(NSNumber *)pair[1] intValue];
-        NSString *cn = a.count ? NSStringFromClass(object_getClass([a objectAtIndex:0])) : @"-";
-        [s appendFormat:@"#[%lu score=%d] %@\n", (unsigned long)a.count, sc, cn];
-        if (a.count) {
-            NSString *desc = [[a objectAtIndex:0] description];
-            if (desc.length > 240) desc = [desc substringToIndex:240];
-            [s appendFormat:@"  %@\n", desc];
-            [s appendFormat:@"  ivi=%@\n", JAGridIvarNames([a objectAtIndex:0], 2, 18)];
-        }
-    }
-
-    // 单独把「所有数组」列一遍（哪怕没到 3 分，也能看出到底哪层在装数据）
-    NSMutableArray *loose = [NSMutableArray array];
-    NSMutableSet *seen2 = [NSMutableSet set];
-    [s appendFormat:@"ARR=%@\n", JAGridArraysText(vc, 4, seen2, loose)];
-    return s;
-}
-
 // ---------- 事件字段读取 ----------
 
+// v2.6：封面地址归一化（补协议 / 丢弃无法解析的相对路径）
+static NSString *JAGridNormalizeURL(NSString *u) {
+    if (![u isKindOfClass:NSString.class]) return nil;
+    if (u.length < 9) return nil;
+    if ([u hasPrefix:@"http://"] || [u hasPrefix:@"https://"]) return u;
+    if ([u hasPrefix:@"//"]) return [@"https:" stringByAppendingString:u];
+    if ([u hasPrefix:@"file://"]) return u;
+    return nil;
+}
+
 static NSString *JAGridImageURL(id ev) {
+    // v2.6：键名扩到常见的封面/抓拍字段（不同设备的报警模型字段不一样）
     NSArray *keys = @[@"event_file_url", @"event_pic_url", @"event_pic", @"picUrl",
                       @"pic_url", @"event_img", @"imageUrl", @"snapUrl", @"eventImagePath",
                       @"recordFileUrl", @"record_file_url", @"fileUrl", @"file_url",
-                      @"coverUrl", @"thumbUrl", @"imgUrl", @"eventPicUrl"];
+                      @"coverUrl", @"thumbUrl", @"imgUrl", @"eventPicUrl",
+                      @"pic", @"cover", @"coverImg", @"coverPic", @"coverPicUrl",
+                      @"videoCoverUrl", @"eventCoverUrl", @"eventCover", @"snapshotUrl",
+                      @"snapPic", @"snapPicUrl", @"thumb", @"image", @"eventImage",
+                      @"eventImageUrl", @"img", @"picPath", @"imagePath", @"localCoverPath"];
     for (NSString *k in keys) {
-        id v = JAVal(ev, k);
-        if ([v isKindOfClass:NSString.class] && [(NSString *)v length] > 8) return (NSString *)v;
+        NSString *u = JAGridNormalizeURL(JAVal(ev, k));
+        if (u) return u;
     }
     return nil;
 }
@@ -1128,7 +924,23 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
     return YES;
 }
 
-// ---------- 图片缓存（内存 + 并发限流） ----------
+// ---------- 图片缓存（内存 + 磁盘 + 网络） ----------
+
+// v2.6：磁盘缓存路径（FNV-1a 对 URL 取哈希做文件名，避免再次进页面/重启后重新下载）
+static NSString *JAGridDiskPathForKey(NSString *key) {
+    if (!key.length) return nil;
+    uint32_t h = 2166136261u;
+    for (NSUInteger i = 0; i < key.length; i++) {
+        h ^= (uint32_t)[key characterAtIndex:i];
+        h *= 16777619u;
+    }
+    NSString *caches = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory,
+                                                            NSUserDomainMask, YES) firstObject];
+    NSString *dir = [caches stringByAppendingPathComponent:@"JAGridCovers"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dir
+                              withIntermediateDirectories:YES attributes:nil error:nil];
+    return [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%08x.img", h]];
+}
 
 @interface JAGridImageCache : NSObject
 @property (nonatomic, strong) NSCache *mem;
@@ -1154,11 +966,19 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
 }
 - (UIImage *)imageForKey:(NSString *)key {
     if (!key) return nil;
-    return [self.mem objectForKey:key];
+    UIImage *m = [self.mem objectForKey:key];
+    if (m) return m;
+    // v2.6：内存没有就查磁盘（这样重启 App 后格子也有封面）
+    NSString *dp = JAGridDiskPathForKey(key);
+    if (dp.length && [[NSFileManager defaultManager] fileExistsAtPath:dp]) {
+        UIImage *d = [UIImage imageWithContentsOfFile:dp];
+        if (d) { [self.mem setObject:d forKey:key]; return d; }
+    }
+    return nil;
 }
 - (void)loadURL:(NSString *)url completion:(void (^)(UIImage *, NSString *))cb {
     if (!url.length || ![url hasPrefix:@"http"]) { if (cb) cb(nil, url); return; }
-    UIImage *c = [self.mem objectForKey:url];
+    UIImage *c = [self imageForKey:url];
     if (c) { if (cb) cb(c, url); return; }
     NSURL *u = [NSURL URLWithString:url];
     if (!u) { if (cb) cb(nil, url); return; }
@@ -1166,7 +986,11 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
         dataTaskWithURL:u completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
             UIImage *img = nil;
             if (data) { @autoreleasepool { img = [UIImage imageWithData:data]; } }
-            if (img) [self.mem setObject:img forKey:url];
+            if (img) {
+                [self.mem setObject:img forKey:url];
+                NSString *dp = JAGridDiskPathForKey(url);
+                if (dp.length) [data writeToFile:dp atomically:YES];
+            }
             dispatch_async(dispatch_get_main_queue(), ^{ if (cb) cb(img, url); });
         }];
     [t resume];
@@ -1178,6 +1002,7 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
 @interface JAGridCell : UICollectionViewCell
 @property (nonatomic, strong) UIImageView *thumb;
 @property (nonatomic, strong) UILabel *timeLab;
+@property (nonatomic, strong) UILabel *noneLab;      // v2.6：没有封面时的占位文字
 @property (nonatomic, strong) UIView *playDot;
 @property (nonatomic, copy) NSString *imgURL;
 - (void)setImageURL:(NSString *)url;
@@ -1190,9 +1015,18 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
         _thumb = [[UIImageView alloc] initWithFrame:CGRectZero];
         _thumb.contentMode = UIViewContentModeScaleAspectFill;
         _thumb.clipsToBounds = YES;
-        _thumb.backgroundColor = [UIColor colorWithWhite:0.10 alpha:1.0];
+        // v2.6：无封面时用浅灰底 + "无封面"占位，不再是纯黑块
+        _thumb.backgroundColor = [UIColor colorWithWhite:0.94 alpha:1.0];
         _thumb.layer.cornerRadius = 8;
         [self.contentView addSubview:_thumb];
+
+        _noneLab = [[UILabel alloc] initWithFrame:CGRectZero];
+        _noneLab.text = @"无封面";
+        _noneLab.font = [UIFont systemFontOfSize:11];
+        _noneLab.textColor = [UIColor colorWithWhite:0.60 alpha:1.0];
+        _noneLab.textAlignment = NSTextAlignmentCenter;
+        _noneLab.hidden = YES;
+        [self.contentView addSubview:_noneLab];
 
         _playDot = [[UIView alloc] initWithFrame:CGRectZero];
         _playDot.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.45];
@@ -1220,6 +1054,7 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
     CGFloat h = self.contentView.bounds.size.height;
     CGFloat thumbH = w * 152.0 / 236.0;
     self.thumb.frame = CGRectMake(0, 0, w, thumbH);
+    self.noneLab.frame = CGRectMake(0, 0, w, thumbH);
     self.playDot.frame = CGRectMake(w - 24, thumbH - 24, 18, 18);
     self.timeLab.frame = CGRectMake(0, thumbH + 5, w, h - thumbH - 5);
 }
@@ -1227,20 +1062,32 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
     [super prepareForReuse];
     self.imgURL = nil;
     self.thumb.image = nil;
+    self.noneLab.hidden = YES;
     self.timeLab.text = nil;
 }
 - (void)setImageURL:(NSString *)url {
     self.imgURL = [url copy];
+    if (!url) {
+        self.thumb.image = nil;
+        self.noneLab.hidden = NO;
+        return;
+    }
     UIImage *cached = [[JAGridImageCache shared] imageForKey:url];
-    if (cached) { self.thumb.image = cached; return; }
+    if (cached) {
+        self.thumb.image = cached;
+        self.noneLab.hidden = YES;
+        return;
+    }
     self.thumb.image = nil;
-    if (!url) return;
+    self.noneLab.hidden = NO;          // 下载期间先显示占位，不留纯黑
     __weak typeof(self) ws = self;
     NSString *key = [url copy];
     [[JAGridImageCache shared] loadURL:url completion:^(UIImage *img, NSString *k) {
         __strong typeof(ws) s = ws;
         if (!s) return;
-        if (key && [s.imgURL isEqualToString:key]) s.thumb.image = img;
+        if (!key || ![s.imgURL isEqualToString:key]) return;
+        if (img) { s.thumb.image = img; s.noneLab.hidden = YES; }
+        else { s.noneLab.hidden = NO; }
     }];
 }
 @end
@@ -1273,7 +1120,6 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
 @property (nonatomic, strong) NSMutableArray *flat;    // @[@{@"ev":id, @"sec":NSNumber, @"day":NSNumber}]
 @property (nonatomic, strong) UICollectionView *cv;
 @property (nonatomic, strong) UILabel *hintLab;
-@property (nonatomic, strong) UITextView *diag;          // 诊断快照（可选可滚，自动复制）
 @property (nonatomic, strong) UIBarButtonItem *autoItem;
 @property (nonatomic, strong) NSMutableArray *retained; // 借用中的官方 dataVC（保活）
 @property (nonatomic, assign) long long nextDay;
@@ -1283,7 +1129,6 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
 @property (nonatomic, assign) BOOL gaveUp;
 @property (nonatomic, assign) NSInteger playIndex;
 @property (nonatomic, strong) id playingVC;
-@property (nonatomic, copy) NSString *lastProbe;
 @end
 
 @implementation JAGridReplayViewController
@@ -1304,11 +1149,7 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
                                                     style:UIBarButtonItemStylePlain
                                                    target:self
                                                    action:@selector(toggleAutoNext)];
-    UIBarButtonItem *copyItem = [[UIBarButtonItem alloc] initWithTitle:@"复制"
-                                                                style:UIBarButtonItemStylePlain
-                                                               target:self
-                                                               action:@selector(copyDiag)];
-    self.navigationItem.rightBarButtonItems = @[copyItem, self.autoItem];
+    self.navigationItem.rightBarButtonItems = @[self.autoItem];
 
     UICollectionViewFlowLayout *lay = [[UICollectionViewFlowLayout alloc] init];
     lay.minimumInteritemSpacing = 9;
@@ -1329,23 +1170,12 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
 
     self.hintLab = [[UILabel alloc] initWithFrame:CGRectZero];
     self.hintLab.numberOfLines = 0;
-    self.hintLab.font = [UIFont systemFontOfSize:12];
+    self.hintLab.font = [UIFont systemFontOfSize:15];
     self.hintLab.textColor = [UIColor colorWithWhite:0.45 alpha:1.0];
-    self.hintLab.textAlignment = NSTextAlignmentLeft;
+    // v2.6：提示文案居中（水平 + 垂直都在页面正中）
+    self.hintLab.textAlignment = NSTextAlignmentCenter;
     [self.view addSubview:self.hintLab];
     self.hintLab.hidden = YES;
-
-    self.diag = [[UITextView alloc] initWithFrame:CGRectZero];
-    self.diag.editable = NO;
-    self.diag.selectable = YES;
-    self.diag.backgroundColor = [UIColor colorWithWhite:0.10 alpha:0.94];
-    self.diag.textColor = [UIColor whiteColor];
-    UIFont *mono = [UIFont fontWithName:@"Menlo" size:10];
-    self.diag.font = mono ? mono : [UIFont systemFontOfSize:10];
-    self.diag.textContainerInset = UIEdgeInsetsMake(10, 10, 10, 10);
-    self.diag.layer.cornerRadius = 8;
-    self.diag.hidden = YES;
-    [self.view addSubview:self.diag];
 }
 
 - (void)viewDidLayoutSubviews {
@@ -1355,9 +1185,8 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
     CGFloat itemW = floor(usable / 3.0);
     UICollectionViewFlowLayout *lay = (UICollectionViewFlowLayout *)self.cv.collectionViewLayout;
     lay.itemSize = CGSizeMake(itemW, itemW * 152.0 / 236.0 + 24);
-    self.hintLab.frame = CGRectMake(20, 80, self.view.bounds.size.width - 40,
-                                   self.view.bounds.size.height - 160);
-    self.diag.frame = CGRectInset(self.view.bounds, 12, 12);
+    self.hintLab.frame = CGRectMake(20, (self.view.bounds.size.height - 64) / 2.0,
+                                    self.view.bounds.size.width - 40, 64);
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -1418,7 +1247,7 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
     [self gridTryFetch:dataVC attempt:0 completion:cb];
 }
 
-// 轮询 3 次（每次 3.2s）：官方列表是异步回来的，给足时间；都不行就把诊断快照留下
+// 轮询 3 次（每次 3.2s）：官方列表是异步回来的，给足时间
 - (void)gridTryFetch:(id)dataVC attempt:(NSInteger)attempt completion:(void (^)(NSArray *events))cb {
     if (!dataVC) { if (cb) cb(nil); return; }
     __weak typeof(self) ws = self;
@@ -1432,7 +1261,6 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
             [s gridTryFetch:dataVC attempt:attempt + 1 completion:cb];
             return;
         }
-        @try { s.lastProbe = JAGridProbeText(dataVC); } @catch (NSException *e) {}
         [s gridStopDataVC:dataVC];
         if (cb) cb(nil);
     });
@@ -1480,12 +1308,8 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
             s.emptyStreak++;
             if (s.emptyStreak >= 3) {
                 s.gaveUp = YES;
-                if (s.lastProbe.length) {
-                    [s showDiag:s.lastProbe];
-                } else {
-                    s.hintLab.hidden = NO;
-                    s.hintLab.text = @"往前 3 天都没有录像（这三天没有事件记录）";
-                }
+                s.hintLab.hidden = NO;
+                s.hintLab.text = @"往前 3 天都没有录像（这三天没有事件记录）";
             } else {
                 [s loadOneMoreDay];
             }
@@ -1503,6 +1327,13 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
         [items addObject:@{@"ev": ev, @"sec": ts, @"day": @(day)}];
     }
     if (items.count == 0) return;
+    // v2.6：格子顺序改为「最新在最上」—— 官方返回的是升序（最早在前），这里统一降序
+    [items sortUsingComparator:^NSComparisonResult(id a, id b) {
+        long long sa = [(NSNumber *)[(NSDictionary *)a objectForKey:@"sec"] longLongValue];
+        long long sb = [(NSNumber *)[(NSDictionary *)b objectForKey:@"sec"] longLongValue];
+        if (sa == sb) return NSOrderedSame;
+        return sa > sb ? NSOrderedAscending : NSOrderedDescending;
+    }];
     [self.days addObject:@{@"day": @(day), @"items": items}];
     [self.flat addObjectsFromArray:items];
     [self.cv reloadData];
@@ -1621,10 +1452,26 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
     if (!nav) return;
     [nav pushViewController:vc animated:YES];
 
-    // 定位 3.0s + 播 35s ≈ 38s 后自动跳下一格
+    // v2.6：云回放式「35 秒片段」观感 —— 进播放页 1s 后隐藏时间轴/拖动条，
+    // 只留画面，看完自动回格子页接着下一格（不再显示可拖的时间线）。
+    __weak id wvc = vc;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        id v = wvc;
+        if (!v) return;
+        @try {
+            id tl = [v valueForKey:@"timeLineView"];
+            if ([tl isKindOfClass:[UIView class]]) {
+                UIView *tview = (UIView *)tl;
+                tview.hidden = YES;
+            }
+        } @catch (NSException *e) {}
+    });
+
+    // 35 秒后自动跳下一格
     if (self.autoNext) {
         __weak typeof(self) ws = self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(38.0 * NSEC_PER_SEC)),
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(35.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             __strong typeof(ws) s = ws;
             if (!s) return;
@@ -1646,32 +1493,6 @@ static BOOL JAGridCallOneArg(id obj, NSString *selName, long long num, id objArg
 - (void)toggleAutoNext {
     self.autoNext = !self.autoNext;
     self.autoItem.title = self.autoNext ? @"连播 开" : @"连播 关";
-}
-
-// ---------- 诊断展示 ----------
-
-- (void)showDiag:(NSString *)text {
-    if (!text.length) return;
-    self.diag.text = text;
-    self.diag.hidden = NO;
-    self.hintLab.hidden = YES;
-    @try { [[UIPasteboard generalPasteboard] setString:text]; } @catch (NSException *e) {}
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"没读到该日事件列表"
-                                                                message:@"诊断信息已自动复制到剪贴板，直接长按粘贴发我就行。也可以在这个黑框里上下滑动看。"
-                                                         preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleDefault handler:nil]];
-    @try { [self presentViewController:ac animated:YES completion:nil]; } @catch (NSException *e) {}
-}
-
-- (void)copyDiag {
-    NSString *t = self.diag.text;
-    if (!t.length) return;
-    @try { [[UIPasteboard generalPasteboard] setString:t]; } @catch (NSException *e) {}
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"已复制"
-                                                                message:@"诊断信息已在剪贴板，粘贴发我即可。"
-                                                         preferredStyle:UIAlertControllerStyleAlert];
-    [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
-    @try { [self presentViewController:ac animated:YES completion:nil]; } @catch (NSException *e) {}
 }
 
 @end
@@ -1994,9 +1815,12 @@ static void JAGridStartWatcher(void) {
     static BOOL started = NO;
     if (started) return;
     started = YES;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+    // v2.6：入口按钮出现太慢 —— 首 tick 1.5s→0.2s，间隔 0.8s→0.3s
+    // （tick 只扫当前可见视图、有则直接 return，开销很小）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        NSTimer *t = [NSTimer timerWithTimeInterval:0.8
+        [[JAGridEntryHub shared] tick];
+        NSTimer *t = [NSTimer timerWithTimeInterval:0.3
                                               target:[JAGridEntryHub shared]
                                             selector:@selector(tick)
                                             userInfo:nil
