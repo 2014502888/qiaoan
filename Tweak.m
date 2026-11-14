@@ -214,6 +214,11 @@
 //     裸请求被 CDN 判成非 App 流量直接拒（格子上一直「失败.jpg」）。
 //   · 失败文字优先显示 HTTP 状态码（失败 403 / 失败 404），跟「失败.jpg」（没拿到响应）分开。
 //   · 同一张图连续失败 3 次后不再自动重试，避免 20s/35s 补图时反复「载入中 → 失败」闪。
+// v2.9.24：
+//   · 遮挡不再靠「找文字」猜。每 0.6s 对每个 window 做一次 hitTest，命中的那个视图就是
+//     真正吃掉手势的东西：它是满屏的、又不是格子页自己的后代，就整块摘掉。
+//     摘不掉的把类名写在底部提示条上（「遮挡:XXX(320x568)」），截图即可定位是谁。
+//   · 缓存读取也拦一道 sec <= 当天 0 点 的条目，老版本写进去的假格子读不出来。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1588,6 +1593,9 @@ static NSArray *JAGridDayCacheRead(NSString *devKey, long long day) {
         if (![o isKindOfClass:NSDictionary.class]) continue;
         NSNumber *sec = ((NSDictionary *)o)[@"sec"];
         if (![sec isKindOfClass:NSNumber.class]) continue;
+        // v2.9.24：缓存里也拦一道 —— 老版本写进去过「时间兜底成当天 0 点」的假条目，
+        // 读出来照样会在 00:00 组里显示一个「无封面 00:00:00」的空格子。
+        if (sec.longLongValue < day + 1 || sec.longLongValue >= day + 86400LL) continue;
         NSMutableDictionary *e = [NSMutableDictionary dictionaryWithDictionary:(NSDictionary *)o];
         e[@"day"] = @(day);
         [out addObject:e];
@@ -2112,6 +2120,32 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 // 整块 removeFromSuperview，横条和遮罩一起走。格子页自己的 view 绝不碰。
 static __weak UIView *g_jaGridHostView = nil;
 
+// v2.9.24：不再靠「找文字」猜遮挡层 —— 直接问系统：在这个点上谁最先接到触摸。
+// window 对自己做 hitTest，命中的那个视图就是真正吃掉手势的东西。
+// 它不是格子页自己的后代、又是满屏的，那就整块摘掉。
+// 返回 @{@"cls":类名, @"frame":CGRect值, @"w":宽, @"h":高} 或 nil。
+static NSDictionary *JAGridProbeHit(UIWindow *win, UIView *host, CGPoint pt) {
+    if (!win || win.hidden || win.alpha < 0.02) return nil;
+    if (win.bounds.size.width < 2 || win.bounds.size.height < 2) return nil;
+    UIView *hit = nil;
+    @try { hit = [win hitTest:pt withEvent:nil]; } @catch (NSException *e) { hit = nil; }
+    if (!hit || [hit isKindOfClass:UIWindow.class]) return nil;
+    if (host && [hit isDescendantOfView:host]) return nil;      // 命中自己，正常
+    // 命中「格子页的祖先」（导航栏/容器）说明那点本来就没被格子页覆盖，不算遮挡
+    if (host) {
+        UIView *anc = host.superview;
+        while (anc) {
+            if (anc == hit) return nil;
+            anc = anc.superview;
+        }
+    }
+    return @{@"cls": NSStringFromClass(hit.class),
+             @"frame": [NSValue valueWithCGRect:hit.frame],
+             @"w": @(CGRectGetWidth(hit.frame)),
+             @"h": @(CGRectGetHeight(hit.frame)),
+             @"v": hit};
+}
+
 static void JAGridToggleSpeedPanel(BOOL hide) {
     if (!hide) return;                 // 不再恢复：留着它只会再遮一次
     UIView *host = g_jaGridHostView;
@@ -2302,6 +2336,30 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     self.speedTimer = nil;
 }
 
+// v2.9.24：用 hitTest 直接找出「谁在吃触摸」。满屏的整块摘掉，剩下的把类名写到
+// 底部提示条上 —— 用户一截图就能看到究竟是谁盖的，不用再猜。
+- (void)jaProbeBlockers {
+    UIView *host = self.view;
+    if (!host) return;
+    NSMutableString *rep = [NSMutableString string];
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        CGPoint p = CGPointMake(CGRectGetMidX(w.bounds), CGRectGetMidY(w.bounds));
+        NSDictionary *d = JAGridProbeHit(w, host, p);
+        if (!d) continue;
+        UIView *v = (UIView *)d[@"v"];
+        CGFloat ww = CGRectGetWidth(w.bounds), hh = CGRectGetHeight(w.bounds);
+        CGFloat fw = [d[@"w"] doubleValue], fh = [d[@"h"] doubleValue];
+        [rep appendFormat:@"%@(%.0fx%.0f) ", d[@"cls"], fw, fh];
+        if (ww > 0 && hh > 0 && fw >= ww * 0.9 && fh >= hh * 0.6) {
+            @try { [v removeFromSuperview]; } @catch (NSException *e) {}
+        }
+    }
+    if (rep.length) {
+        self.hintLab.hidden = NO;
+        self.hintLab.text = [NSString stringWithFormat:@"遮挡:%@", rep];
+    }
+}
+
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
     // v2.9.22：官方播放页在后台可能又把「回放倍数选择」浮层显示回来（它带模态遮罩，
@@ -2313,6 +2371,7 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
             __strong JAGridReplayViewController *sv = wsv;
             if (!sv) { [t invalidate]; return; }
             JAGridToggleSpeedPanel(YES);
+            [sv jaProbeBlockers];
         }];
     }
     if (!self.myCamera) {
