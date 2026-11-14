@@ -103,6 +103,16 @@
 //   · 该日真的没有报警消息时只给一个日期抬头 + 一句说明，不再连读三天、也不再弹
 //     「往前 3 天都没有录像」；
 //   · 连播到这一天最后一格就停，不再自动跳下一天。
+// v2.9.5（修「第二台无封面」+「第三台入口双层 / 返回后点不进去」）：
+//   · 封面：固定键表只有 40 个名字，不同型号 / 阿里云存量设备的报警模型是另一套字段。
+//     改为把消息对象的所有 ivar 扫一遍：绝对地址里挑像图片的，相对路径用同对象的
+//     http 地址补成绝对地址 —— 这样字段叫什么都能捞到。
+//   · 入口双层：旧实现按屏幕坐标 ±14pt 判重，cell 一复用坐标就变，旧入口留在旧容器里
+//     没人清，于是同一张卡片叠两个。改为按「设备身份（uid / 设备名）」判重、同身份全局
+//     只留一个；每 0.3s 扫描前再清一遍「父视图里已经没有云存储 / AI分析」的残影。
+//   · 返回后点不进去：旧实现每次点击都现场解析视图层级，从回放页返回后层级变了就报
+//     「没找到这台设备」。改为安装入口时就把 camera 挂到入口上（associated object），
+//     点击直接用，永不失手。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -916,6 +926,61 @@ static NSString *JAGridImageURL(id ev) {
     for (NSString *k in keys) {
         NSString *u = JAGridNormalizeURL(JAVal(ev, k));
         if (u) return u;
+    }
+    // v2.9.5：字段名兜底 —— 不同型号 / 不同云通道（Jooan / 阿里云存量）的报警模型字段
+    // 名是另一套，上面那张固定键表覆盖不到（第二台设备就整页「无封面」）。这里直接把
+    // 对象所有 ivar 扫一遍：先挑绝对地址里像图片的，再把相对路径用同对象的 http 地址
+    // 补成绝对地址。
+    unsigned int ic = 0;
+    Ivar *ivs = class_copyIvarList([ev class], &ic);
+    NSMutableArray *absUrls = [NSMutableArray array];
+    NSMutableArray *relUrls = [NSMutableArray array];
+    for (unsigned int i = 0; i < ic; i++) {
+        const char *nm = ivar_getName(ivs[i]);
+        if (!nm) continue;
+        NSString *raw = [NSString stringWithUTF8String:nm];
+        NSString *key = [raw hasPrefix:@"_"] ? [raw substringFromIndex:1] : raw;
+        id v = nil;
+        @try { v = [ev valueForKey:key]; } @catch (NSException *e) { v = nil; }
+        if (![v isKindOfClass:NSString.class]) {
+            @try { v = object_getIvar(ev, ivs[i]); } @catch (NSException *e) { v = nil; }
+        }
+        if (![v isKindOfClass:NSString.class]) continue;
+        NSString *s = [(NSString *)v stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (s.length < 8 || s.length > 2048) continue;
+        if ([s hasPrefix:@"http://"] || [s hasPrefix:@"https://"]) [absUrls addObject:s];
+        else if ([s hasPrefix:@"/"]) [relUrls addObject:s];
+    }
+    if (ivs) free(ivs);
+
+    for (NSString *u in absUrls) {
+        NSString *low = u.lowercaseString;
+        if ([low containsString:@".jpg"] || [low containsString:@".jpeg"] ||
+            [low containsString:@".png"] || [low containsString:@".webp"] ||
+            [low containsString:@"pic"] || [low containsString:@"thumb"] ||
+            [low containsString:@"snap"] || [low containsString:@"image"] ||
+            [low containsString:@"cover"]) return u;
+    }
+    // 相对路径：借同对象里第一个 http 地址的 scheme+host 拼成绝对地址
+    NSString *origin = nil;
+    for (NSString *u in absUrls) {
+        NSRange r = [u rangeOfString:@"://"];
+        if (r.location == NSNotFound) continue;
+        NSRange tail = NSMakeRange(r.location + 3, u.length - r.location - 3);
+        NSUInteger slash = [u rangeOfString:@"/" options:0 range:tail].location;
+        origin = (slash == NSNotFound) ? u : [u substringToIndex:slash];
+        break;
+    }
+    if (origin.length) {
+        for (NSString *rel in relUrls) {
+            NSString *full = [origin stringByAppendingString:rel];
+            NSString *low = full.lowercaseString;
+            if ([low containsString:@".jpg"] || [low containsString:@".jpeg"] ||
+                [low containsString:@".png"] || [low containsString:@".webp"] ||
+                [low containsString:@"pic"] || [low containsString:@"thumb"] ||
+                [low containsString:@"snap"] || [low containsString:@"image"]) return full;
+        }
     }
     return nil;
 }
@@ -2385,6 +2450,9 @@ static void ja_openGrid(id self, SEL _cmd) {
 // 所以 5 台设备各进各的，不会串台。
 
 static const NSInteger JAGridEntryTag = 0x1A63;
+// v2.9.5：入口 box 上挂的两个身份 —— camera 本身、以及该卡片的设备身份键。
+static char kJAGridEntryCamKey = 0;
+static char kJAGridEntryIdKey = 0;
 
 @interface JAGridEntryHub : NSObject
 + (instancetype)shared;
@@ -2515,17 +2583,46 @@ static id JAGridCameraForView(UIView *v) {
 // v2.8：入口去重 —— cell 复用会让卡片的视图层级重建，旧的入口 box 可能留在
 // 上一层容器里，只按「同一 host + midX」判重会漏掉，结果一张卡片上叠出两个
 // 「格子回放」（其中一个是旧层级里的残影，点它自然解析不到设备）。
-static void JAGridCollectEntriesNear(UIView *root, CGPoint pt, NSMutableArray *out, int depth) {
-    if (!root || depth > 8) return;
+// v2.9.5：收集窗口里全部入口 box（不限坐标），用于按设备身份去重 / 清残影
+static void JAGridCollectAllEntries(UIView *root, NSMutableArray *out, int depth) {
+    if (!root || depth > 10) return;
     for (UIView *s in root.subviews) {
-        if (s.tag == JAGridEntryTag && s.window) {
-            CGRect rw = [s convertRect:s.bounds toView:s.window];
-            if (fabs(CGRectGetMidX(rw) - pt.x) < 14 && fabs(CGRectGetMidY(rw) - pt.y) < 14) {
-                [out addObject:s];
-            }
+        if (s.tag == JAGridEntryTag) {
+            [out addObject:s];      // 入口内部只有 icon/lab，不必再往下钻
+        } else {
+            JAGridCollectAllEntries(s, out, depth + 1);
         }
-        JAGridCollectEntriesNear(s, pt, out, depth + 1);
     }
+}
+
+// v2.9.5：清残影 —— cell 复用会让旧入口留在已不复用的那一层容器里，从此叠在卡片上。
+// 判定：入口的父视图里再也找不到「云存储 / AI分析」这两个文字，就说明它挂错了地方。
+static void JAGridSweepStaleEntries(void) {
+    UIWindow *win = nil;
+    NSArray *wins = [UIApplication sharedApplication].windows;
+    for (UIWindow *w in wins) {
+        if (w.isKeyWindow) { win = w; break; }
+    }
+    if (!win && wins.count) win = [wins lastObject];
+    if (!win) return;
+    NSMutableArray *boxes = [NSMutableArray array];
+    JAGridCollectAllEntries(win, boxes, 0);
+    if (boxes.count == 0) return;
+    NSMutableArray *del = [NSMutableArray array];
+    for (UIView *b in boxes) {
+        UIView *sup = b.superview;
+        if (!sup) { [del addObject:b]; continue; }
+        NSMutableArray *txt = [NSMutableArray array];
+        NSInteger budget = 200;
+        JAGridCollectTexts(sup, 0, txt, &budget);
+        BOOL ok = NO;
+        for (UIView *v in txt) {
+            NSString *t = JAGridViewText(v);
+            if (JAGridIsCloudText(t) || JAGridIsAIText(t)) { ok = YES; break; }
+        }
+        if (!ok) [del addObject:b];
+    }
+    for (UIView *d in del) [d removeFromSuperview];
 }
 
 static void JAGridPurgeEntriesUnder(UIView *v, int depth) {
@@ -2552,19 +2649,41 @@ static void JAGridInstallEntryInRow(UIView *cloud, UIView *ai) {
     CGFloat midX = (CGRectGetMidX(rc) + CGRectGetMidX(ra)) / 2.0;
     CGFloat midY = (CGRectGetMidY(rc) + CGRectGetMidY(ra)) / 2.0;
 
-    // 已在同一位置装过就什么都不做（避免每 0.3s 重建一次导致闪烁）
-    CGRect rcw = [cloud convertRect:cloud.bounds toView:nil];
-    CGRect raw = [ai convertRect:ai.bounds toView:nil];
-    CGPoint wp = CGPointMake((CGRectGetMidX(rcw) + CGRectGetMidX(raw)) / 2.0,
-                             (CGRectGetMidY(rcw) + CGRectGetMidY(raw)) / 2.0);
-    NSMutableArray *found = [NSMutableArray array];
-    JAGridCollectEntriesNear(cloud.window, wp, found, 0);
-    if (found.count > 0) {
-        // 多余的重影全部删掉，只留第一个
-        for (NSUInteger i = 1; i < found.count; i++) [found[i] removeFromSuperview];
+    // v2.9.5：入口身份 = 这张卡片的设备（uid 优先，其次设备名）。同身份全局只留一个，
+    // 并把 camera 直接挂在入口上 —— 这两个就是「一张卡片叠两个格子回放」和
+    // 「返回后再点提示没找到设备」的根因：旧实现按屏幕坐标 ±14pt 判重，cell 一复用
+    // 坐标就变，旧入口留在旧容器里没人管；点击时又去现场解析视图层级，解析不到就报错。
+    id cam = JAGridCameraForView(cloud);
+    if (!cam) cam = JAGridCameraByNameNear(host);
+    NSString *eid = nil;
+    if (cam) {
+        NSString *u = JAGridDeviceId(cam);
+        eid = u.length ? u : JAGridDeviceName(cam);
+    }
+    if (!eid.length) {
+        eid = [NSString stringWithFormat:@"pos_%.0f_%.0f",
+               (CGRectGetMidX(rc) + CGRectGetMidX(ra)) / 2.0, midY];
+    }
+
+    NSMutableArray *allBoxes = [NSMutableArray array];
+    JAGridCollectAllEntries(cloud.window, allBoxes, 0);
+    UIView *keep = nil;
+    for (UIView *b in allBoxes) {
+        NSString *bid = objc_getAssociatedObject(b, &kJAGridEntryIdKey);
+        if (![bid isKindOfClass:NSString.class] || ![bid isEqualToString:eid]) continue;
+        if (!keep) keep = b;
+        else [b removeFromSuperview];      // 同一设备的多层叠影，删掉多余的
+    }
+    if (keep) {
+        // 已有同一设备的入口：只纠正位置 + 刷新 camera，不重建（避免每 0.3s 闪烁）
+        CGRect f = keep.frame;
+        f.origin = CGPointMake(midX - f.size.width / 2.0, midY - f.size.height / 2.0);
+        keep.frame = f;
+        if (cam) objc_setAssociatedObject(keep, &kJAGridEntryCamKey, cam,
+                                          OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         return;
     }
-    // 这张卡片所在容器里的旧入口一律清掉，再装新的（保证一卡一口）
+    // 这张卡片所在容器里解析不到设备身份的旧入口一律清掉，保证一卡一口
     JAGridPurgeEntriesUnder(host, 0);
 
     CGFloat h = MAX(36.0, MAX(CGRectGetHeight(rc), CGRectGetHeight(ra)) + 10.0);
@@ -2574,6 +2693,9 @@ static void JAGridInstallEntryInRow(UIView *cloud, UIView *ai) {
 
     UIView *box = [[UIView alloc] initWithFrame:CGRectMake(midX - w / 2.0, midY - h / 2.0, w, h)];
     box.tag = JAGridEntryTag;
+    objc_setAssociatedObject(box, &kJAGridEntryIdKey, eid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (cam) objc_setAssociatedObject(box, &kJAGridEntryCamKey, cam,
+                                      OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     box.backgroundColor = [UIColor clearColor];
     box.userInteractionEnabled = YES;
     box.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin |
@@ -2647,6 +2769,8 @@ static UIViewController *JAGridTopVC(void) {
 
 static void JAGridScanVisible(void) {
     if ([UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
+    // v2.9.5：每次扫描先清掉挂错层的旧入口（cell 复用留下的叠影）
+    @try { JAGridSweepStaleEntries(); } @catch (NSException *e) {}
     UIViewController *vc = JAGridTopVC();
     if (!vc || !vc.isViewLoaded) return;
     NSMutableArray *hits = [NSMutableArray array];
@@ -2695,7 +2819,10 @@ static void JAGridScanVisible(void) {
 - (void)onTapEntry:(UITapGestureRecognizer *)g {
     UIView *box = g.view;
     if (!box) return;
-    id cam = JAGridCameraForView(box);
+    // v2.9.5：优先用安装入口时就存好的 camera —— 旧实现每次点击都去现场解析视图层级，
+    // 从回放页返回后层级已变，解析不到就弹「没找到这台设备」（第三台就是这样）。
+    id cam = objc_getAssociatedObject(box, &kJAGridEntryCamKey);
+    if (!cam) cam = JAGridCameraForView(box);
     UIViewController *from = JAGridTopVC();
     if (!cam) {
         NSString *src = nil;
