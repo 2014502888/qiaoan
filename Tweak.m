@@ -228,6 +228,16 @@
 // v2.9.26：**彻底去掉 SD 卡回退通道**。方案 1 的数据源就是消息列表，读不到就是「当天没有」。
 //   回退要现建官方 SD 回放 VC —— 它一初始化就把三屏引导蒙层挂到窗口上（全屏吞手势 + 藏
 //   状态栏），空天最容易触发，还要多等一轮。去掉后空天第一页返回就收工，不再等待。
+// v2.9.27：
+//   · 换日期后位置不对：`applyLayoutKeepingOffset` 判断「是否贴底」时没管内容能不能滚动 ——
+//     那一天只有 1 条消息、整页不到一屏时条件恒成立，被当成贴底，换到内容多的一天就直接
+//     甩到最底，那天的日期抬头被顶到上面看不见。现在只有「原本就能滚动」才判断贴底，
+//     并且换天一律强制回到顶部。
+//   · 封面「失败.jpg」但连响应都没拿到：URL 里只要有一个没编码的字符（空格、中文等），
+//     `NSURL URLWithString:` 就返回 nil，请求根本没发出去。现在补一次穷举式百分号编码
+//     （已有 %XX 原样保留，不会二次编码）。
+//   · 格子上失败文字细化：`失败 403`=被拒、`失败 e-1022`=被 ATS 拦、`失败 e-1001`=超时、
+//     `失败 e-1004`=连不上、`失败 e-1003`=DNS 不通、`失败 地址`=URL 非法没发出去。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1824,6 +1834,16 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 
 - (void)jaFetch:(NSString *)url retry:(NSInteger)retry {
     NSURL *u = [NSURL URLWithString:url];
+    // v2.9.27：地址里只要有一个没编码的字符（空格、中文、{|} 之类），
+    // URLWithString 就直接返回 nil —— 请求根本发不出去，格子上却只显示「失败.jpg」，
+    // 看起来像被服务端拒了。这里补一次穷举式百分号编码：只保留 URL 结构里合法的字符，
+    // 其它全部编码，已有 %XX 原样留着，不会被二次编码。
+    if (!u) {
+        NSCharacterSet *allow = [NSCharacterSet characterSetWithCharactersInString:
+            @"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~:/?#[]@!$&'()*+,;=%"];
+        NSString *esc = [url stringByAddingPercentEncodingWithAllowedCharacters:allow];
+        if (esc.length) u = [NSURL URLWithString:esc];
+    }
     if (!u) { [self jaFinish:url image:nil]; return; }
     // v2.9.23：带上 App 的 User-Agent 跟常规图片请求头。第二台设备那张抓拍图 jpg 地址是对的，
     // 但裸 session 请求图片 CDN 会被判成非 App 流量直接拒（格子上一直是「失败.jpg」）。
@@ -1837,10 +1857,16 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         dataTaskWithRequest:rq completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
             UIImage *img = nil;
             if (data) { @autoreleasepool { img = [UIImage imageWithData:data]; } }
-            if (!img && [resp isKindOfClass:NSHTTPURLResponse.class]) {
-                // v2.9.23：记下 HTTP 状态码，格子上的失败文字能区分 403/404/超时
-                NSInteger st = ((NSHTTPURLResponse *)resp).statusCode;
-                if (st > 0) self.codes[url] = @(st);
+            if (!img) {
+                // v2.9.23：记 HTTP 状态码（403/404）
+                if ([resp isKindOfClass:NSHTTPURLResponse.class]) {
+                    NSInteger st = ((NSHTTPURLResponse *)resp).statusCode;
+                    if (st > 0) self.codes[url] = @(st);
+                } else if (err) {
+                    // v2.9.27：连响应都没有 —— 记网络错误码（负数），格子上显示「失败 e-1022」之类，
+                    // 才能分清是超时(-1001)、DNS(-1003)、连不上(-1004)、被 ATS 拦(-1022) 还是别的。
+                    self.codes[url] = @(-(err.code));
+                }
             }
             if (img) {
                 [self.mem setObject:img forKey:url];
@@ -1959,10 +1985,13 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         if (img) { s.thumb.image = img; s.noneLab.hidden = YES; }
         else {
             // v2.9.21：把后缀带出来 —— 显示「失败.mp4」就说明拿到的根本不是图。
-            // v2.9.23：有 HTTP 状态码时优先显示码 —— 「失败 403」是被拒，「失败 404」是地址错，
-            // 「失败.jpg」是压根没拿到响应（超时/断网）。三者修法完全不同。
+            // v2.9.23：有 HTTP 状态码时优先显示码 —— 「失败 403」是被拒，「失败 404」是地址错。
+            // v2.9.27：负数是网络错误码 —— 「失败 e-1022」是被 ATS 拦、e-1001 超时、
+            // e-1004 连不上、e-1003 DNS 解析不出来；「失败 地址」是 URL 本身非法，请求没发出去。
             NSInteger st = [[JAGridImageCache shared] statusForURL:key];
             if (st >= 400) s.noneLab.text = [NSString stringWithFormat:@"失败 %ld", (long)st];
+            else if (st < 0) s.noneLab.text = [NSString stringWithFormat:@"失败 e%ld", (long)st];
+            else if (![NSURL URLWithString:key]) s.noneLab.text = @"失败 地址";
             else {
                 NSString *ext = [[NSURL URLWithString:key] pathExtension].lowercaseString;
                 s.noneLab.text = ext.length ? [NSString stringWithFormat:@"失败.%@", ext]
@@ -2205,6 +2234,7 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
 @property (nonatomic, assign) BOOL coverRefetch;      // v2.9.18：正在静默补一次最新页
 @property (nonatomic, assign) NSInteger emptyStreak;
 @property (nonatomic, assign) BOOL gaveUp;
+@property (nonatomic, assign) BOOL needsScrollTop;   // v2.9.27：换日期后强制回到顶部
 @property (nonatomic, strong) NSTimer *speedTimer;   // v2.9.22：前台期间持续压住官方倍数浮层
 @property (nonatomic, assign) NSInteger playIndex;
 @property (nonatomic, strong) id playingVC;
@@ -2834,7 +2864,19 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     CGFloat insetTop = cv.adjustedContentInset.top;
     CGFloat insetBottom = cv.adjustedContentInset.bottom;
     CGFloat oldH = cv.contentSize.height;
-    BOOL atBottom = (oldH > 0 &&
+    // v2.9.27：换日期后不许再「保持位置」—— 内容换了，位置没有意义，必须回到该天抬头。
+    if (self.needsScrollTop) {
+        self.needsScrollTop = NO;
+        [cv reloadData];
+        [cv layoutIfNeeded];
+        cv.contentOffset = CGPointMake(0, -cv.adjustedContentInset.top);
+        return;
+    }
+    // 只有「内容本来就能滚动」时，「贴在底部」才有意义。
+    // v2.9.27：原来没这个限制 —— 内容不足一屏时（比如那一天只有 1 条消息）上面这个式子恒成立，
+    // 于是被当成「贴底」，换到内容多的那天就直接甩到最底，那天的日期抬头被顶到上面看不见。
+    BOOL canScroll = oldH > cv.bounds.size.height - insetTop - insetBottom + 8.0;
+    BOOL atBottom = (canScroll &&
                      off.y + cv.bounds.size.height - insetBottom >= oldH - 8.0);
     [cv reloadData];
     [cv layoutIfNeeded];
@@ -3293,6 +3335,7 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     self.didFirstLoad = YES;
     self.loading = NO;
     [self.days removeAllObjects];
+    self.needsScrollTop = YES;      // v2.9.27：换天必须回到顶部，否则看到的是旧位置
     self.nextDay = day;
     [self rebuildLayout];
     self.hintLab.hidden = YES;
