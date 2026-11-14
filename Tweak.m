@@ -144,6 +144,11 @@
 //   · 按天缓存换目录（JAGridDays3）。v2.9.9 改了报警时间的算法，旧缓存里的秒是旧规则
 //     算的 —— 复用会让格子定位到错误时刻。换目录即自动作废，用户不用手动清缓存。
 //   · 网络回包条数比本地缓存还少时不覆盖（残缺结果会冲掉好数据、还会把缓存写坏）。
+// v2.9.12：
+//   · 修「第三个监控的格子回放入口出现了又消失」。v2.9.5 的清残影判据只看入口的直接
+//     父视图里有没有「云存储/AI分析」文字 —— 第三台那种型号入口容器和文字不在同一层，
+//     于是被误判成残影删掉，下一 tick 又装回来，入口一直闪。现在改成往 cell 内整条链
+//     找文字，并且必须连续 3 次 tick 都判无效才删，防滚动/复用瞬间抖动。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -2823,19 +2828,36 @@ static id JAGridCameraForView(UIView *v) {
 // 上一层容器里，只按「同一 host + midX」判重会漏掉，结果一张卡片上叠出两个
 // 「格子回放」（其中一个是旧层级里的残影，点它自然解析不到设备）。
 // v2.9.5：收集窗口里全部入口 box（不限坐标），用于按设备身份去重 / 清残影
-static void JAGridCollectAllEntries(UIView *root, NSMutableArray *out, int depth) {
-    if (!root || depth > 10) return;
-    for (UIView *s in root.subviews) {
-        if (s.tag == JAGridEntryTag) {
-            [out addObject:s];      // 入口内部只有 icon/lab，不必再往下钻
-        } else {
-            JAGridCollectAllEntries(s, out, depth + 1);
+static char kJAGridEntryMissKey = 0;
+
+// v2.9.12：入口是否还挂在正确的位置 —— 从它往上找，扫到 cell / 列表边界为止，
+// 这一路任何一层子树里还有「云存储 / AI分析」就算有效。
+// 旧判据（v2.9.5）只扫直接父视图：第三台那种型号，入口容器和文字不在同一个直接父层，
+// 一扫不到就判残影删掉，下一 tick 又装回来 → 入口「出现了又消失」，只有它这样。
+static BOOL JAGridEntryStillValid(UIView *b) {
+    UIView *v = b.superview;
+    int depth = 0;
+    while (v && depth < 8) {
+        NSMutableArray *txt = [NSMutableArray array];
+        NSInteger budget = 240;
+        JAGridCollectTexts(v, 0, txt, &budget);
+        for (UIView *t in txt) {
+            NSString *s = JAGridViewText(t);
+            if (JAGridIsCloudText(s) || JAGridIsAIText(s)) return YES;
         }
+        if ([v isKindOfClass:NSClassFromString(@"UITableViewCell")] ||
+            [v isKindOfClass:NSClassFromString(@"UICollectionViewCell")] ||
+            [v isKindOfClass:UITableView.class] ||
+            [v isKindOfClass:UICollectionView.class]) break;
+        v = v.superview;
+        depth++;
     }
+    return NO;
 }
 
 // v2.9.5：清残影 —— cell 复用会让旧入口留在已不复用的那一层容器里，从此叠在卡片上。
-// 判定：入口的父视图里再也找不到「云存储 / AI分析」这两个文字，就说明它挂错了地方。
+// v2.9.12：判定改为「往 cell 内整条链找文字」，并且必须连续 3 次 tick 都判无效才删
+// （滚动 / 复用瞬间会短暂扫不到，一次就删就是闪烁）。
 static void JAGridSweepStaleEntries(void) {
     UIWindow *win = nil;
     NSArray *wins = [UIApplication sharedApplication].windows;
@@ -2849,17 +2871,17 @@ static void JAGridSweepStaleEntries(void) {
     if (boxes.count == 0) return;
     NSMutableArray *del = [NSMutableArray array];
     for (UIView *b in boxes) {
-        UIView *sup = b.superview;
-        if (!sup) { [del addObject:b]; continue; }
-        NSMutableArray *txt = [NSMutableArray array];
-        NSInteger budget = 200;
-        JAGridCollectTexts(sup, 0, txt, &budget);
-        BOOL ok = NO;
-        for (UIView *v in txt) {
-            NSString *t = JAGridViewText(v);
-            if (JAGridIsCloudText(t) || JAGridIsAIText(t)) { ok = YES; break; }
+        // 真的脱离窗口了（cell 被回收）→ 立刻清
+        if (!b.superview || !b.window) { [del addObject:b]; continue; }
+        if (JAGridEntryStillValid(b)) {
+            objc_setAssociatedObject(b, &kJAGridEntryMissKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            continue;
         }
-        if (!ok) [del addObject:b];
+        NSInteger m = [objc_getAssociatedObject(b, &kJAGridEntryMissKey) integerValue] + 1;
+        objc_setAssociatedObject(b, &kJAGridEntryMissKey, @(m),
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        if (m >= 3) [del addObject:b];      // 连续 3 次（≈1s）都无效才删
     }
     for (UIView *d in del) [d removeFromSuperview];
 }
