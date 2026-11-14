@@ -205,6 +205,15 @@
 //     都解析不出来时 JAGridSecForMessage 兜底成了当天 0 点整。现在 sec <= 当天 0 点的直接丢。
 //   · 「回放倍数选择」浮层带模态遮罩，一旦显示回来就把格子页的触摸全吃掉（连返回都点不了，
 //     只能退后台）。改成格子页前台期间每 0.6s 压一次，扫描范围扩到所有 window，且不再恢复。
+// v2.9.23：
+//   · 光藏横条不够 —— 横条外面那层全屏遮罩还挂着：屏幕顶上留一条白边（状态栏那块看不见），
+//     触摸照样全被吃掉，连手势返回都失效。现在往上找到「满屏宽」的那层容器，整块移除。
+//   · 按天缓存换目录（JAGridDays4）：旧缓存里存着「时间兜底成 0 点」的假格子，读缓存
+//     会照样显示出来（过 0 点当天没报警时页面上多一个「无封面 00:00:00」）。
+//   · 封面请求补 User-Agent / Accept / Referer，超时 12 秒 —— 第二台那张 jpg 地址是对的，
+//     裸请求被 CDN 判成非 App 流量直接拒（格子上一直「失败.jpg」）。
+//   · 失败文字优先显示 HTTP 状态码（失败 403 / 失败 404），跟「失败.jpg」（没拿到响应）分开。
+//   · 同一张图连续失败 3 次后不再自动重试，避免 20s/35s 补图时反复「载入中 → 失败」闪。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1547,13 +1556,16 @@ static void JAGridFetchFirstPage(id cam, long long day, void (^cb)(NSArray *item
 // ---------- v2.8：按天磁盘缓存（第二次进格子页秒开） ----------
 
 // v2.9.11：目录名带版本号（JAGridDays3）。v2.9.9 改了报警时间的算法（双源校正），
+// v2.9.23：换成 JAGridDays4 —— 之前写进缓存的条目里有「时间解析兜底成当天 0 点」的假格子，
+// 读缓存会照样把它显示出来（过 0 点当天没报警时页面上多一个「无封面 00:00:00」）。
+// 换目录一次性作废旧缓存，不用用户手动清。
 // 之前缓存的秒是旧规则算出来的，直接复用会让格子定位到错误的时刻、看起来像「读不全」。
 // 换目录 = 旧缓存自动作废，不用用户手动清。
 static NSString *JAGridDayCacheDir(NSString *devKey) {
     NSString *caches = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory,
                                                             NSUserDomainMask, YES) firstObject];
     if (!caches.length || !devKey.length) return nil;
-    NSString *dir = [[caches stringByAppendingPathComponent:@"JAGridDays3"]
+    NSString *dir = [[caches stringByAppendingPathComponent:@"JAGridDays4"]
                      stringByAppendingPathComponent:devKey];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir
                               withIntermediateDirectories:YES attributes:nil error:nil];
@@ -1693,11 +1705,14 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 @interface JAGridImageCache : NSObject
 @property (nonatomic, strong) NSCache *mem;
 @property (nonatomic, strong) NSMutableDictionary *inflight;   // v2.9.14：同 URL 去重
+@property (nonatomic, strong) NSMutableDictionary *fails;      // v2.9.23：同一 URL 连续失败次数
+@property (nonatomic, strong) NSMutableDictionary *codes;      // v2.9.23：失败时的 HTTP 状态码
 @property (nonatomic, strong) NSMutableArray *queue;           // v2.9.15：限并发排队
 @property (nonatomic, assign) NSInteger active;                // 当前在跑的下载数
 + (instancetype)shared;
 - (UIImage *)imageForKey:(NSString *)key;
 - (void)loadURL:(NSString *)url completion:(void (^)(UIImage *img, NSString *key))cb;
+- (NSInteger)statusForURL:(NSString *)url;   // v2.9.23：失败时的 HTTP 状态码，0 = 没拿到响应
 @end
 
 @implementation JAGridImageCache
@@ -1713,6 +1728,8 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         _mem = [[NSCache alloc] init];
         _mem.countLimit = 160;
         _inflight = [NSMutableDictionary dictionary];
+        _fails = [NSMutableDictionary dictionary];
+        _codes = [NSMutableDictionary dictionary];
         _queue = [NSMutableArray array];
     }
     return self;
@@ -1729,12 +1746,19 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     }
     return nil;
 }
+- (NSInteger)statusForURL:(NSString *)url {
+    if (!url.length) return 0;
+    return [[self.codes objectForKey:url] integerValue];
+}
 - (void)loadURL:(NSString *)url completion:(void (^)(UIImage *, NSString *))cb {
     if (!url.length || ![url hasPrefix:@"http"]) { if (cb) cb(nil, url); return; }
     UIImage *c = [self imageForKey:url];
     if (c) { if (cb) cb(c, url); return; }
     // v2.9.14：同一个 URL 只发一个请求。边读边显示会一层层重建 cell，不去重就会对同一张图
     // 反复发请求，图片在「占位 → 加载出来」之间来回跳，看起来就是闪。
+    // v2.9.23：连续失败已经够多次的就不再自动重试 —— 否则 20s/35s 那几轮补图会一轮轮
+    // 重新下载同一张失败图，格子上「载入中 → 失败」反复闪。
+    if ([[self.fails objectForKey:url] integerValue] >= 3) { if (cb) cb(nil, url); return; }
     NSMutableArray *wait = (NSMutableArray *)self.inflight[url];
     if (wait) {
         if (cb) [wait addObject:[cb copy]];
@@ -1766,6 +1790,11 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 - (void)jaFinish:(NSString *)url image:(UIImage *)img {
     if (!self.inflight[url]) return;      // v2.9.19：幂等 —— 兜底已经收过就别重复扣并发
     if (self.active > 0) self.active -= 1;
+    if (img) [self.fails removeObjectForKey:url];
+    else {
+        NSInteger n = [[self.fails objectForKey:url] integerValue] + 1;
+        self.fails[url] = @(n);
+    }
     NSArray *ws = [self.inflight[url] copy];
     [self.inflight removeObjectForKey:url];
     for (void (^b)(UIImage *, NSString *) in ws) { if (b) b(img, url); }
@@ -1779,12 +1808,26 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 - (void)jaFetch:(NSString *)url retry:(NSInteger)retry {
     NSURL *u = [NSURL URLWithString:url];
     if (!u) { [self jaFinish:url image:nil]; return; }
+    // v2.9.23：带上 App 的 User-Agent 跟常规图片请求头。第二台设备那张抓拍图 jpg 地址是对的，
+    // 但裸 session 请求图片 CDN 会被判成非 App 流量直接拒（格子上一直是「失败.jpg」）。
+    NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:u];
+    [rq setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Joolink/4.79"
+        forHTTPHeaderField:@"User-Agent"];
+    [rq setValue:@"image/*,*/*;q=0.8" forHTTPHeaderField:@"Accept"];
+    [rq setValue:@"https://www.jooancloud.com/" forHTTPHeaderField:@"Referer"];
+    rq.timeoutInterval = 12.0;
     NSURLSessionDataTask *t = [[NSURLSession sharedSession]
-        dataTaskWithURL:u completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
+        dataTaskWithRequest:rq completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
             UIImage *img = nil;
             if (data) { @autoreleasepool { img = [UIImage imageWithData:data]; } }
+            if (!img && [resp isKindOfClass:NSHTTPURLResponse.class]) {
+                // v2.9.23：记下 HTTP 状态码，格子上的失败文字能区分 403/404/超时
+                NSInteger st = ((NSHTTPURLResponse *)resp).statusCode;
+                if (st > 0) self.codes[url] = @(st);
+            }
             if (img) {
                 [self.mem setObject:img forKey:url];
+                [self.codes removeObjectForKey:url];
                 NSString *dp = JAGridDiskPathForKey(url);
                 if (dp.length) [data writeToFile:dp atomically:YES];
             }
@@ -1898,11 +1941,16 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         if (!key || ![s.imgURL isEqualToString:key]) return;
         if (img) { s.thumb.image = img; s.noneLab.hidden = YES; }
         else {
-            // v2.9.21：把后缀带出来 —— 显示「失败.mp4」就说明拿到的根本不是图，
-            // 显示「失败.jpg」才是地址对但下载被拒，两者修法完全不同。
-            NSString *ext = [[NSURL URLWithString:key] pathExtension].lowercaseString;
-            s.noneLab.text = ext.length ? [NSString stringWithFormat:@"失败.%@", ext]
-                                        : @"加载失败";
+            // v2.9.21：把后缀带出来 —— 显示「失败.mp4」就说明拿到的根本不是图。
+            // v2.9.23：有 HTTP 状态码时优先显示码 —— 「失败 403」是被拒，「失败 404」是地址错，
+            // 「失败.jpg」是压根没拿到响应（超时/断网）。三者修法完全不同。
+            NSInteger st = [[JAGridImageCache shared] statusForURL:key];
+            if (st >= 400) s.noneLab.text = [NSString stringWithFormat:@"失败 %ld", (long)st];
+            else {
+                NSString *ext = [[NSURL URLWithString:key] pathExtension].lowercaseString;
+                s.noneLab.text = ext.length ? [NSString stringWithFormat:@"失败.%@", ext]
+                                            : @"加载失败";
+            }
             s.noneLab.hidden = NO;
         }
     }];
@@ -2058,19 +2106,15 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 
 // v2.9.20：过 0 点再进格子页时，官方播放器留在 window 上的「回放倍数选择」浮层还挂着，
 // 正好盖住日期抬头，而且它是模态的 —— 遮罩吃掉所有触摸，连左上角返回都点不了。
-// v2.9.22：改成「格子页在前台期间持续压住它」：
-//   · 每次都重新扫一遍（官方后台可能又把它 hidden = NO），扫到就藏；
-//   · 不恢复。官方播放页要用就自己重建，留着它只会再遮一次。
-// 只处理挂在任一 window 直接子视图上的浮层，播放页自己的 view 一律不碰。
-static NSMutableArray *g_jaHiddenPanels = nil;
+// v2.9.22：改成「格子页在前台期间持续压住它」：每次都重扫（官方后台可能又把它显示回来）。
+// v2.9.23：光隐藏横条不够 —— 横条外面那层全屏遮罩还在，屏幕顶上会出现一条白边（状态栏那块），
+// 触摸照样全被吃掉、手势返回也失效。所以往上找到「宽度接近满屏」的那层遮罩容器，
+// 整块 removeFromSuperview，横条和遮罩一起走。格子页自己的 view 绝不碰。
+static __weak UIView *g_jaGridHostView = nil;
 
 static void JAGridToggleSpeedPanel(BOOL hide) {
-    if (!hide) {
-        for (UIView *v in g_jaHiddenPanels) v.hidden = NO;
-        g_jaHiddenPanels = nil;
-        return;
-    }
-    if (!g_jaHiddenPanels) g_jaHiddenPanels = [NSMutableArray array];
+    if (!hide) return;                 // 不再恢复：留着它只会再遮一次
+    UIView *host = g_jaGridHostView;
     NSArray *wins = [UIApplication sharedApplication].windows;
     for (UIWindow *win in wins) {
         NSMutableArray *os = [NSMutableArray arrayWithObject:win];
@@ -2081,12 +2125,22 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
             if ([v isKindOfClass:UILabel.class]) {
                 UILabel *l = (UILabel *)v;
                 if (l.text.length && [l.text containsString:@"回放倍数"]) {
-                    UIView *root = l;
-                    while (root.superview && root.superview != win) root = root.superview;
-                    if (root.superview == win && ![g_jaHiddenPanels containsObject:root]) {
-                        root.hidden = YES;
-                        [g_jaHiddenPanels addObject:root];
+                    // 往上找「满屏宽」的那层容器（模态遮罩），没有就退回到 window 直接子视图
+                    UIView *target = nil;
+                    UIView *cur = l.superview;
+                    CGFloat ww = win.bounds.size.width;
+                    while (cur && cur != win) {
+                        if (ww > 0 && CGRectGetWidth(cur.bounds) >= ww * 0.9) target = cur;
+                        cur = cur.superview;
                     }
+                    if (!target) {
+                        UIView *r = l;
+                        while (r.superview && r.superview != win) r = r.superview;
+                        if (r.superview == win) target = r;
+                    }
+                    if (target && host && [target isDescendantOfView:host]) target = nil;  // 不碰自己
+                    if (target) [target removeFromSuperview];
+                    continue;
                 }
             }
             for (UIView *s in v.subviews) [os addObject:s];
@@ -2238,6 +2292,7 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     [super viewWillAppear:animated];
     // v2.9.20：先藏掉官方播放器残留的「回放倍数选择」浮层，它正好压在日期抬头上面，
     // 而且带模态遮罩，会把返回按钮也一起挡掉。
+    g_jaGridHostView = self.view;
     JAGridToggleSpeedPanel(YES);
 }
 
