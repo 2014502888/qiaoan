@@ -177,6 +177,14 @@
 //   · 封面失败重试放到 4 次（2s/4s/8s/16s），补封面的时间点延到 20s、35s。
 //   · 入口残影清理改为「先隐藏、连续 12 次才真删」—— 从别的格子页返回时第三台那个 cell
 //     有几拍扫不到文字，以前删掉就不再重装，表现是「进去过一次，回来入口就没了」。
+// v2.9.18：
+//   · 入口去重不能只挪坐标：cell 复用后旧入口挂在了别人家的容器里，新位置因为「已存在」
+//     跳过安装，旧入口又被清掉 —— 这就是「主界面看着没事，一滑动第三个就没了」。
+//     改成把同身份旧入口迁到当前这一行的容器里。
+//   · 封面分三种状态显示：无封面（没地址）/ 载入中…（有地址还没下完）/ 加载失败（下载失败）。
+//     这样一眼就能判断是「取不到地址」还是「地址不对/下载不通」。
+//   · 收工后若这一天还有「没地址」的格子，静默再请求一次最新页，把新对象里的封面补上
+//     （那台设备的抓拍地址要第二次请求才回来）。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1390,8 +1398,7 @@ static void JAGridPollMessageModel(id model, long long day, NSInteger round,
 
 // 拉「某设备某天」的报警消息；prog 每翻到一页就回调一次（先上屏），cb(nil) 表示这条通道
 // 走不通（调用方回退官方 SD 段）
-static void JAGridFetchMessageDay(id cam, long long day,
-                                  void (^prog)(NSArray *items),
+static void JAGridFetchMessageDay(id cam, long long day,                                  void (^prog)(NSArray *items),
                                   void (^cb)(NSArray *items)) {
     Class mc = NSClassFromString(@"JAMessageModel");
     NSString *devId = JAGridDeviceId(cam);
@@ -1441,6 +1448,37 @@ static void JAGridFetchMessageDay(id cam, long long day,
         } @catch (NSException *e) { ok = NO; }
         if (!ok) { if (cb) cb(nil); return; }
         JAGridPollMessageModel(model, day, 0, nil, 0, 0, 0, prog, cb);
+    });
+}
+
+// v2.9.18：只请求「最新那一页」，不翻页。
+// 第二台那个设备首屏返回的消息里抓拍地址是空的，官方消息列表也要滑一下（等于再请求一次）才出图。
+// 这里在收工之后静默地再请求一次，用新对象里的封面地址补给还没有图的格子。
+static void JAGridFetchFirstPage(id cam, long long day, void (^cb)(NSArray *items)) {
+    Class mc = NSClassFromString(@"JAMessageModel");
+    NSString *devId = JAGridDeviceId(cam);
+    if (!mc || !devId.length) { if (cb) cb(nil); return; }
+    id model = nil;
+    @try { model = [[mc alloc] init]; } @catch (NSException *e) { model = nil; }
+    if (!model) { if (cb) cb(nil); return; }
+    NSString *ds = JAGridDayStr(day);
+    NSString *dn = JAGridDeviceName(cam);
+    @try { [model setValue:cam forKey:@"selectedCamera"]; } @catch (NSException *e) {}
+    @try { [model setValue:ds forKey:@"selectedDayString"]; } @catch (NSException *e) {}
+    @try { [model setValue:@(0) forKey:@"searchFrom"]; } @catch (NSException *e) {}
+    SEL f1 = NSSelectorFromString(@"fetchJooanMessagesWithDay:searchFrom:devId:devName:");
+    if (![model respondsToSelector:f1]) { if (cb) cb(nil); return; }
+    BOOL sent = NO;
+    @try {
+        ((void (*)(id, SEL, id, int, id, id))objc_msgSend)(model, f1, ds, 0, devId, dn);
+        sent = YES;
+    } @catch (NSException *e) { sent = NO; }
+    if (!sent) { if (cb) cb(nil); return; }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NSArray *list = nil;
+        @try { list = [model valueForKey:@"warnMessageList"]; } @catch (NSException *e) {}
+        if (cb) cb(JAGridEntriesFromMessages(list, day));
     });
 }
 
@@ -1768,6 +1806,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     self.imgURL = [url copy];
     if (!url) {
         self.thumb.image = nil;
+        self.noneLab.text = @"无封面";     // v2.9.18：区分「没地址」和「有地址没下下来」
         self.noneLab.hidden = NO;
         return;
     }
@@ -1778,7 +1817,8 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         return;
     }
     self.thumb.image = nil;
-    self.noneLab.hidden = NO;          // 下载期间先显示占位，不留纯黑
+    self.noneLab.text = @"载入中…";        // v2.9.18：有地址但图还没到，和「无封面」分开显示
+    self.noneLab.hidden = NO;
     __weak typeof(self) ws = self;
     NSString *key = [url copy];
     [[JAGridImageCache shared] loadURL:url completion:^(UIImage *img, NSString *k) {
@@ -1786,7 +1826,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         if (!s) return;
         if (!key || ![s.imgURL isEqualToString:key]) return;
         if (img) { s.thumb.image = img; s.noneLab.hidden = YES; }
-        else { s.noneLab.hidden = NO; }
+        else { s.noneLab.text = @"加载失败"; s.noneLab.hidden = NO; }
     }];
 }
 
@@ -1946,6 +1986,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 @property (nonatomic, assign) long long nextDay;
 @property (nonatomic, assign) BOOL loading;
 @property (nonatomic, assign) BOOL pendingRefresh;   // v2.9.14：滚动中攒下来的刷新
+@property (nonatomic, assign) BOOL coverRefetch;      // v2.9.18：正在静默补一次最新页
 @property (nonatomic, assign) NSInteger emptyStreak;
 @property (nonatomic, assign) BOOL gaveUp;
 @property (nonatomic, assign) NSInteger playIndex;
@@ -2301,11 +2342,13 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         if (shown > 0 && shown == (NSInteger)items.count) {
             self.hintLab.hidden = YES;
             if (self.cacheKey.length) JAGridDayCacheWrite(self.cacheKey, day, items);
+            [self refetchCoversForDay:day];
             return;
         }
         [self appendDay:day items:items];
         if (self.cacheKey.length) JAGridDayCacheWrite(self.cacheKey, day, items);
         self.hintLab.hidden = YES;
+        [self refetchCoversForDay:day];
         return;
     }
     // 网络这次没回，但缓存里已经有这天 → 保留缓存内容，不算“没录像”
@@ -2495,6 +2538,63 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     if (maxY < minY) maxY = minY;
     CGFloat y = atBottom ? maxY : MIN(MAX(off.y, minY), maxY);
     if (fabs(y - off.y) > 0.5) cv.contentOffset = CGPointMake(off.x, y);
+}
+
+// v2.9.18：这一天的条目里还有「完全没有封面地址」的就返回 YES
+- (BOOL)dayHasCoverless:(long long)day {
+    for (NSDictionary *d in self.days) {
+        if ([(NSNumber *)d[@"day"] longLongValue] != day) continue;
+        for (NSDictionary *e in (NSArray *)d[@"items"]) {
+            if ([e[@"imgObj"] isKindOfClass:UIImage.class]) continue;
+            if ([(NSString *)e[@"img"] length]) continue;
+            return YES;
+        }
+        break;
+    }
+    return NO;
+}
+
+// v2.9.18：再请求一次「最新那一页」，把新对象里的封面地址补到已有条目上（只补不重建，不闪）
+- (void)refetchCoversForDay:(long long)day {
+    if (self.coverRefetch || day <= 0 || !self.myCamera) return;
+    if (![self dayHasCoverless:day]) return;
+    self.coverRefetch = YES;
+    __weak typeof(self) ws = self;
+    JAGridFetchFirstPage(self.myCamera, day, ^(NSArray *items) {
+        __strong typeof(ws) s = ws;
+        if (!s) return;
+        s.coverRefetch = NO;
+        if (items.count) [s applyCovers:items day:day];
+    });
+}
+
+// 把 items 里「有封面」的那些按秒号补到已有条目（只补没有图/没有地址的）。
+// 补完刷新一次可见 cell —— 不重建列表。
+- (void)applyCovers:(NSArray *)items day:(long long)day {
+    NSMutableDictionary *bySec = [NSMutableDictionary dictionaryWithCapacity:items.count];
+    for (NSDictionary *e in items) {
+        NSNumber *sec = e[@"sec"];
+        if (![sec isKindOfClass:NSNumber.class]) continue;
+        if ([e[@"imgObj"] isKindOfClass:UIImage.class] || [(NSString *)e[@"img"] length]) {
+            bySec[sec] = e;
+        }
+    }
+    if (!bySec.count) return;
+    for (NSDictionary *d in self.days) {
+        if ([(NSNumber *)d[@"day"] longLongValue] != day) continue;
+        for (NSDictionary *e in (NSArray *)d[@"items"]) {
+            NSNumber *sec = e[@"sec"];
+            NSDictionary *src = [sec isKindOfClass:NSNumber.class] ? bySec[sec] : nil;
+            if (!src || ![e isKindOfClass:NSMutableDictionary.class]) continue;
+            NSMutableDictionary *m = (NSMutableDictionary *)e;
+            if ([m[@"imgObj"] isKindOfClass:UIImage.class]) continue;
+            if ([src[@"imgObj"] isKindOfClass:UIImage.class]) m[@"imgObj"] = src[@"imgObj"];
+            NSString *u = src[@"img"];
+            if ([u isKindOfClass:NSString.class] && u.length) m[@"img"] = u;
+        }
+        break;
+    }
+    [self refreshMissingCovers];
 }
 
 // v2.9.15：只给「还没有图」的可见格子补一次封面 —— 重新从消息对象取地址。
@@ -3202,7 +3302,17 @@ static void JAGridInstallEntryInRow(UIView *cloud, UIView *ai) {
         else [b removeFromSuperview];      // 同一设备的多层叠影，删掉多余的
     }
     if (keep) {
-        // 已有同一设备的入口：只纠正位置 + 刷新 camera，不重建（避免每 0.3s 闪烁）
+        // v2.9.18：同设备已有入口时，不能只挪坐标。列表滚动会让 cell 复用，旧入口此时挂在
+        // 一个已经装了别的设备的容器里 —— 用户看到的现象正是「主界面不动，一滑动第三个就没了」：
+        // 旧入口被当残影清掉，新位置又因为「已存在」跳过了安装。
+        // 这里改成「迁到当前这一行的容器里」，位置一起纠正。
+        if (keep.superview != host) {
+            [keep removeFromSuperview];
+            [host addSubview:keep];
+            objc_setAssociatedObject(keep, &kJAGridEntryMissKey, nil,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            keep.hidden = NO;
+        }
         CGRect f = keep.frame;
         f.origin = CGPointMake(midX - f.size.width / 2.0, midY - f.size.height / 2.0);
         keep.frame = f;
