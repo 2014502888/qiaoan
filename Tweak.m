@@ -1738,6 +1738,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 @property (nonatomic, strong) NSMutableDictionary *codes;      // v2.9.23：失败时的 HTTP 状态码
 @property (nonatomic, strong) NSMutableArray *queue;           // v2.9.15：限并发排队
 @property (nonatomic, assign) NSInteger active;                // 当前在跑的下载数
+@property (nonatomic, strong) NSString *firstFailInfo;         // v2.9.30：第一个失败样本的现场（排查用）
 + (instancetype)shared;
 - (UIImage *)imageForKey:(NSString *)key;
 - (void)loadURL:(NSString *)url completion:(void (^)(UIImage *img, NSString *key))cb;
@@ -1870,13 +1871,21 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
             if (data) { @autoreleasepool { img = [UIImage imageWithData:data]; } }
             if (!img) {
                 // v2.9.23：记 HTTP 状态码（403/404）
+                NSInteger st = 0;
                 if ([resp isKindOfClass:NSHTTPURLResponse.class]) {
-                    NSInteger st = ((NSHTTPURLResponse *)resp).statusCode;
+                    st = ((NSHTTPURLResponse *)resp).statusCode;
                     if (st > 0) self.codes[url] = @(st);
                 } else if (err) {
                     // v2.9.27：连响应都没有 —— 记网络错误码（负数），格子上显示「失败 e-1022」之类，
                     // 才能分清是超时(-1001)、DNS(-1003)、连不上(-1004)、被 ATS 拦(-1022) 还是别的。
-                    self.codes[url] = @(-(err.code));
+                    st = -(err.code);
+                    self.codes[url] = @(st);
+                }
+                // v2.9.30：留一个失败样本现场 —— 完整 URL + 状态码 + 返回字节数。
+                // 只记第一条，够看一次就行，不刷屏。
+                if (!self.firstFailInfo) {
+                    self.firstFailInfo = [NSString stringWithFormat:@"%@ [%ld|%lu]",
+                                          url, (long)st, (unsigned long)(data.length)];
                 }
             }
             if (img) {
@@ -2000,7 +2009,9 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
             // v2.9.27：负数是网络错误码 —— 「失败 e-1022」是被 ATS 拦、e-1001 超时、
             // e-1004 连不上、e-1003 DNS 解析不出来；「失败 地址」是 URL 本身非法，请求没发出去。
             NSInteger st = [[JAGridImageCache shared] statusForURL:key];
-            if (st >= 400) s.noneLab.text = [NSString stringWithFormat:@"失败 %ld", (long)st];
+            // v2.9.30：状态码只要拿到了就显示 —— 包括 200。
+            // 「失败 200」= 服务器正常回应了，但回来的是空内容或非图片，这跟 403 完全两回事。
+            if (st > 0) s.noneLab.text = [NSString stringWithFormat:@"失败 %ld", (long)st];
             else if (st < 0) s.noneLab.text = [NSString stringWithFormat:@"失败 e%ld", (long)st];
             else if (![NSURL URLWithString:key]) s.noneLab.text = @"失败 地址";
             else {
@@ -2861,6 +2872,21 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
                           @"items": @[],
                           @"note": @"当日已全部加载完毕，选择日期重新加载"}];
     }
+    // v2.9.30：排查期临时 —— 有封面失败时，把第一条失败样本的现场顶到底部那行：
+    // 完整 URL + [状态码|返回字节数]。看到它就够定案了（200|0 是空响应，200|5000 是回来的不是图）。
+    // 补完就删掉这段。
+    NSString *failInfo = [JAGridImageCache shared].firstFailInfo;
+    if (failInfo.length && secs.count > 0) {
+        NSDictionary *last = secs.lastObject;
+        if ([last[@"day"] isEqualToNumber:@(0)]) {
+            NSMutableDictionary *md = [last mutableCopy];
+            NSString *shown = failInfo.length > 110 ? [failInfo substringToIndex:110] : failInfo;
+            md[@"note"] = [NSString stringWithFormat:@"封面失败 %@", shown];
+            NSMutableArray *arr = [secs mutableCopy];
+            arr[arr.count - 1] = md;
+            secs = arr;
+        }
+    }
     self.secs = secs;
     self.flat = flat;
     // v2.9.14：正在拖 / 惯性滑动时不重建 —— 否则每页都刷新一次，会打断滑动、位置被拉回，
@@ -3355,6 +3381,7 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     self.didFirstLoad = YES;
     self.loading = NO;
     [self.days removeAllObjects];
+    [JAGridImageCache shared].firstFailInfo = nil;   // v2.9.30：换天重新采一次失败样本
     self.needsScrollTop = YES;      // v2.9.27：换天必须回到顶部，否则看到的是旧位置
     self.nextDay = day;
     [self rebuildLayout];
