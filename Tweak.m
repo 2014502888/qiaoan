@@ -269,6 +269,7 @@
 //   v1.26：清理（本版）。
 
 #import <UIKit/UIKit.h>
+#import <ImageIO/ImageIO.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <stdarg.h>
@@ -1884,7 +1885,24 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     NSURLSessionDataTask *t = [[NSURLSession sharedSession]
         dataTaskWithRequest:rq completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
             UIImage *img = nil;
-            if (data) { @autoreleasepool { img = [UIImage imageWithData:data]; } }
+            if (data) {
+                @autoreleasepool {
+                    img = [UIImage imageWithData:data];
+                    // v2.9.33：UIImage imageWithData 对某些 JPEG 变体（progressive / 特殊 EXIF /
+                    // 尺寸异常）会返回 nil，但数据本身是好的。换 ImageIO 再解一次，它宽容得多。
+                    if (!img && data.length > 8) {
+                        CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
+                        if (src) {
+                            CGImageRef cg = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+                            if (cg) {
+                                img = [UIImage imageWithCGImage:cg];
+                                CGImageRelease(cg);
+                            }
+                            CFRelease(src);
+                        }
+                    }
+                }
+            }
             if (!img) {
                 // v2.9.23：记 HTTP 状态码（403/404）
                 NSInteger st = 0;
@@ -1918,8 +1936,16 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
                         [kvArr addObject:[NSString stringWithFormat:@"%@=%@", ks, v]];
                     }
                     NSString *kvLine = kvArr.count ? [kvArr componentsJoinedByString:@" "] : @"(无签名字段)";
-                    self.firstFailInfo = [NSString stringWithFormat:@"封面失败 [%ld|%lu]\n%@\n%@",
-                                          (long)st, (unsigned long)(data.length), pth, kvLine];
+                    // v2.9.33：把返回数据的前 8 字节打出来 —— 这是最后一块拼图。
+                    // FFD8FFxx = 真 JPEG（那问题在解码这一层）；89504E47 = PNG；
+                    // 其它随机值 = 文件是加密的（OBS 上的文件名带 _enc 就是这个意思）。
+                    NSMutableString *hx = [NSMutableString string];
+                    NSUInteger hn = MIN(data.length, (NSUInteger)8);
+                    const uint8_t *bp = (const uint8_t *)data.bytes;
+                    for (NSUInteger i = 0; i < hn; i++) [hx appendFormat:@"%02X", bp[i]];
+                    self.firstFailInfo = [NSString stringWithFormat:@"封面失败 [%ld|%lu] 头=%@\n%@\n%@",
+                                          (long)st, (unsigned long)(data.length),
+                                          hx.length ? hx : @"空", pth, kvLine];
                 }
             }
             if (img) {
