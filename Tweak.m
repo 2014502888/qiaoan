@@ -140,6 +140,10 @@
 //     改为完全不看 _isLoading，只按结果自适应：翻一页就看列表长度变没变，没变就把同一页
 //     重试（最多 3 次），变了继续，成功翻满 24 页收工；首屏 6s 一条没有才当空天。
 //     这样「请求被官方在途请求吞掉」也能靠重试救回来。
+// v2.9.11：
+//   · 按天缓存换目录（JAGridDays3）。v2.9.9 改了报警时间的算法，旧缓存里的秒是旧规则
+//     算的 —— 复用会让格子定位到错误时刻。换目录即自动作废，用户不用手动清缓存。
+//   · 网络回包条数比本地缓存还少时不覆盖（残缺结果会冲掉好数据、还会把缓存写坏）。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1398,11 +1402,14 @@ static void JAGridFetchMessageDay(id cam, long long day, void (^cb)(NSArray *ite
 
 // ---------- v2.8：按天磁盘缓存（第二次进格子页秒开） ----------
 
+// v2.9.11：目录名带版本号（JAGridDays3）。v2.9.9 改了报警时间的算法（双源校正），
+// 之前缓存的秒是旧规则算出来的，直接复用会让格子定位到错误的时刻、看起来像「读不全」。
+// 换目录 = 旧缓存自动作废，不用用户手动清。
 static NSString *JAGridDayCacheDir(NSString *devKey) {
     NSString *caches = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory,
                                                             NSUserDomainMask, YES) firstObject];
     if (!caches.length || !devKey.length) return nil;
-    NSString *dir = [[caches stringByAppendingPathComponent:@"JAGridDays"]
+    NSString *dir = [[caches stringByAppendingPathComponent:@"JAGridDays3"]
                      stringByAppendingPathComponent:devKey];
     [[NSFileManager defaultManager] createDirectoryAtPath:dir
                               withIntermediateDirectories:YES attributes:nil error:nil];
@@ -2141,6 +2148,14 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     if (items.count > 0) {
         self.emptyStreak = 0;
         [self.knownDays addObject:@(day)];
+        // v2.9.11：网络这次回的条数比本地缓存还少 —— 多半是这一轮翻页没翻全（请求被官方
+        // 在途请求吞掉）。别拿残缺结果把已经拿到的好数据冲掉，连缓存一起写坏。
+        NSArray *cachedNow = self.cacheKey.length ? JAGridDayCacheRead(self.cacheKey, day) : nil;
+        if (cachedNow.count > items.count) {
+            [self appendDay:day items:cachedNow];
+            self.hintLab.hidden = YES;
+            return;
+        }
         [self appendDay:day items:items];
         if (self.cacheKey.length) JAGridDayCacheWrite(self.cacheKey, day, items);
         self.hintLab.hidden = YES;
