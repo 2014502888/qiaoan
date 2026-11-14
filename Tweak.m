@@ -2828,6 +2828,17 @@ static id JAGridCameraForView(UIView *v) {
 // 上一层容器里，只按「同一 host + midX」判重会漏掉，结果一张卡片上叠出两个
 // 「格子回放」（其中一个是旧层级里的残影，点它自然解析不到设备）。
 // v2.9.5：收集窗口里全部入口 box（不限坐标），用于按设备身份去重 / 清残影
+static void JAGridCollectAllEntries(UIView *root, NSMutableArray *out, int depth) {
+    if (!root || depth > 10) return;
+    for (UIView *s in root.subviews) {
+        if (s.tag == JAGridEntryTag) {
+            [out addObject:s];      // 入口内部只有 icon/lab，不必再往下钻
+        } else {
+            JAGridCollectAllEntries(s, out, depth + 1);
+        }
+    }
+}
+
 static char kJAGridEntryMissKey = 0;
 
 // v2.9.12：入口是否还挂在正确的位置 —— 从它往上找，扫到 cell / 列表边界为止，
