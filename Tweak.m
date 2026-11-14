@@ -1001,6 +1001,16 @@ static id JAMsgListVCFor(id cam) {
     @try { return g_msgListVCs[k]; } @catch (NSException *e) { return nil; }
 }
 
+// v2.9.2 崩溃根因：官方把 finish 回调存起来、在网络回来之后才调。
+// 若这里传 `^{}`（栈 block），函数一返回它就失效，异步调到时就是
+// 「向已释放对象发消息」→ SIGABRT（.ips 里正是 __forwarding__ + 网络回调链）。
+// 所以统一用一份长驻的堆 block：全局强引用，永不回收。
+static id g_noopFinishBlock = nil;
+static id JANoopFinish(void) {
+    if (!g_noopFinishBlock) g_noopFinishBlock = (id)[^(BOOL ok){} copy];
+    return g_noopFinishBlock;
+}
+
 static NSString *JAGridDeviceName(id cam) {
     for (NSString *k in @[@"name", @"deviceName", @"devName", @"nickName", @"remark"]) {
         id v = JAVal(cam, k);
@@ -1744,9 +1754,8 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 
     SEL ldf = NSSelectorFromString(@"loadDataFirstWithDate:showHud:isTableRefresh:finish:");
     if (![vc respondsToSelector:ldf]) { if (cb) cb(nil); return; }
-    // finish 的 block 签名未知（@?），传一个无参空 block 最安全：
-    // 就算它按 (BOOL) 调用，多余参数也被忽略
-    id noopFinish = ^{};
+    // finish 由官方异步调用，必须给长驻堆 block（栈 block 会失效→闪退）
+    id noopFinish = JANoopFinish();
     BOOL sent = NO;
     @try {
         ((void (*)(id, SEL, id, BOOL, BOOL, id))objc_msgSend)(vc, ldf, ds, NO, NO, noopFinish);
@@ -1794,7 +1803,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
             SEL lm = NSSelectorFromString(@"loadMoreFirstDateWithShowHud:isTableRefresh:finish:");
             if ([mvc respondsToSelector:lm]) {
                 @try {
-                    id noop2 = ^{};
+                    id noop2 = JANoopFinish();
                     ((void (*)(id, SEL, BOOL, BOOL, id))objc_msgSend)(mvc, lm, NO, NO, noop2);
                     ml += 1;
                     st = 0;
