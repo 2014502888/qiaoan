@@ -194,6 +194,12 @@
 //   · 进格子页先藏掉官方播放器残留的「回放倍数选择」浮层（它正好压在日期抬头上面），
 //     离开页面再放回去，官方播放页照常可用。
 //   · 日期抬头量宽改成「先按不换行量，再夹到可用宽度」—— 窄宽下不会只剩一个字。
+// v2.9.21：
+//   · 封面候选禁止是视频。键表里 event_file_url 排在第二位，第二台设备没有
+//     eventPicThumbUrl，就一路被 event_file_url（录像地址 mp4/ts）当成封面下载，
+//     UIImage 解不出来 —— 现象正是「载入中很久 → 加载失败」，而别的设备都正常。
+//     视频类字段挪到末尾，统一过「不许是视频」的过滤。
+//   · 失败时格子上带后缀：「失败.mp4」= 拿到的是录像；「失败.jpg」= 地址对但下载被拒。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -988,6 +994,42 @@ static NSArray *JAGridFindEvents(id vc) {
 
 // ---------- 事件字段读取 ----------
 
+// v2.9.21：这个地址是不是「视频」。key 表里 event_file_url 排在很前面，第二台设备没有
+// eventPicThumbUrl 字段，就一路落到 event_file_url（录像地址）当封面用 —— 下载回来是
+// mp4/ts，UIImage 解不出来，格子上就一直「载入中」然后「加载失败」。
+// 这是「别的设备都正常、只有第二台没图」最可能的病因。
+static BOOL JAGridLooksLikeVideo(NSString *u) {
+    if (![u isKindOfClass:NSString.class]) return NO;
+    NSString *low = u.lowercaseString;
+    if ([low containsString:@".mp4"] || [low containsString:@".m3u8"] ||
+        [low containsString:@".m4v"] || [low containsString:@".ts"] ||
+        [low containsString:@".avi"] || [low containsString:@".mov"] ||
+        [low containsString:@".mkv"] || [low containsString:@".flv"] ||
+        [low containsString:@".h264"] || [low containsString:@".mpg"]) return YES;
+    return NO;
+}
+
+static BOOL JAGridLooksLikeImage(NSString *u) {
+    if (![u isKindOfClass:NSString.class] || u.length < 8) return NO;
+    if (JAGridLooksLikeVideo(u)) return NO;
+    NSString *low = u.lowercaseString;
+    if ([low containsString:@".jpg"] || [low containsString:@".jpeg"] ||
+        [low containsString:@".png"] || [low containsString:@".webp"] ||
+        [low containsString:@".bmp"] || [low containsString:@"pic"] ||
+        [low containsString:@"thumb"] || [low containsString:@"snap"] ||
+        [low containsString:@"image"] || [low containsString:@"cover"] ||
+        [low containsString:@"img"]) return YES;
+    return NO;
+}
+
+// v2.9.21：封面候选过滤 —— 视频地址直接丢掉，别当封面下载
+static NSString *JAGridPickImage(NSString *u) {
+    if (!u) return nil;
+    if (JAGridLooksLikeVideo(u)) return nil;
+    return u;
+}
+
+
 // v2.6：封面地址归一化（补协议 / 丢弃无法解析的相对路径）
 static NSString *JAGridNormalizeURL(NSString *u) {
     if (![u isKindOfClass:NSString.class]) return nil;
@@ -1047,20 +1089,23 @@ static NSString *JAGridImageURL(id ev) {
     // 键名 eventPicThumbUrl 优先；其次 event_file_url（原图/大图）。
     id thumb = JAVal(ev, @"eventPicThumbUrl");
     if ([thumb isKindOfClass:NSString.class]) {
-        NSString *u = JAGridNormalizeURL((NSString *)thumb);
+        NSString *u = JAGridPickImage(JAGridNormalizeURL((NSString *)thumb));
         if (u) return u;
     }
     // v2.6：键名扩到常见的封面/抓拍字段（不同设备的报警模型字段不一样）
-    NSArray *keys = @[@"event_file_url", @"event_pic_url", @"event_pic", @"picUrl",
+    NSArray *keys = @[@"eventPicUrl", @"event_pic_url", @"event_pic", @"picUrl",
                       @"pic_url", @"event_img", @"imageUrl", @"snapUrl", @"eventImagePath",
-                      @"recordFileUrl", @"record_file_url", @"fileUrl", @"file_url",
-                      @"coverUrl", @"thumbUrl", @"imgUrl", @"eventPicUrl",
+                      @"coverUrl", @"thumbUrl", @"imgUrl",
                       @"pic", @"cover", @"coverImg", @"coverPic", @"coverPicUrl",
                       @"videoCoverUrl", @"eventCoverUrl", @"eventCover", @"snapshotUrl",
                       @"snapPic", @"snapPicUrl", @"thumb", @"image", @"eventImage",
-                      @"eventImageUrl", @"img", @"picPath", @"imagePath", @"localCoverPath"];
+                      @"eventImageUrl", @"img", @"picPath", @"imagePath", @"localCoverPath",
+                      @"event_file_url", @"recordFileUrl", @"record_file_url",
+                      @"fileUrl", @"file_url"];
+    // v2.9.21：视频类字段挪到最后，并且统一过一道「不许是视频」的过滤 ——
+    // 之前的顺序让 event_file_url 抢了第二台设备的封面，下载 mp4 必然解不出图。
     for (NSString *k in keys) {
-        NSString *u = JAGridNormalizeURL(JAVal(ev, k));
+        NSString *u = JAGridPickImage(JAGridNormalizeURL(JAVal(ev, k)));
         if (u) return u;
     }
     // v2.9.5：字段名兜底 —— 不同型号 / 不同云通道（Jooan / 阿里云存量）的报警模型字段
@@ -1097,12 +1142,11 @@ static NSString *JAGridImageURL(id ev) {
     if (ivs) free(ivs);
 
     for (NSString *u in absUrls) {
-        NSString *low = u.lowercaseString;
-        if ([low containsString:@".jpg"] || [low containsString:@".jpeg"] ||
-            [low containsString:@".png"] || [low containsString:@".webp"] ||
-            [low containsString:@"pic"] || [low containsString:@"thumb"] ||
-            [low containsString:@"snap"] || [low containsString:@"image"] ||
-            [low containsString:@"cover"]) return u;
+        if (JAGridLooksLikeImage(u)) return u;
+    }
+    // v2.9.21：没有明确像图片的，退一步取第一个「不是视频」的地址
+    for (NSString *u in absUrls) {
+        if (!JAGridLooksLikeVideo(u)) return u;
     }
     // 相对路径：借同对象里第一个 http 地址的 scheme+host 拼成绝对地址
     NSString *origin = nil;
@@ -1117,11 +1161,11 @@ static NSString *JAGridImageURL(id ev) {
     if (origin.length) {
         for (NSString *rel in relUrls) {
             NSString *full = [origin stringByAppendingString:rel];
-            NSString *low = full.lowercaseString;
-            if ([low containsString:@".jpg"] || [low containsString:@".jpeg"] ||
-                [low containsString:@".png"] || [low containsString:@".webp"] ||
-                [low containsString:@"pic"] || [low containsString:@"thumb"] ||
-                [low containsString:@"snap"] || [low containsString:@"image"]) return full;
+            if (JAGridLooksLikeImage(full)) return full;
+        }
+        for (NSString *rel in relUrls) {
+            NSString *full = [origin stringByAppendingString:rel];
+            if (!JAGridLooksLikeVideo(full)) return full;
         }
     }
 
@@ -1844,7 +1888,14 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         if (!s) return;
         if (!key || ![s.imgURL isEqualToString:key]) return;
         if (img) { s.thumb.image = img; s.noneLab.hidden = YES; }
-        else { s.noneLab.text = @"加载失败"; s.noneLab.hidden = NO; }
+        else {
+            // v2.9.21：把后缀带出来 —— 显示「失败.mp4」就说明拿到的根本不是图，
+            // 显示「失败.jpg」才是地址对但下载被拒，两者修法完全不同。
+            NSString *ext = [[NSURL URLWithString:key] pathExtension].lowercaseString;
+            s.noneLab.text = ext.length ? [NSString stringWithFormat:@"失败.%@", ext]
+                                        : @"加载失败";
+            s.noneLab.hidden = NO;
+        }
     }];
 }
 
