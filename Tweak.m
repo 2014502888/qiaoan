@@ -125,6 +125,15 @@
 //     还在请求（_isLoading）的窗口，此时翻页会被它吞掉 → 这一页「一条没多」→ 提前收工。
 //     现在恢复「连续 2 次不增长」，并在翻页前先看 _isLoading，忙就等它跑完再翻。
 //   · 加回官方 SD 回放页自带的时间轴 / 拖动条（v2.6 曾主动隐藏，用户要能自己拖）。
+// v2.9.9：
+//   · 报警时间改为「双源校正」：eid / 时间戳解析出的秒，与消息列表上直接显示的
+//     HH:mm:ss 比对，都在当天且相差 ≤5 分钟才用解析值，否则以显示时间为准。
+//     第二台就是解析结果和显示时间对不上 —— 既让它整天的记录被当成「不在本天」丢掉，
+//     又让「查看录像」（官方页和格子页同一个 hook）定位到不存在的时刻、播不起来、
+//     回落到实时流。这条同时修了「条数少」和「定位不对」。
+//   · 封面再兜一层：递归扫字段值里的字典 / 数组 / JSON 字符串（有的型号把抓拍图塞在
+//     eventData 里，不在顶层字段上）。
+//   · 去掉自动连播（35 秒自动跳下一格），播放节奏完全交给用户。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -448,6 +457,10 @@ static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
 static void ja_rtc_viewDidAppear(id self, SEL _cmd);
 static void ja_rtc_viewDidDisappear(id self, SEL _cmd);
 static void JATimeLineSyncToSec(id sdVC, long long sec);
+// v2.9.9：报警时间的「双源校正」—— 用列表上直接显示的 HH:mm:ss 反推秒，跟 eid/时间戳
+// 解析出来的比对，偏差大就以显示时间为准（第二台就是 eid 解析结果和显示时间对不上）。
+static long long JAGridDayFromMessage(id msg);
+static long long JAGridSecForMessage(id msg, long long day);
 static NSArray *JAGridFindEvents(id vc);
 static NSNumber *JAGridTimestamp(id ev);
 
@@ -509,16 +522,23 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     if (warn) {
         JASet(vc, @"currentEvent", warn);
         NSNumber *ts = JABuildTimestamp(warn);
-        if (ts) JASet(vc, @"currentTimeStamp", ts);
-        // 校验秒范围：10 位秒级（1.0e9 ~ 9.9e9），防止再传毫秒
-        long long tv = ts ? ts.longLongValue : 0;
-        // 记录报警时间戳（秒），RTC viewDidAppear 后自动 startSDPlayWithSelectTimeStamp:
-        if (tv >= 1000000000LL && tv < 10000000000LL) g_rtcTargetSec = tv;
+        // v2.9.9：这个秒如果和消息列表上显示的时间不一致，官方「查看录像」也会定错位
+        // （第二台的情况：定位了不播、又回到实时）。统一走双源校正。
+        long long d0 = JAGridDayFromMessage(warn);
+        if (d0 <= 0) d0 = JADayStartSec(ts);
+        long long fixed = JAGridSecForMessage(warn, d0);
+        if (fixed > 0) {
+            JASet(vc, @"currentTimeStamp", @(fixed));
+            g_rtcTargetSec = fixed;
+        } else {
+            if (ts) JASet(vc, @"currentTimeStamp", ts);
+            long long tv0 = ts ? ts.longLongValue : 0;
+            if (tv0 >= 1000000000LL && tv0 < 10000000000LL) g_rtcTargetSec = tv0;
+        }
         // 预设设备 SD 选中日期 = 报警日 0 点秒 —— RTC setupData（0x100af6104）会
         // 读 myCamera.sdSelectiontDay → 加载该日事件列表
-        long long dayStart = JADayStartSec(ts);
-        if (dayStart > 0 && cam) {
-            JASet(cam, @"sdSelectiontDay", @(dayStart));
+        if (d0 > 0 && cam) {
+            JASet(cam, @"sdSelectiontDay", @(d0));
         }
     }
 
@@ -918,6 +938,50 @@ static NSString *JAGridNormalizeURL(NSString *u) {
     return nil;
 }
 
+// v2.9.9：在任意对象里递归找图片地址 —— 有的型号把抓拍图塞在 eventData（字典或 JSON
+// 字符串）里，不在任何顶层字段上，逐字段扫永远扫不到。
+static NSString *JAGridFindURLIn(id obj, int depth) {
+    if (!obj || depth < 0) return nil;
+    if ([obj isKindOfClass:NSString.class]) {
+        NSString *s = (NSString *)obj;
+        if (s.length < 8 || s.length > 4096) return nil;
+        if ([s hasPrefix:@"http://"] || [s hasPrefix:@"https://"]) {
+            NSString *low = s.lowercaseString;
+            if ([low containsString:@".jpg"] || [low containsString:@".jpeg"] ||
+                [low containsString:@".png"] || [low containsString:@".webp"] ||
+                [low containsString:@"pic"] || [low containsString:@"thumb"] ||
+                [low containsString:@"snap"] || [low containsString:@"image"] ||
+                [low containsString:@"cover"]) return s;
+            return nil;
+        }
+        NSString *t = [s stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (t.length > 2 && ([t hasPrefix:@"{"] || [t hasPrefix:@"["])) {
+            NSData *d = [t dataUsingEncoding:NSUTF8StringEncoding];
+            id j = nil;
+            @try { j = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil]; }
+            @catch (NSException *e) { j = nil; }
+            if (j) return JAGridFindURLIn(j, depth - 1);
+        }
+        return nil;
+    }
+    if ([obj isKindOfClass:NSDictionary.class]) {
+        for (id k in (NSDictionary *)obj) {
+            NSString *r = JAGridFindURLIn([(NSDictionary *)obj objectForKey:k], depth - 1);
+            if (r) return r;
+        }
+        return nil;
+    }
+    if ([obj isKindOfClass:NSArray.class]) {
+        for (id v in (NSArray *)obj) {
+            NSString *r = JAGridFindURLIn(v, depth - 1);
+            if (r) return r;
+        }
+        return nil;
+    }
+    return nil;
+}
+
 static NSString *JAGridImageURL(id ev) {
     // v2.8：消息模型（JAEMWarnInfoEntityModel）的抓拍图就是消息列表里那张缩略图，
     // 键名 eventPicThumbUrl 优先；其次 event_file_url（原图/大图）。
@@ -958,7 +1022,12 @@ static NSString *JAGridImageURL(id ev) {
         // SIGSEGV（objc_retain @ JAGridImageURL，第二台设备点格子播放、RTC 定位找事件时必崩）。
         // KVC 会按 ivar 类型装箱：标量变 NSNumber，对象才是对象，安全。
         @try { v = [ev valueForKey:key]; } @catch (NSException *e) { v = nil; }
-        if (![v isKindOfClass:NSString.class]) continue;
+        if (![v isKindOfClass:NSString.class]) {
+            // v2.9.9：嵌套结构（字典 / 数组 / JSON 字符串）里也可能藏着抓拍图
+            NSString *deep = JAGridFindURLIn(v, 2);
+            if (deep) { if (ivs) free(ivs); return deep; }
+            continue;
+        }
         NSString *s = [(NSString *)v stringByTrimmingCharactersInSet:
                        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (s.length < 8 || s.length > 2048) continue;
@@ -1100,12 +1169,77 @@ static NSString *JAGridDeviceName(id cam) {
     return @"";
 }
 
-// 一条报警消息 → 格子 entry（sec 复用 v2.5 已验证的解析链）
+// v2.9.9：从消息对象里取报警日的 0 点秒（event_date 最可靠，没有就退回时间戳推算）
+static long long JAGridDayFromMessage(id msg) {
+    if (!msg) return -1;
+    for (NSString *k in @[@"event_date", @"eventDate", @"day", @"dateStr", @"eventDateStr",
+                          @"date", @"showDate"]) {
+        id v = JAVal(msg, k);
+        if (![v isKindOfClass:NSString.class]) continue;
+        NSString *s = (NSString *)v;
+        NSRegularExpression *re = [NSRegularExpression
+            regularExpressionWithPattern:@"(\\d{4})-(\\d{1,2})-(\\d{1,2})" options:0 error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:s options:0 range:NSMakeRange(0, s.length)];
+        if (!m || m.numberOfRanges < 4) continue;
+        NSInteger y = [[s substringWithRange:[m rangeAtIndex:1]] integerValue];
+        NSInteger mo = [[s substringWithRange:[m rangeAtIndex:2]] integerValue];
+        NSInteger da = [[s substringWithRange:[m rangeAtIndex:3]] integerValue];
+        if (y < 2000 || mo < 1 || mo > 12 || da < 1 || da > 31) continue;
+        NSDateComponents *c = [[NSDateComponents alloc] init];
+        c.year = y; c.month = mo; c.day = da;
+        NSCalendar *cal = [[NSCalendar alloc] initWithCalendarIdentifier:NSCalendarIdentifierGregorian];
+        cal.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:8 * 3600];
+        NSDate *d = [cal dateFromComponents:c];
+        if (d) return (long long)[d timeIntervalSince1970];
+    }
+    return -1;
+}
+
+// 消息列表上直接显示的时刻（timeLabelStr 等，形如 23:46:05）→ 当天秒
+static long long JAGridSecFromLabel(id msg, long long day) {
+    if (day <= 0) return -1;
+    for (NSString *k in @[@"timeLabelStr", @"showMessage", @"eventDesc", @"message", @"timeStr"]) {
+        id v = JAVal(msg, k);
+        if (![v isKindOfClass:NSString.class]) continue;
+        NSString *s = (NSString *)v;
+        if (s.length < 5) continue;
+        NSRegularExpression *re = [NSRegularExpression
+            regularExpressionWithPattern:@"(\\d{1,2}):(\\d{2}):(\\d{2})" options:0 error:nil];
+        NSTextCheckingResult *m = [re firstMatchInString:s options:0 range:NSMakeRange(0, s.length)];
+        if (!m || m.numberOfRanges < 4) continue;
+        NSInteger h = [[s substringWithRange:[m rangeAtIndex:1]] integerValue];
+        NSInteger mi = [[s substringWithRange:[m rangeAtIndex:2]] integerValue];
+        NSInteger se = [[s substringWithRange:[m rangeAtIndex:3]] integerValue];
+        if (h < 0 || h > 23 || mi < 0 || mi > 59 || se < 0 || se > 59) continue;
+        return day + (long long)h * 3600 + (long long)mi * 60 + (long long)se;
+    }
+    return -1;
+}
+
+// 双源校正：eid/时间戳解析 vs 列表显示时间。两个都在当天且相差 ≤5 分钟就用解析值，
+// 否则用显示时间 —— 显示时间是用户眼睛看到的那条，必须一致。
+static long long JAGridSecForMessage(id msg, long long day) {
+    if (!msg) return -1;
+    long long a = -1;
+    NSNumber *ts = JABuildTimestamp(msg);
+    if (ts) a = ts.longLongValue;
+    long long b = JAGridSecFromLabel(msg, day);
+    BOOL aOk = (a >= day && a < day + 86400LL);
+    BOOL bOk = (b >= day && b < day + 86400LL);
+    if (day <= 0) return (a > 0) ? a : b;
+    if (aOk && bOk) {
+        long long d = (a > b) ? (a - b) : (b - a);
+        return (d <= 300) ? a : b;
+    }
+    if (bOk) return b;
+    if (aOk) return a;
+    return -1;
+}
+
+// 一条报警消息 → 格子 entry（sec 用 v2.9.9 的双源校正）
 static NSDictionary *JAGridEntryFromMessage(id msg, long long day) {
     if (!msg) return nil;
-    NSNumber *ts = JABuildTimestamp(msg);
-    if (!ts) return nil;
-    long long sec = ts.longLongValue;
+    long long sec = JAGridSecForMessage(msg, day);
     if (sec < day || sec >= day + 86400LL) return nil;     // 只收本天
     NSMutableDictionary *e = [NSMutableDictionary dictionary];
     e[@"sec"] = @(sec);
@@ -1691,7 +1825,6 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 @property (nonatomic, strong) NSMutableArray *retained; // 借用中的官方 dataVC（保活）
 @property (nonatomic, assign) long long nextDay;
 @property (nonatomic, assign) BOOL loading;
-@property (nonatomic, assign) BOOL autoNext;
 @property (nonatomic, assign) NSInteger emptyStreak;
 @property (nonatomic, assign) BOOL gaveUp;
 @property (nonatomic, assign) NSInteger playIndex;
@@ -1752,7 +1885,6 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     self.secs = [NSMutableArray array];
     self.flat = [NSMutableArray array];
     self.retained = [NSMutableArray array];
-    self.autoNext = YES;
     self.playIndex = -1;
     self.emptyStreak = 0;
     self.nextDay = JAGridTodayStart();
@@ -2302,25 +2434,8 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         [p.view addSubview:lab];
     });
 
-    // 35 秒后自动跳下一格
-    if (self.autoNext) {
-        __weak typeof(self) ws = self;
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(35.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            __strong typeof(ws) s = ws;
-            if (!s) return;
-            if (vc != g_activeSDPlayer) return;         // 用户已手动返回或切了别的
-            if (nav.topViewController != vc) return;
-            [nav popViewControllerAnimated:NO];
-            if (index + 1 < (NSInteger)s.flat.count) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    [s openPlayerAtIndex:index + 1];
-                });
-            }
-            // v2.9.4：连播到这一天最后一格就停（一天一屏，不再自动读前一天）
-        });
-    }
+    // v2.9.9：自动连播（35 秒自动跳下一格）已按用户要求去掉 —— 拖动条回来了，
+    // 播放完全由用户自己控制。
 }
 
 // ---------- v2.8：右上角日期选择器（月历 + 有录像日期红点） ----------
