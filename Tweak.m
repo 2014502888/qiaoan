@@ -153,6 +153,12 @@
 //   · 格子页改成「边读边显示」：以前要等翻满 24 页才一次性上屏，用户盯着
 //     「正在读取该日录像…」等几十秒。现在每翻到一页就把这批格子推上去（最新的在最上面），
 //     后台继续往早补，先看到最近这段时间，再慢慢补到当天最早的一条。
+// v2.9.14：
+//   · 治「每补一页闪一下」的三个源头：
+//     ① 重建时滚动位置被重置 → 保存并恢复 contentOffset，原来在底部等数据的继续贴底；
+//     ② 正在拖 / 惯性滑动时不重建，攒到松手再一次性刷新；
+//     ③ 同一张封面图只发一个下载请求（否则每次重建都重复请求，图在占位与图片之间跳）；
+//     ④ 收工那次如果条数没变就跳过重建。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1551,6 +1557,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 
 @interface JAGridImageCache : NSObject
 @property (nonatomic, strong) NSCache *mem;
+@property (nonatomic, strong) NSMutableDictionary *inflight;   // v2.9.14：同 URL 去重
 + (instancetype)shared;
 - (UIImage *)imageForKey:(NSString *)key;
 - (void)loadURL:(NSString *)url completion:(void (^)(UIImage *img, NSString *key))cb;
@@ -1568,6 +1575,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     if (self) {
         _mem = [[NSCache alloc] init];
         _mem.countLimit = 160;
+        _inflight = [NSMutableDictionary dictionary];
     }
     return self;
 }
@@ -1587,8 +1595,22 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     if (!url.length || ![url hasPrefix:@"http"]) { if (cb) cb(nil, url); return; }
     UIImage *c = [self imageForKey:url];
     if (c) { if (cb) cb(c, url); return; }
+    // v2.9.14：同一个 URL 只发一个请求。边读边显示会一层层重建 cell，不去重就会对同一张图
+    // 反复发请求，图片在「占位 → 加载出来」之间来回跳，看起来就是闪。
+    NSMutableArray *wait = (NSMutableArray *)self.inflight[url];
+    if (wait) {
+        if (cb) [wait addObject:[cb copy]];
+        return;
+    }
+    wait = [NSMutableArray array];
+    if (cb) [wait addObject:[cb copy]];
+    self.inflight[url] = wait;
     NSURL *u = [NSURL URLWithString:url];
-    if (!u) { if (cb) cb(nil, url); return; }
+    if (!u) {
+        [self.inflight removeObjectForKey:url];
+        if (cb) cb(nil, url);
+        return;
+    }
     NSURLSessionDataTask *t = [[NSURLSession sharedSession]
         dataTaskWithURL:u completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
             UIImage *img = nil;
@@ -1598,7 +1620,11 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
                 NSString *dp = JAGridDiskPathForKey(url);
                 if (dp.length) [data writeToFile:dp atomically:YES];
             }
-            dispatch_async(dispatch_get_main_queue(), ^{ if (cb) cb(img, url); });
+            dispatch_async(dispatch_get_main_queue(), ^{
+                NSArray *ws = [self.inflight[url] copy];
+                [self.inflight removeObjectForKey:url];
+                for (void (^b)(UIImage *, NSString *) in ws) { if (b) b(img, url); }
+            });
         }];
     [t resume];
 }
@@ -1855,6 +1881,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 @property (nonatomic, strong) NSMutableArray *retained; // 借用中的官方 dataVC（保活）
 @property (nonatomic, assign) long long nextDay;
 @property (nonatomic, assign) BOOL loading;
+@property (nonatomic, assign) BOOL pendingRefresh;   // v2.9.14：滚动中攒下来的刷新
 @property (nonatomic, assign) NSInteger emptyStreak;
 @property (nonatomic, assign) BOOL gaveUp;
 @property (nonatomic, assign) NSInteger playIndex;
@@ -2186,6 +2213,20 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
             self.hintLab.hidden = YES;
             return;
         }
+        // v2.9.14：进度回调已经把同一批数据上屏了，收工这一次条数没变就别再重建 ——
+        // 再重建一次就是用户说的「读取完毕时闪一下」。
+        NSInteger shown = 0;
+        for (NSDictionary *d in self.days) {
+            if ([(NSNumber *)d[@"day"] longLongValue] == day) {
+                shown = (NSInteger)[(NSArray *)d[@"items"] count];
+                break;
+            }
+        }
+        if (shown > 0 && shown == (NSInteger)items.count) {
+            self.hintLab.hidden = YES;
+            if (self.cacheKey.length) JAGridDayCacheWrite(self.cacheKey, day, items);
+            return;
+        }
         [self appendDay:day items:items];
         if (self.cacheKey.length) JAGridDayCacheWrite(self.cacheKey, day, items);
         self.hintLab.hidden = YES;
@@ -2303,7 +2344,37 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     }
     self.secs = secs;
     self.flat = flat;
-    [self.cv reloadData];
+    // v2.9.14：正在拖 / 惯性滑动时不重建 —— 否则每页都刷新一次，会打断滑动、位置被拉回，
+    // 看起来就是「闪一下」。先攒着，等手停下再一次性刷。
+    UICollectionView *cv = self.cv;
+    if (!cv) return;
+    if (cv.isDragging || cv.isDecelerating || cv.isTracking) {
+        self.pendingRefresh = YES;
+        return;
+    }
+    [self applyLayoutKeepingOffset];
+}
+
+// v2.9.14：重建表格但保住滚动位置 —— 原来停在底部的继续贴底（数据在末尾增长），
+// 否则原位不动。避免「位置被弹回去」造成的闪烁。
+- (void)applyLayoutKeepingOffset {
+    UICollectionView *cv = self.cv;
+    if (!cv) return;
+    self.pendingRefresh = NO;
+    CGPoint off = cv.contentOffset;
+    CGFloat insetTop = cv.adjustedContentInset.top;
+    CGFloat insetBottom = cv.adjustedContentInset.bottom;
+    CGFloat oldH = cv.contentSize.height;
+    BOOL atBottom = (oldH > 0 &&
+                     off.y + cv.bounds.size.height - insetBottom >= oldH - 8.0);
+    [cv reloadData];
+    [cv layoutIfNeeded];
+    CGFloat newH = cv.contentSize.height;
+    CGFloat minY = -insetTop;
+    CGFloat maxY = newH - cv.bounds.size.height + insetBottom;
+    if (maxY < minY) maxY = minY;
+    CGFloat y = atBottom ? maxY : MIN(MAX(off.y, minY), maxY);
+    if (fabs(y - off.y) > 0.5) cv.contentOffset = CGPointMake(off.x, y);
 }
 
 // ---------- 集合视图 ----------
@@ -2387,6 +2458,15 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 // v2.9.4：不再滚到底自动读前一天 —— 一天一屏，换天走右上角日期选择器。
 // （旧实现滚到底就 loadOneMoreDay，于是「14 号读到一半突然变成 13 号」。）
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
+}
+
+// v2.9.14：手停下来就把滚动期间攒下的刷新补上（边读边显示时数据在持续增长）
+- (void)scrollViewDidEndDragging:(UIScrollView *)scrollView willDecelerate:(BOOL)decelerate {
+    if (!decelerate && self.pendingRefresh) [self applyLayoutKeepingOffset];
+}
+
+- (void)scrollViewDidEndDecelerating:(UIScrollView *)scrollView {
+    if (self.pendingRefresh) [self applyLayoutKeepingOffset];
 }
 
 // ---------- 点开播放 ----------
