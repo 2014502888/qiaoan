@@ -171,6 +171,12 @@
 //   · 历史日期（不是今天）已经有缓存就直接收工，不再从头翻一遍网络 —— 之前是「缓存上屏之后
 //     照样翻 24 页」，所以会出现「13 号秒显示、却一直在加载」。今天仍然会刷新（可能还有新报警）。
 //   · 缓存按天自动清理，只留最近 30 天（每天一个 plist，一条只存「秒 + 封面地址」，占用很小）。
+// v2.9.17：
+//   · 同一天整体替换前继承旧条目已有的封面 —— 网络新数据对某些设备抓拍地址是空的，
+//     直接覆盖会让已经显示出来的封面先消失再慢慢回来（读第四台时看到的那种闪）。
+//   · 封面失败重试放到 4 次（2s/4s/8s/16s），补封面的时间点延到 20s、35s。
+//   · 入口残影清理改为「先隐藏、连续 12 次才真删」—— 从别的格子页返回时第三台那个 cell
+//     有几拍扫不到文字，以前删掉就不再重装，表现是「进去过一次，回来入口就没了」。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1674,10 +1680,11 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
                 if (dp.length) [data writeToFile:dp atomically:YES];
             }
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (img || retry >= 2) { [self jaFinish:url image:img]; return; }
-                // 失败自动重试两次（1s、2s）—— 官方列表靠滑动重新拉才出图，这里直接补
+                if (img || retry >= 4) { [self jaFinish:url image:img]; return; }
+                // v2.9.17：失败自动重试 4 次（2s、4s、8s、16s）。第二台那个设备首屏那几张图
+                // 第一次必失败（官方列表也要滑一下重新请求才出图），窗口给足才抓得到。
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                             (int64_t)((1.0 + retry) * NSEC_PER_SEC)),
+                                             (int64_t)((2.0 * (double)(1 << retry)) * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
                     [self jaFetch:url retry:retry + 1];
                 });
@@ -2095,7 +2102,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     // 可能还没填到消息对象上 —— 官方消息列表里那几条也是滑动之后才出图的。这里只补图，
     // 不重建列表，所以不会闪。
     __weak typeof(self) wself = self;
-    for (NSNumber *d in @[@1.2, @3.0, @6.0, @12.0]) {
+    for (NSNumber *d in @[@1.2, @3.0, @6.0, @12.0, @20.0, @35.0]) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      (int64_t)(d.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
@@ -2319,6 +2326,48 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     self.hintLab.hidden = YES;
 }
 
+// v2.9.17：同一天整体替换前，把旧条目里已经拿到的封面继承过来。
+// 某些设备网络刚回来的消息对象抓拍地址是空的（官方列表也要滑一下才出图），
+// 直接拿新数组覆盖会让本来有图的格子先变回「无封面」，过一会才补上 ——
+// 用户看到的就是「读取完闪一下、封面没了，等十几秒又出来」。
+- (NSArray *)mergeCovers:(NSArray *)items forDay:(long long)day {
+    if (!items.count) return items;
+    NSArray *oldItems = nil;
+    for (NSDictionary *d in self.days) {
+        if ([(NSNumber *)d[@"day"] longLongValue] == day) {
+            oldItems = (NSArray *)d[@"items"];
+            break;
+        }
+    }
+    if (!oldItems.count) return items;
+    NSMutableDictionary *oldBySec = [NSMutableDictionary dictionary];
+    for (NSDictionary *e in oldItems) {
+        NSNumber *sec = e[@"sec"];
+        if (![sec isKindOfClass:NSNumber.class]) continue;
+        if ([e[@"imgObj"] isKindOfClass:UIImage.class] || [(NSString *)e[@"img"] length]) {
+            oldBySec[sec] = e;
+        }
+    }
+    if (!oldBySec.count) return items;
+    NSMutableArray *out = [NSMutableArray arrayWithCapacity:items.count];
+    for (NSDictionary *e in items) {
+        NSNumber *sec = e[@"sec"];
+        NSDictionary *old = [sec isKindOfClass:NSNumber.class] ? oldBySec[sec] : nil;
+        BOOL newHasCover = ([e[@"imgObj"] isKindOfClass:UIImage.class] ||
+                            [(NSString *)e[@"img"] length]);
+        if (old && !newHasCover) {
+            NSMutableDictionary *m = [e mutableCopy];
+            if ([old[@"imgObj"] isKindOfClass:UIImage.class]) m[@"imgObj"] = old[@"imgObj"];
+            NSString *oi = old[@"img"];
+            if ([oi isKindOfClass:NSString.class] && oi.length) m[@"img"] = oi;
+            [out addObject:m];
+        } else {
+            [out addObject:e];
+        }
+    }
+    return out;
+}
+
 - (void)appendDay:(long long)day items:(NSArray *)items {
     [self appendDay:day items:items note:nil];
 }
@@ -2327,8 +2376,10 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     // v2.8.1：空天也允许入组 —— 只为了显示「2026年11月14日 + 当日还没有任何报警消息」
     // 这样一个抬头，不下发任何格子
     if (items.count == 0 && note.length == 0) return;
+    // v2.9.17：替换前先继承旧封面，避免「刷新完封面先消失再回来」
+    NSArray *covers = [self mergeCovers:items forDay:day];
     NSDictionary *bucket = @{@"day": @(day),
-                             @"items": (items ?: @[]),
+                             @"items": (covers ?: @[]),
                              @"note": (note ?: @"")};
     // v2.7：同一天已经加过就整体替换（防同一天出现两个分组）
     BOOL replaced = NO;
@@ -3085,12 +3136,18 @@ static void JAGridSweepStaleEntries(void) {
         if (JAGridEntryStillValid(b)) {
             objc_setAssociatedObject(b, &kJAGridEntryMissKey, nil,
                                      OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            if (b.hidden) b.hidden = NO;    // v2.9.17：误判过就先恢复显示
             continue;
         }
         NSInteger m = [objc_getAssociatedObject(b, &kJAGridEntryMissKey) integerValue] + 1;
         objc_setAssociatedObject(b, &kJAGridEntryMissKey, @(m),
                                  OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (m >= 3) [del addObject:b];      // 连续 3 次（≈1s）都无效才删
+        // v2.9.17：从别的格子页返回时，第三台那个 cell 有几拍扫不到文字，
+        // 以前 3 次就直接删掉，删掉之后一直不再重装 —— 用户看到「进去过一次，回来就没了」。
+        // 现在先只隐藏（层级还留着，位置也不会跑），连续 12 次（≈4s）仍然无效才真删，
+        // 交给下一 tick 重新安装。
+        if (m >= 12) [del addObject:b];
+        else if (m >= 3) b.hidden = YES;
     }
     for (UIView *d in del) [d removeFromSuperview];
 }
