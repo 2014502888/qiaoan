@@ -95,6 +95,14 @@
 //     ja_msgList_viewDidLoad / hook 安装），从根上消除那条崩源；
 //   · 直连通道补翻页：首屏稳定后调 loadMoreWarningMessagesWithDay:，某一页一条也
 //     没多出就收工（最多 8 页）—— 修「只读到 22/21/20 点、19 点那条读不到」。
+// v2.9.4（一天一屏，对齐官方消息列表）：
+//   官方「消息列表」只看当天，要看前一天必须点右上角日期选择器。格子页照此改：
+//   · 滚到底不再自动读前一天（旧实现滚到底就 loadOneMoreDay，于是「14 号读到一半
+//     突然冒出 13 号」）；
+//   · 列表底部固定一行「当日没有更多消息了 · 看其他日期请点右上角日期」；
+//   · 该日真的没有报警消息时只给一个日期抬头 + 一句说明，不再连读三天、也不再弹
+//     「往前 3 天都没有录像」；
+//   · 连播到这一天最后一格就停，不再自动跳下一天。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1805,7 +1813,9 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 
 - (void)onDayLoaded:(long long)day items:(NSArray *)items {
     self.loading = NO;
-    self.nextDay = day - 86400;
+    // v2.9.4：只展示「当前这一天」，不再自动往前翻（官方消息列表也只能看当天，
+    // 前一天要点日期选择器）。这里不再把 nextDay 减一天。
+    self.nextDay = day;
     long long today = JAGridTodayStart();
     if (items.count > 0) {
         self.emptyStreak = 0;
@@ -1821,23 +1831,16 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         self.hintLab.hidden = YES;
         return;
     }
-    // v2.8.1：刚过 0 点时「今天还没有任何报警」是完全正常的状态 —— 显示当天抬头 +
-    // 一句说明，不累加“连续空”，也不自动往前翻；用户往下拉才去读前一天。
-    if (day >= today) {
-        self.emptyStreak = 0;
-        self.gaveUp = NO;
-        [self appendDay:day items:@[] note:@"当日还没有任何报警消息，往下拉可读取前一天"];
-        self.hintLab.hidden = YES;
-        return;
-    }
-    self.emptyStreak++;
-    if (self.emptyStreak >= 3) {
-        self.gaveUp = YES;
-        self.hintLab.hidden = NO;
-        self.hintLab.text = @"往前 3 天都没有读到录像记录（设备可能没上报这几天的报警）";
-    } else {
-        [self loadOneMoreDay];
-    }
+    // 这一天确实没有读到报警消息（含「刚过 0 点今天还没有」）：给日期抬头 + 一句说明，
+    // 不再连读三天、也不再弹「往前 3 天都没录像」。
+    self.emptyStreak = 0;
+    self.gaveUp = NO;
+    [self appendDay:day
+               items:@[]
+                note:(day >= today
+                      ? @"当日还没有任何报警消息 · 点右上角日期可查看其他日期"
+                      : @"该日没有读到报警消息 · 点右上角日期可查看其他日期")];
+    self.hintLab.hidden = YES;
 }
 
 - (void)appendDay:(long long)day items:(NSArray *)items {
@@ -1924,6 +1927,14 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
             firstHourOfDay = NO;
         }
     }
+    // v2.9.4：一天一屏 —— 列表底部固定一行提示（等同官方消息列表的「没有更多消息」）。
+    // 想看前一天就点右上角日期选择器，不再滚到底自动往前翻。
+    if (secs.count > 0) {
+        [secs addObject:@{@"day": @(0), @"hour": @(-2),
+                          @"dayTitle": @"", @"hourTitle": @"",
+                          @"items": @[],
+                          @"note": @"当日没有更多消息了 · 看其他日期请点右上角日期"}];
+    }
     self.secs = secs;
     self.flat = flat;
     [self.cv reloadData];
@@ -2001,12 +2012,9 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     return CGSizeMake(self.cv.bounds.size.width, hasDay ? 78 : 42);
 }
 
+// v2.9.4：不再滚到底自动读前一天 —— 一天一屏，换天走右上角日期选择器。
+// （旧实现滚到底就 loadOneMoreDay，于是「14 号读到一半突然变成 13 号」。）
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
-    if (scrollView.contentSize.height < 1) return;
-    if (scrollView.contentOffset.y + scrollView.bounds.size.height >
-        scrollView.contentSize.height - 320) {
-        [self loadOneMoreDay];
-    }
 }
 
 // ---------- 点开播放 ----------
@@ -2133,9 +2141,8 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
                                dispatch_get_main_queue(), ^{
                     [s openPlayerAtIndex:index + 1];
                 });
-            } else {
-                [s loadOneMoreDay];
             }
+            // v2.9.4：连播到这一天最后一格就停（一天一屏，不再自动读前一天）
         });
     }
 }
