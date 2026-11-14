@@ -185,6 +185,9 @@
 //     这样一眼就能判断是「取不到地址」还是「地址不对/下载不通」。
 //   · 收工后若这一天还有「没地址」的格子，静默再请求一次最新页，把新对象里的封面补上
 //     （那台设备的抓拍地址要第二次请求才回来）。
+// v2.9.19：
+//   · 封面下载并发 3 → 6，失败重试 4 次 16s → 3 次 6s，另加 8 秒兜底。
+//     上一版最长要 30 秒才收工，这段时间整页格子都挂「载入中」，看着像卡死。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1686,14 +1689,23 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 
 // v2.9.15：限制并发。第二台那个设备首屏一次要拉十几张图，一起打出去服务端会吞掉一部分 ——
 // 官方消息列表里表现为「最上面那 9 条没封面，往下拉滑走再滑回来就有了」（cell 复用等于重拉一次）。
-// 我们这边同时最多跑 3 个，其余排队。
+// v2.9.19：上限从 3 提到 6 —— 限 3 时首屏 9 个格子要排三批，看着全是「载入中」；
+// 同时加了 8 秒兜底，任何一个请求不回调也会被收掉，不会把队列堵死。
 - (void)jaStart:(NSString *)url {
-    if (self.active >= 3) { [self.queue addObject:url]; return; }
+    if (self.active >= 6) { [self.queue addObject:url]; return; }
     self.active += 1;
     [self jaFetch:url retry:0];
+    __weak typeof(self) ws = self;
+    NSString *key = [url copy];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(ws) s = ws;
+        if (s && s.inflight[key]) [s jaFinish:key image:nil];
+    });
 }
 
 - (void)jaFinish:(NSString *)url image:(UIImage *)img {
+    if (!self.inflight[url]) return;      // v2.9.19：幂等 —— 兜底已经收过就别重复扣并发
     if (self.active > 0) self.active -= 1;
     NSArray *ws = [self.inflight[url] copy];
     [self.inflight removeObjectForKey:url];
@@ -1718,11 +1730,11 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
                 if (dp.length) [data writeToFile:dp atomically:YES];
             }
             dispatch_async(dispatch_get_main_queue(), ^{
-                if (img || retry >= 4) { [self jaFinish:url image:img]; return; }
-                // v2.9.17：失败自动重试 4 次（2s、4s、8s、16s）。第二台那个设备首屏那几张图
-                // 第一次必失败（官方列表也要滑一下重新请求才出图），窗口给足才抓得到。
+                if (img || retry >= 3) { [self jaFinish:url image:img]; return; }
+                // v2.9.19：重试 3 次（1.5s、3s、6s）。上一版给到 4 次 16s，最长要 30 秒才收工，
+                // 这段时间格子上一直挂着「载入中」，看起来像整页卡住。
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                             (int64_t)((2.0 * (double)(1 << retry)) * NSEC_PER_SEC)),
+                                             (int64_t)((1.5 * (double)(1 << retry)) * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
                     [self jaFetch:url retry:retry + 1];
                 });
