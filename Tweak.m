@@ -167,6 +167,10 @@
 //     往下拉滑走再滑回来就有了」（cell 复用等于重拉一次）。
 //   · 进页面后 1.2s/3s/6s/12s 各补一次「还没图」的可见格子（不重建列表、不闪），
 //     兜住「抓拍地址晚一点才填到消息对象上」这一种情况。
+// v2.9.16：
+//   · 历史日期（不是今天）已经有缓存就直接收工，不再从头翻一遍网络 —— 之前是「缓存上屏之后
+//     照样翻 24 页」，所以会出现「13 号秒显示、却一直在加载」。今天仍然会刷新（可能还有新报警）。
+//   · 缓存按天自动清理，只留最近 30 天（每天一个 plist，一条只存「秒 + 封面地址」，占用很小）。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1490,6 +1494,23 @@ static void JAGridDayCacheWrite(NSString *devKey, long long day, NSArray *items)
     [arr writeToFile:p atomically:YES];
 }
 
+// v2.9.16：缓存按天自动清理 —— 只留最近 30 天。占用很小：每天一个 plist，每条消息只存
+// 「秒 + 封面地址」，一天 200 条约 30KB，30 天也就 1MB 左右，留着不影响什么。
+static void JAGridDayCachePrune(NSString *devKey, NSInteger keepDays) {
+    NSString *dir = JAGridDayCacheDir(devKey);
+    if (!dir.length) return;
+    NSArray *files = [[NSFileManager defaultManager] contentsOfDirectoryAtPath:dir error:nil];
+    long long cutoff = JAGridTodayStart() - (long long)keepDays * 86400;
+    for (NSString *n in files) {
+        if (![[n pathExtension] isEqualToString:@"plist"]) continue;
+        long long day = [[n stringByDeletingPathExtension] longLongValue];
+        if (day > 0 && day < cutoff) {
+            [[NSFileManager defaultManager]
+                removeItemAtPath:[dir stringByAppendingPathComponent:n] error:nil];
+        }
+    }
+}
+
 // 官方 SD 段数组 → 格子 entry（回退路径用；按天过滤 + 去重 + 最新在上）
 static NSArray *JAGridEntriesFromEvents(NSArray *events, long long day) {
     NSMutableArray *items = [NSMutableArray array];
@@ -2053,6 +2074,8 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         return;
     }
     long long today = JAGridTodayStart();
+    // v2.9.16：进页面顺手清一次 30 天以前的老缓存
+    if (self.cacheKey.length) JAGridDayCachePrune(self.cacheKey, 30);
     // v2.8：缓存先上屏 —— 第二次进页面直接有内容（不用等网络/等官方的隐藏数据页）
     if (self.days.count == 0) {
         NSArray *cached = JAGridDayCacheRead(self.cacheKey, today);
@@ -2194,13 +2217,23 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 
     // ① 有缓存就直接上屏（第二次进页面 = 秒开）
     NSArray *cached = JAGridDayCacheRead(self.cacheKey, day);
+    BOOL cacheHit = NO;
     if (cached.count && ![self hasDay:day]) {
         [self appendDay:day items:cached];
         [self.knownDays addObject:@(day)];
         self.hintLab.hidden = YES;
+        cacheHit = YES;
     } else if (!cached.count && self.days.count == 0) {
         self.hintLab.hidden = NO;
         self.hintLab.text = @"正在读取该日录像…";
+    }
+
+    // v2.9.16：历史日期已经有完整缓存 —— 那天早就读完了，不用再从头翻一遍网络。
+    // 之前是「缓存上屏之后照样翻 24 页」，所以会看到「13 号秒显示、却一直在加载」。
+    // 只有「今天」需要再拉一次，因为可能还有新的报警消息。
+    if (cacheHit && day != JAGridTodayStart()) {
+        [self onDayLoaded:day items:cached];
+        return;
     }
 
     __weak typeof(self) ws = self;
