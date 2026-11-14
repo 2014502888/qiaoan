@@ -113,6 +113,13 @@
 //   · 返回后点不进去：旧实现每次点击都现场解析视图层级，从回放页返回后层级变了就报
 //     「没找到这台设备」。改为安装入口时就把 camera 挂到入口上（associated object），
 //     点击直接用，永不失手。
+// v2.9.6：
+//   · 底部提示改为「当日已全部加载完毕，选择日期重新加载」，整行居中。
+//   · 修「消息多的设备读不全」：翻页后服务端比首屏慢得多，旧版 0.45s × 2 次没增长就判
+//     「这页没数据」直接收工（所以滑到底只到 12:32:46，条数比消息列表少）。现在翻页后
+//     第一次等 1.0s 再判，一页没多也再等 2 轮才收工，页数上限 8 → 20。
+//   · 导航栏：删掉「连播 开」按钮，右上角只留日期选择器；中间改成「回放 + 正在加载」，
+//     加载时右边出现蓝色「正在加载」，读完自动消失。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1098,15 +1105,19 @@ static NSArray *JAGridEntriesFromMessages(NSArray *list, long long day) {
     return items;
 }
 
-// 官方消息模型是异步网络拉取：warnMessageList 会分段变长，连续 2 次不再增长才收工。
-// v2.9.3：首屏稳定后还替它翻页（loadMoreWarningMessagesWithDay:）直到没有更多。
-// 之前只拿第 1 页 —— 这就是「只读到 22/21/20 点、19 点那条读不到」的原因。
+// 官方消息模型是异步网络拉取：warnMessageList 会分段变长。
+// v2.9.3：首屏稳定后替它翻页（loadMoreWarningMessagesWithDay:）直到没有更多。
+// v2.9.6：翻页后服务端比首屏慢得多，旧版「0.45s × 2 次没增长」就判「这页没数据」→
+//   消息多的设备被误判成没有更多（正是「滑到底只到 12:32:46、条数比消息列表少」）。
+//   现在翻页后第一次等 1.0s 再判，一页一条没多也再等 2 轮才收工；页数上限 8 → 20。
 static void JAGridPollMessageModel(id model, long long day, NSInteger round,
                                    NSArray *best, NSInteger bestN, NSInteger stable,
-                                   NSInteger pages, NSInteger lastPageN,
+                                   NSInteger pages, NSInteger idle,
                                    void (^cb)(NSArray *items)) {
-    if (round > 40) { if (cb) cb(bestN > 0 ? best : nil); return; }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+    if (round > 90) { if (cb) cb(bestN > 0 ? best : nil); return; }
+    // 刚翻过页（stable==0）说明正在等这一页的第一批数据回来，给足时间
+    NSTimeInterval wait = (pages > 0 && stable == 0) ? 1.0 : 0.6;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         NSArray *list = nil;
         @try { list = [model valueForKey:@"warnMessageList"]; } @catch (NSException *e) {}
@@ -1115,28 +1126,35 @@ static void JAGridPollMessageModel(id model, long long day, NSInteger round,
         __block NSArray *cand = best;
         __block NSInteger bn = bestN;
         __block NSInteger st = stable;
-        if (n > bn) { cand = items; bn = n; st = 0; }
+        __block NSInteger idl = idle;
+        if (n > bn) { cand = items; bn = n; st = 0; idl = 0; }
         else { st += 1; }
 
-        if (st >= 2 && bn > 0) {
-            // 这一页已经稳定。翻过页却一条也没多 → 确实没有更多了
-            if (pages > 0 && n <= lastPageN) { if (cb) cb(cand); return; }
+        // 首屏要连续 2 次不再增长才算稳定；翻页只要 1 次（那页回得慢，多等会拖很久）
+        BOOL ready = (pages > 0) ? (st >= 1) : (st >= 2);
+        if (ready && bn > 0) {
+            if (pages > 0 && n <= bn) {
+                // 翻过页却一条没多：可能只是这页还没回来，再等 2 轮才下结论
+                if (idl >= 2) { if (cb) cb(cand); return; }
+                JAGridPollMessageModel(model, day, round + 1, cand, bn, 0, pages, idl + 1, cb);
+                return;
+            }
             SEL lm = NSSelectorFromString(@"loadMoreWarningMessagesWithDay:");
-            if (pages < 8 && [model respondsToSelector:lm]) {
+            if (pages < 20 && [model respondsToSelector:lm]) {
                 BOOL ok = NO;
                 @try {
                     ((void (*)(id, SEL, id))objc_msgSend)(model, lm, JAGridDayStr(day));
                     ok = YES;
                 } @catch (NSException *e) { ok = NO; }
                 if (ok) {
-                    JAGridPollMessageModel(model, day, round + 1, cand, bn, 0, pages + 1, bn, cb);
+                    JAGridPollMessageModel(model, day, round + 1, cand, bn, 0, pages + 1, 0, cb);
                     return;
                 }
             }
             if (cb) cb(cand);
             return;
         }
-        JAGridPollMessageModel(model, day, round + 1, cand, bn, st, pages, lastPageN, cb);
+        JAGridPollMessageModel(model, day, round + 1, cand, bn, st, pages, idl, cb);
     });
 }
 
@@ -1525,6 +1543,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 @property (nonatomic, strong) JAGridClockView *clockView;
 @property (nonatomic, strong) UILabel *hourLab;        // 「22:00」
 - (void)configDayTitle:(NSString *)dayTitle hourTitle:(NSString *)hourTitle;
+- (void)configNote:(NSString *)note;   // v2.9.6：一行居中灰字说明（空天 / 列表末尾）
 @end
 
 @implementation JAGridHeader
@@ -1558,6 +1577,22 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     self.dayLab.hidden = !hasDay;
     self.dashLine.hidden = !hasDay;
     self.hourLab.text = hourTitle;
+    self.hourLab.font = [UIFont systemFontOfSize:16];
+    self.hourLab.textColor = [UIColor colorWithRed:0.13 green:0.55 blue:0.95 alpha:1.0];
+    self.hourLab.textAlignment = NSTextAlignmentLeft;     // cell 复用要复位
+    [self setNeedsLayout];
+}
+
+// v2.9.6：一行居中灰字 —— 该日没报警 / 当日已全部加载完毕
+- (void)configNote:(NSString *)note {
+    self.dayLab.text = nil;
+    self.dayLab.hidden = YES;
+    self.dashLine.hidden = YES;
+    self.clockView.hidden = YES;
+    self.hourLab.text = note;
+    self.hourLab.font = [UIFont systemFontOfSize:13];
+    self.hourLab.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
+    self.hourLab.textAlignment = NSTextAlignmentCenter;
     [self setNeedsLayout];
 }
 - (void)layoutSubviews {
@@ -1604,7 +1639,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 @property (nonatomic, strong) NSMutableArray *flat;    // 与 secs 顺序完全一致，连播/翻页索引用
 @property (nonatomic, strong) UICollectionView *cv;
 @property (nonatomic, strong) UILabel *hintLab;
-@property (nonatomic, strong) UIBarButtonItem *autoItem;
+@property (nonatomic, strong) UILabel *loadingLab;      // v2.9.6：标题右边的「正在加载」
 @property (nonatomic, strong) NSMutableArray *retained; // 借用中的官方 dataVC（保活）
 @property (nonatomic, assign) long long nextDay;
 @property (nonatomic, assign) BOOL loading;
@@ -1622,6 +1657,44 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 @end
 
 @implementation JAGridReplayViewController
+
+// v2.9.6：导航中间「回放 + 正在加载」—— 加载时右边出现蓝色「正在加载」，读完自动消失，
+// 不用再去消息列表确认读完没有
+- (void)buildTitleView {
+    UILabel *t = [[UILabel alloc] initWithFrame:CGRectZero];
+    t.text = @"回放";
+    t.font = [UIFont boldSystemFontOfSize:17];
+    t.textColor = [UIColor blackColor];
+    [t sizeToFit];
+
+    UILabel *ld = [[UILabel alloc] initWithFrame:CGRectZero];
+    ld.text = @"正在加载";
+    ld.font = [UIFont systemFontOfSize:13];
+    ld.textColor = [UIColor colorWithRed:0.13 green:0.55 blue:0.95 alpha:1.0];
+    [ld sizeToFit];
+    // 用 alpha 而不是 hidden：宽度一直留着，「回放」不会随加载状态左右跳
+    ld.alpha = 0.0;
+    self.loadingLab = ld;
+
+    CGFloat h = MAX(CGRectGetHeight(t.frame), CGRectGetHeight(ld.frame));
+    CGFloat gap = 10.0;
+    CGFloat wt = CGRectGetWidth(t.frame);
+    CGFloat wl = CGRectGetWidth(ld.frame);
+    UIView *box = [[UIView alloc] initWithFrame:CGRectMake(0, 0, wt + gap + wl, h)];
+    t.frame = CGRectMake(0, (h - CGRectGetHeight(t.frame)) / 2.0, wt, CGRectGetHeight(t.frame));
+    ld.frame = CGRectMake(wt + gap, (h - CGRectGetHeight(ld.frame)) / 2.0,
+                          wl, CGRectGetHeight(ld.frame));
+    [box addSubview:t];
+    [box addSubview:ld];
+    self.navigationItem.titleView = box;
+}
+
+- (void)setLoadingBadge:(BOOL)on {
+    if (!self.loadingLab) return;
+    [UIView animateWithDuration:0.18 animations:^{
+        self.loadingLab.alpha = on ? 1.0 : 0.0;
+    }];
+}
 
 - (void)viewDidLoad {
     [super viewDidLoad];
@@ -1648,10 +1721,6 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         self.cacheKey = [NSString stringWithFormat:@"%08x", h];
     }
 
-    self.autoItem = [[UIBarButtonItem alloc] initWithTitle:@"连播 开"
-                                                    style:UIBarButtonItemStylePlain
-                                                   target:self
-                                                   action:@selector(toggleAutoNext)];
     // v2.8：右上角日期选择器（月历，有录像的日期带红点）
     UIImage *calImg = [UIImage systemImageNamed:@"calendar"];
     if (calImg) {
@@ -1665,7 +1734,9 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
                                                        target:self
                                                        action:@selector(showCalendarPanel)];
     }
-    self.navigationItem.rightBarButtonItems = @[self.calItem, self.autoItem];
+    // v2.9.6：右上角只留日期选择器（「连播 开」按钮去掉，连播本身仍是默认开启）
+    self.navigationItem.rightBarButtonItem = self.calItem;
+    [self buildTitleView];
 
     UICollectionViewFlowLayout *lay = [[UICollectionViewFlowLayout alloc] init];
     lay.minimumInteritemSpacing = 9;
@@ -1846,6 +1917,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     if (self.nextDay <= 0) self.nextDay = JAGridTodayStart();
     long long day = self.nextDay;
     self.loading = YES;
+    [self setLoadingBadge:YES];
 
     // ① 有缓存就直接上屏（第二次进页面 = 秒开）
     NSArray *cached = JAGridDayCacheRead(self.cacheKey, day);
@@ -1878,6 +1950,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 
 - (void)onDayLoaded:(long long)day items:(NSArray *)items {
     self.loading = NO;
+    [self setLoadingBadge:NO];
     // v2.9.4：只展示「当前这一天」，不再自动往前翻（官方消息列表也只能看当天，
     // 前一天要点日期选择器）。这里不再把 nextDay 减一天。
     self.nextDay = day;
@@ -1998,7 +2071,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         [secs addObject:@{@"day": @(0), @"hour": @(-2),
                           @"dayTitle": @"", @"hourTitle": @"",
                           @"items": @[],
-                          @"note": @"当日没有更多消息了 · 看其他日期请点右上角日期"}];
+                          @"note": @"当日已全部加载完毕，选择日期重新加载"}];
     }
     self.secs = secs;
     self.flat = flat;
@@ -2050,12 +2123,18 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         NSDictionary *secDict = (NSDictionary *)self.secs[ip.section];
         NSString *note = (NSString *)secDict[@"note"];
         if (note.length) {
-            // v2.8.1：空天 —— 只留日期抬头，时钟换成一句灰色说明
-            [h configDayTitle:(NSString *)secDict[@"dayTitle"] hourTitle:@""];
-            h.clockView.hidden = YES;
-            h.hourLab.text = note;
-            h.hourLab.font = [UIFont systemFontOfSize:13];
-            h.hourLab.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
+            NSString *dayTitle = (NSString *)secDict[@"dayTitle"];
+            if (dayTitle.length > 0) {
+                // 空天 —— 保留日期抬头，说明跟在抬头下面（左对齐）
+                [h configDayTitle:dayTitle hourTitle:note];
+                h.clockView.hidden = YES;
+                h.hourLab.font = [UIFont systemFontOfSize:13];
+                h.hourLab.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
+                h.hourLab.textAlignment = NSTextAlignmentLeft;
+            } else {
+                // v2.9.6：列表末尾提示 —— 整行居中
+                [h configNote:note];
+            }
         } else {
             [h configDayTitle:(NSString *)secDict[@"dayTitle"]
                      hourTitle:(NSString *)secDict[@"hourTitle"]];
@@ -2210,11 +2289,6 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
             // v2.9.4：连播到这一天最后一格就停（一天一屏，不再自动读前一天）
         });
     }
-}
-
-- (void)toggleAutoNext {
-    self.autoNext = !self.autoNext;
-    self.autoItem.title = self.autoNext ? @"连播 开" : @"连播 关";
 }
 
 // ---------- v2.8：右上角日期选择器（月历 + 有录像日期红点） ----------
