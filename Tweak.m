@@ -188,6 +188,12 @@
 // v2.9.19：
 //   · 封面下载并发 3 → 6，失败重试 4 次 16s → 3 次 6s，另加 8 秒兜底。
 //     上一版最长要 30 秒才收工，这段时间整页格子都挂「载入中」，看着像卡死。
+// v2.9.20：
+//   · 过了 0 点当天还没报警时，只留「日期抬头 + 当日还没有任何报警消息」。
+//     底部那句「当日已全部加载完毕」改成「有格子才加」，不再和空天说明自相矛盾。
+//   · 进格子页先藏掉官方播放器残留的「回放倍数选择」浮层（它正好压在日期抬头上面），
+//     离开页面再放回去，官方播放页照常可用。
+//   · 日期抬头量宽改成「先按不换行量，再夹到可用宽度」—— 窄宽下不会只剩一个字。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1956,7 +1962,10 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     BOOL hasDay = !self.dayLab.hidden;
     CGFloat y = 2;
     if (hasDay) {
-        CGSize sz = [self.dayLab sizeThatFits:CGSizeMake(w - 70, 28)];
+        // v2.9.20：先按不换行量一次真实宽度，再夹到可用宽度里 —— 窄宽下直接
+        // sizeThatFits(w-70) 会把「2026年11月15日」压成只剩一个字。
+        CGSize sz = [self.dayLab sizeThatFits:CGSizeMake(CGFLOAT_MAX, 28)];
+        sz.width = MIN(sz.width, MAX(0, w - 70));
         self.dayLab.frame = CGRectMake(16, y, sz.width, 28);
         CGFloat dashX = 16 + sz.width + 12;
         self.dashLine.frame = CGRectMake(dashX, y + 14, MAX(0, w - dashX - 16), 1);
@@ -1986,6 +1995,44 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 @end
 
 // ---------- 格子页本体 ----------
+
+// v2.9.20：过 0 点再进格子页时，官方播放器留在 window 上的「回放倍数选择」浮层还挂着，
+// 正好盖住日期抬头。进页面先把它藏起来，离开再放回去（官方播放页还要用）。
+// 只处理挂在 window 直接子视图上的浮层，播放页自己的 view 一带一律不碰。
+static NSMutableArray *g_jaHiddenPanels = nil;
+
+static void JAGridToggleSpeedPanel(BOOL hide) {
+    if (!hide) {
+        for (UIView *v in g_jaHiddenPanels) v.hidden = NO;
+        g_jaHiddenPanels = nil;
+        return;
+    }
+    if (g_jaHiddenPanels.count > 0) return;
+    UIWindow *win = nil;
+    NSArray *wins = [UIApplication sharedApplication].windows;
+    for (UIWindow *w in wins) { if (w.isKeyWindow) { win = w; break; } }
+    if (!win && wins.count) win = [wins lastObject];
+    if (!win) return;
+    NSMutableArray *roots = [NSMutableArray array];
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:win];
+    int budget = 6000;
+    while (stack.count > 0 && budget-- > 0) {
+        UIView *v = (UIView *)stack.lastObject;
+        [stack removeLastObject];
+        if ([v isKindOfClass:UILabel.class]) {
+            UILabel *l = (UILabel *)v;
+            if (l.text.length && [l.text containsString:@"回放倍数"]) {
+                UIView *root = l;
+                while (root.superview && root.superview != win) root = root.superview;
+                if (root.superview == win && ![roots containsObject:root]) [roots addObject:root];
+            }
+        }
+        for (UIView *s in v.subviews) [stack addObject:s];
+    }
+    if (roots.count == 0) return;
+    for (UIView *r in roots) r.hidden = YES;
+    g_jaHiddenPanels = roots;
+}
 
 @interface JAGridReplayViewController : UIViewController <UICollectionViewDataSource, UICollectionViewDelegateFlowLayout>
 @property (nonatomic, strong) id myCamera;
@@ -2124,6 +2171,17 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 - (void)viewSafeAreaInsetsDidChange {
     [super viewSafeAreaInsetsDidChange];
     [self.view setNeedsLayout];
+}
+
+- (void)viewWillAppear:(BOOL)animated {
+    [super viewWillAppear:animated];
+    // v2.9.20：先藏掉官方播放器残留的「回放倍数选择」浮层，它正好压在日期抬头上面
+    JAGridToggleSpeedPanel(YES);
+}
+
+- (void)viewWillDisappear:(BOOL)animated {
+    [super viewWillDisappear:animated];
+    JAGridToggleSpeedPanel(NO);
 }
 
 - (void)viewDidAppear:(BOOL)animated {
@@ -2511,7 +2569,9 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     }
     // v2.9.4：一天一屏 —— 列表底部固定一行提示（等同官方消息列表的「没有更多消息」）。
     // 想看前一天就点右上角日期选择器，不再滚到底自动往前翻。
-    if (secs.count > 0) {
+    // v2.9.20：只有真的有格子时才加这一行 —— 空天（过了 0 点今天还没报警）只留
+    // 「日期抬头 + 当日还没有任何报警消息」，不再多一句「已全部加载完毕」自相矛盾。
+    if (flat.count > 0) {
         [secs addObject:@{@"day": @(0), @"hour": @(-2),
                           @"dayTitle": @"", @"hourTitle": @"",
                           @"items": @[],
