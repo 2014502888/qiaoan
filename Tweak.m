@@ -120,6 +120,11 @@
 //     第一次等 1.0s 再判，一页没多也再等 2 轮才收工，页数上限 8 → 20。
 //   · 导航栏：删掉「连播 开」按钮，右上角只留日期选择器；中间改成「回放 + 正在加载」，
 //     加载时右边出现蓝色「正在加载」，读完自动消失。
+// v2.9.8：
+//   · 修「第一台反而只读到 18:32:32」：v2.9.6 把翻页稳定判定放松到 1 次，正好撞进官方自己
+//     还在请求（_isLoading）的窗口，此时翻页会被它吞掉 → 这一页「一条没多」→ 提前收工。
+//     现在恢复「连续 2 次不增长」，并在翻页前先看 _isLoading，忙就等它跑完再翻。
+//   · 加回官方 SD 回放页自带的时间轴 / 拖动条（v2.6 曾主动隐藏，用户要能自己拖）。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1140,13 +1145,16 @@ static NSArray *JAGridEntriesFromMessages(NSArray *list, long long day) {
 // v2.9.3：首屏稳定后替它翻页（loadMoreWarningMessagesWithDay:）直到没有更多。
 // v2.9.6：翻页后服务端比首屏慢得多，旧版「0.45s × 2 次没增长」就判「这页没数据」→
 //   消息多的设备被误判成没有更多（正是「滑到底只到 12:32:46、条数比消息列表少」）。
-//   现在翻页后第一次等 1.0s 再判，一页一条没多也再等 2 轮才收工；页数上限 8 → 20。
+//   翻页后第一次等 1.0s 再判，一页一条没多也再等 2 轮才收工；页数上限 8 → 20。
+// v2.9.8：v2.9.6 把稳定判定放松到 1 次，正好撞进官方自己还在请求（_isLoading）的窗口 ——
+//   此时翻页会被它吞掉，于是「一条没多」→ 提前收工，第一台反而只到 18:32:32。
+//   现在恢复「连续 2 次不增长」，并且翻页前先看 _isLoading，忙就等它跑完。
 static void JAGridPollMessageModel(id model, long long day, NSInteger round,
                                    NSArray *best, NSInteger bestN, NSInteger stable,
                                    NSInteger pages, NSInteger idle,
                                    void (^cb)(NSArray *items)) {
-    if (round > 90) { if (cb) cb(bestN > 0 ? best : nil); return; }
-    // 刚翻过页（stable==0）说明正在等这一页的第一批数据回来，给足时间
+    if (round > 120) { if (cb) cb(bestN > 0 ? best : nil); return; }
+    // 1.0s 只在「刚翻页、等这一页第一批数据」时用，其余 0.6s
     NSTimeInterval wait = (pages > 0 && stable == 0) ? 1.0 : 0.6;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -1161,9 +1169,18 @@ static void JAGridPollMessageModel(id model, long long day, NSInteger round,
         if (n > bn) { cand = items; bn = n; st = 0; idl = 0; }
         else { st += 1; }
 
-        // 首屏要连续 2 次不再增长才算稳定；翻页只要 1 次（那页回得慢，多等会拖很久）
-        BOOL ready = (pages > 0) ? (st >= 1) : (st >= 2);
+        // 首屏和翻页都要求连续 2 次不再增长才算这一页到齐
+        BOOL ready = (st >= 2);
         if (ready && bn > 0) {
+            // v2.9.8：官方自己还在跑请求时（_isLoading）翻页会被它吞掉，请求发出去但没效果，
+            // 于是这一页「一条没多」→ 收工 → 条数变少。v2.9.6 把判定放松到 1 次，正好撞上
+            // 这个窗口，所以第一台反而只读到 18:32:32。先等它跑完再翻。
+            BOOL busy = NO;
+            @try { busy = [[model valueForKey:@"isLoading"] boolValue]; } @catch (NSException *e) {}
+            if (busy) {
+                JAGridPollMessageModel(model, day, round + 1, cand, bn, 0, pages, idl, cb);
+                return;
+            }
             if (pages > 0 && n <= bn) {
                 // 翻过页却一条没多：可能只是这页还没回来，再等 2 轮才下结论
                 if (idl >= 2) { if (cb) cb(cand); return; }
@@ -2263,24 +2280,8 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     if (!nav) return;
     [nav pushViewController:vc animated:YES];
 
-    // v2.6：云回放式「35 秒片段」观感 —— 进播放页 1s 后隐藏时间轴/拖动条，
-    // 只留画面，看完自动回格子页接着下一格（不再显示可拖的时间线）。
-    __weak id wvc = vc;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        id v = wvc;
-        if (!v) return;
-        @try {
-            id tl = [v valueForKey:@"timeLineView"];
-            if ([tl isKindOfClass:[UIView class]]) {
-                UIView *tview = (UIView *)tl;
-                tview.hidden = YES;
-            }
-        } @catch (NSException *e) {}
-    });
-
-    // v2.8：画面右上角标出这一格的目标时间 —— 时间轴被隐藏了，定位有没有生效
-    // 只能靠这个角标和画面做对照
+    // v2.9.8：官方 SD 回放页自带的时间轴/拖动条不再隐藏（用户要能自己拖）。
+    // v2.8：画面右上角标出这一格的目标时间 —— 定位有没有生效靠这个角标和画面对照
     __weak id wvc2 = vc;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
