@@ -1841,7 +1841,18 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 }
 
 - (void)jaFetch:(NSString *)url retry:(NSInteger)retry {
-    NSURL *u = [NSURL URLWithString:url];
+    // v2.9.32：华为云 OBS 预签名 URL（qiaoan-thn.obs.cn-east-3.myhuaweicloud.com）的
+    // Signature 是 base64，可能含未编码的 '+'。query 里的 '+' 会被服务端当成空格解码，
+    // 签名立刻对不上 —— 表现就是「地址对、签名参数都在，但一直被拒」。这里统一转成 %2B。
+    NSString *sendURL = url;
+    NSRange qr = [url rangeOfString:@"?"];
+    if (qr.location != NSNotFound) {
+        NSString *base = [url substringToIndex:qr.location];
+        NSString *query = [url substringFromIndex:qr.location];
+        sendURL = [base stringByAppendingString:
+                   [query stringByReplacingOccurrencesOfString:@"+" withString:@"%2B"]];
+    }
+    NSURL *u = [NSURL URLWithString:sendURL];
     // v2.9.27：地址里只要有一个没编码的字符（空格、中文、{|} 之类），
     // URLWithString 就直接返回 nil —— 请求根本发不出去，格子上却只显示「失败.jpg」，
     // 看起来像被服务端拒了。这里补一次穷举式百分号编码：只保留 URL 结构里合法的字符，
@@ -1886,11 +1897,29 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
                     st = -(err.code);
                     self.codes[url] = @(st);
                 }
-                // v2.9.30：留一个失败样本现场 —— 完整 URL + 状态码 + 返回字节数。
-                // 只记第一条，够看一次就行，不刷屏。
+                // v2.9.30：留一个失败样本现场 —— 状态码 + 返回字节数 + 地址关键片段。
+                // v2.9.32：改成三行短文本（签名参数缩写），底部那行是多行标签，不会再被截断。
                 if (!self.firstFailInfo) {
-                    self.firstFailInfo = [NSString stringWithFormat:@"%@ [%ld|%lu]",
-                                          url, (long)st, (unsigned long)(data.length)];
+                    NSRange qr2 = [url rangeOfString:@"?"];
+                    NSString *pth = qr2.location != NSNotFound ? [url substringToIndex:qr2.location] : url;
+                    NSString *qry = qr2.location != NSNotFound ? [url substringFromIndex:qr2.location + 1] : @"";
+                    if (pth.length > 34) pth = [@"…" stringByAppendingString:[pth substringFromIndex:pth.length - 34]];
+                    NSMutableArray *kvArr = [NSMutableArray array];
+                    for (NSString *kv in [qry componentsSeparatedByString:@"&"]) {
+                        NSRange eq = [kv rangeOfString:@"="];
+                        if (eq.location == NSNotFound) continue;
+                        NSString *k = [kv substringToIndex:eq.location];
+                        NSString *v = [kv substringFromIndex:eq.location + 1];
+                        NSString *ks = k;
+                        if ([k rangeOfString:@"ccessKey"].location != NSNotFound) ks = @"AK";
+                        else if ([k rangeOfString:@"xpires"].location != NSNotFound) ks = @"Exp";
+                        else if ([k rangeOfString:@"ignature"].location != NSNotFound) ks = @"Sg";
+                        if (v.length > 22) v = [[v substringToIndex:22] stringByAppendingString:@"…"];
+                        [kvArr addObject:[NSString stringWithFormat:@"%@=%@", ks, v]];
+                    }
+                    NSString *kvLine = kvArr.count ? [kvArr componentsJoinedByString:@" "] : @"(无签名字段)";
+                    self.firstFailInfo = [NSString stringWithFormat:@"封面失败 [%ld|%lu]\n%@\n%@",
+                                          (long)st, (unsigned long)(data.length), pth, kvLine];
                 }
             }
             if (img) {
@@ -2144,6 +2173,9 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     self.hourLab.font = [UIFont systemFontOfSize:13];
     self.hourLab.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
     self.hourLab.textAlignment = NSTextAlignmentCenter;
+    // v2.9.32：多行说明（排查期的封面失败现场），允许换行，不再被单行截断。
+    self.hourLab.numberOfLines = [note rangeOfString:@"\n"].location != NSNotFound ? 0 : 1;
+    self.hourLab.lineBreakMode = NSLineBreakByCharWrapping;
     [self setNeedsLayout];
 }
 - (void)layoutSubviews {
@@ -2165,7 +2197,11 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     self.clockView.frame = CGRectMake(16, y + 3, 20, 20);
     // v2.8.1：没有时钟的「空天说明」从左边 16 起排，和日期标题左对齐
     CGFloat hx = self.clockView.hidden ? 16 : 42;
-    self.hourLab.frame = CGRectMake(hx, y, MAX(0, w - hx - 16), 26);
+    CGFloat hy = y;
+    CGFloat hh = MAX(26, self.bounds.size.height - hy - 4);
+    // v2.9.32：多行说明给足整块高度，别按单行 26 裁掉下面的行
+    if (self.hourLab.numberOfLines == 0) hh = MAX(26, self.bounds.size.height - hy);
+    self.hourLab.frame = CGRectMake(hx, hy, MAX(0, w - hx - 16), hh);
 }
 - (void)refreshDash {
     self.dashLine.layer.sublayers = nil;
@@ -2885,11 +2921,9 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
         NSDictionary *last = secs.lastObject;
         if ([last[@"day"] isEqualToNumber:@(0)]) {
             NSMutableDictionary *md = [last mutableCopy];
-            // v2.9.31：改成显示**尾部** —— 华为云 OBS 的签名参数（AccessKeyId/Expires/Signature）
-            // 全在 query 末尾，前面截了等于什么都没看到。
-            NSString *shown = failInfo;
-            if (shown.length > 100) shown = [@"…" stringByAppendingString:[shown substringFromIndex:shown.length - 100]];
-            md[@"note"] = [NSString stringWithFormat:@"封面失败 %@", shown];
+            // v2.9.32：firstFailInfo 本身就是三行短文本（状态码/字节数 + 路径尾段 + 签名参数缩写），
+            // 交给多行标签自己换行，不用再截。
+            md[@"note"] = failInfo;
             NSMutableArray *arr = [secs mutableCopy];
             arr[arr.count - 1] = md;
             secs = arr;
@@ -3098,6 +3132,11 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     if (section < 0 || section >= (NSInteger)self.secs.count) return CGSizeZero;
     NSDictionary *secDict = (NSDictionary *)self.secs[section];
     BOOL hasDay = [(NSString *)secDict[@"dayTitle"] length] > 0;
+    // v2.9.32：多行说明（封面失败现场）要给够高度，否则底部那几行被裁掉
+    NSString *note = secDict[@"note"];
+    if ([note rangeOfString:@"\n"].location != NSNotFound) {
+        return CGSizeMake(self.cv.bounds.size.width, 92);
+    }
     return CGSizeMake(self.cv.bounds.size.width, hasDay ? 78 : 42);
 }
 
