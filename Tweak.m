@@ -219,6 +219,12 @@
 //     真正吃掉手势的东西：它是满屏的、又不是格子页自己的后代，就整块摘掉。
 //     摘不掉的把类名写在底部提示条上（「遮挡:XXX(320x568)」），截图即可定位是谁。
 //   · 缓存读取也拦一道 sec <= 当天 0 点 的条目，老版本写进去的假格子读不出来。
+// v2.9.25：hitTest 抓到的是 JATHreeScreenGuidedSlidingView —— 官方「三屏引导蒙层」，
+//   由 newShowThreeScreenGuideViewToWindow 直接加到窗口上：全屏、吞手势、自带隐藏状态栏。
+//   它是官方 SD 回放 VC 初始化时挂上来的，所以「当天一条消息都没有」退到 SD 通道时最容易
+//   触发（这也解释了为什么空天反而更容易卡死）。
+//   · 蒙层直接挂在窗口上时，连整个窗口一起 hidden（只关窗口，状态栏才回得来）；
+//   · 摘完之后由格子页自己接管状态栏：prefersStatusBarHidden 恒为 NO，并主动刷新。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -2338,27 +2344,62 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
 
 // v2.9.24：用 hitTest 直接找出「谁在吃触摸」。满屏的整块摘掉，剩下的把类名写到
 // 底部提示条上 —— 用户一截图就能看到究竟是谁盖的，不用再猜。
+// v2.9.25：实测抓到的是 JATHreeScreenGuidedSlidingView —— 官方「三屏引导蒙层」，由
+// newShowThreeScreenGuideViewToWindow 直接加到窗口上：全屏、吃手势、自带隐藏状态栏。
+// 它会由官方 SD 回放 VC 初始化时挂上来，所以「当天无消息」退到 SD 通道时最容易被触发。
+// 光把蒙层 view 摘掉不够 —— 它所在的那个窗口还在，状态栏照样是它管着。所以：
+//   · 蒙层直接挂在窗口上（v.superview == w）→ 整个窗口 hidden = YES；
+//   · 摘完之后自己接管状态栏，主动要求显示。
 - (void)jaProbeBlockers {
     UIView *host = self.view;
     if (!host) return;
     NSMutableString *rep = [NSMutableString string];
+    BOOL changed = NO;
     for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.hidden) continue;
         CGPoint p = CGPointMake(CGRectGetMidX(w.bounds), CGRectGetMidY(w.bounds));
         NSDictionary *d = JAGridProbeHit(w, host, p);
         if (!d) continue;
         UIView *v = (UIView *)d[@"v"];
+        NSString *cls = d[@"cls"];
         CGFloat ww = CGRectGetWidth(w.bounds), hh = CGRectGetHeight(w.bounds);
         CGFloat fw = [d[@"w"] doubleValue], fh = [d[@"h"] doubleValue];
-        [rep appendFormat:@"%@(%.0fx%.0f) ", d[@"cls"], fw, fh];
         if (ww > 0 && hh > 0 && fw >= ww * 0.9 && fh >= hh * 0.6) {
+            // 只有认得出是「蒙层类」的东西才敢把整个窗口关掉，别误伤主界面
+            BOOL cover = NO;
+            for (NSString *k in @[@"Guided", @"Guide", @"Mask", @"Overlay", @"Shade",
+                                  @"HUD", @"Progress", @"Loading", @"Tips", @"Toast"]) {
+                if ([cls rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                    cover = YES; break;
+                }
+            }
+            // 蒙层自己就是窗口的根视图 → 连窗口一起关，状态栏才回得来
+            if (cover && v.superview == w && w != host.window) {
+                @try { w.hidden = YES; } @catch (NSException *e) {}
+                changed = YES;
+                continue;
+            }
             @try { [v removeFromSuperview]; } @catch (NSException *e) {}
+            changed = YES;
+        } else {
+            [rep appendFormat:@"%@(%.0fx%.0f) ", cls, fw, fh];
         }
     }
-    if (rep.length) {
+    if (changed) {
+        self.hintLab.hidden = YES;      // 摘掉了就别在页面上留那行字
+        [self setNeedsStatusBarAppearanceUpdate];
+        @try { [self.navigationController setNeedsStatusBarAppearanceUpdate]; } @catch (NSException *e) {}
+    } else if (rep.length) {
         self.hintLab.hidden = NO;
         self.hintLab.text = [NSString stringWithFormat:@"遮挡:%@", rep];
     }
 }
+
+// v2.9.25：状态栏被官方全屏蒙层藏掉之后不会自己回来，这里明确要求显示。
+- (BOOL)prefersStatusBarHidden { return NO; }
+- (UIStatusBarStyle)preferredStatusBarStyle { return UIStatusBarStyleDarkContent; }
+- (UIViewController *)childViewControllerForStatusBarHidden { return nil; }
+- (UIViewController *)childViewControllerForStatusBarStyle { return nil; }
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
