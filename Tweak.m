@@ -948,10 +948,11 @@ static NSString *JAGridImageURL(id ev) {
         NSString *raw = [NSString stringWithUTF8String:nm];
         NSString *key = [raw hasPrefix:@"_"] ? [raw substringFromIndex:1] : raw;
         id v = nil;
+        // v2.9.7：这里只能走 KVC。v2.9.5 还挂了一条 object_getIvar 兜底，但它会把
+        // int / long long / BOOL 这类标量 ivar 的数值直接当 id 交出去，ARC 一 retain 就
+        // SIGSEGV（objc_retain @ JAGridImageURL，第二台设备点格子播放、RTC 定位找事件时必崩）。
+        // KVC 会按 ivar 类型装箱：标量变 NSNumber，对象才是对象，安全。
         @try { v = [ev valueForKey:key]; } @catch (NSException *e) { v = nil; }
-        if (![v isKindOfClass:NSString.class]) {
-            @try { v = object_getIvar(ev, ivs[i]); } @catch (NSException *e) { v = nil; }
-        }
         if (![v isKindOfClass:NSString.class]) continue;
         NSString *s = [(NSString *)v stringByTrimmingCharactersInSet:
                        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
@@ -989,6 +990,36 @@ static NSString *JAGridImageURL(id ev) {
                 [low containsString:@"snap"] || [low containsString:@"image"]) return full;
         }
     }
+
+    // v2.9.7：再兜一层 —— 有些型号的图地址是 getter 现场拼出来的（域名 + id，不落在任何
+    // ivar 上），光扫字段永远取不到，而消息列表里照样有图。这里枚举模型自己的 0 参方法，
+    // 只在名字像取图的里面取返回值，其余方法一律不碰。
+    // 只对「像事件 / 消息模型」的类做，避免对随便一个对象触发带副作用的 getter。
+    NSString *clsName = NSStringFromClass([ev class]);
+    BOOL looksEvent = ([clsName containsString:@"Warn"] || [clsName containsString:@"Event"] ||
+                       [clsName containsString:@"Record"] || [clsName containsString:@"Entity"] ||
+                       [clsName containsString:@"Msg"]);
+    if (!looksEvent) return nil;
+    unsigned int mc = 0;
+    Method *ms = class_copyMethodList([ev class], &mc);
+    NSString *hit = nil;
+    for (unsigned int i = 0; i < mc && !hit; i++) {
+        if (method_getNumberOfArguments(ms[i]) != 2) continue;      // self + _cmd，纯取值
+        const char *enc = method_getTypeEncoding(ms[i]);
+        if (!enc || enc[0] != '@') continue;                       // 返回类型必须是对象
+        NSString *sn = NSStringFromSelector(method_getName(ms[i]));
+        NSString *low = sn.lowercaseString;
+        if (!([low containsString:@"url"] || [low containsString:@"pic"] ||
+              [low containsString:@"thumb"] || [low containsString:@"image"] ||
+              [low containsString:@"cover"] || [low containsString:@"snap"])) continue;
+        id r = nil;
+        @try { r = ((id (*)(id, SEL))objc_msgSend)(ev, method_getName(ms[i])); }
+        @catch (NSException *e) { r = nil; }
+        if (![r isKindOfClass:NSString.class]) continue;
+        hit = JAGridNormalizeURL((NSString *)r);
+    }
+    if (ms) free(ms);
+    if (hit) return hit;
     return nil;
 }
 
