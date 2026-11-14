@@ -1863,7 +1863,12 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     [rq setValue:@"Joolink/26101509371 CFNetwork/1312 Darwin/21.0.0"
         forHTTPHeaderField:@"User-Agent"];
     [rq setValue:@"*/*" forHTTPHeaderField:@"Accept"];
-    [rq setValue:@"https://www.jooancloud.com/" forHTTPHeaderField:@"Referer"];
+    // v2.9.31：第一次带 Referer；重试就不带了。
+    // 第二台设备的图在华为云 OBS（qiaoan-thn.obs.cn-east-3.myhuaweicloud.com），
+    // OBS 桶可以配防盗链：如果白名单只允许空 Referer，我们主动加的这条反而会被拒。
+    if (retry == 0) {
+        [rq setValue:@"https://www.jooancloud.com/" forHTTPHeaderField:@"Referer"];
+    }
     rq.timeoutInterval = 12.0;
     NSURLSessionDataTask *t = [[NSURLSession sharedSession]
         dataTaskWithRequest:rq completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
@@ -2880,7 +2885,10 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
         NSDictionary *last = secs.lastObject;
         if ([last[@"day"] isEqualToNumber:@(0)]) {
             NSMutableDictionary *md = [last mutableCopy];
-            NSString *shown = failInfo.length > 110 ? [failInfo substringToIndex:110] : failInfo;
+            // v2.9.31：改成显示**尾部** —— 华为云 OBS 的签名参数（AccessKeyId/Expires/Signature）
+            // 全在 query 末尾，前面截了等于什么都没看到。
+            NSString *shown = failInfo;
+            if (shown.length > 100) shown = [@"…" stringByAppendingString:[shown substringFromIndex:shown.length - 100]];
             md[@"note"] = [NSString stringWithFormat:@"封面失败 %@", shown];
             NSMutableArray *arr = [secs mutableCopy];
             arr[arr.count - 1] = md;
