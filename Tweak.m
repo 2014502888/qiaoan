@@ -75,28 +75,26 @@
 //   ② 入口去重改窗口坐标 ±14 判定；播放页补 RTC hooks 与「目标 HH:mm:ss」角标；
 //   ③ 过了 24 点当天还没有报警时不再误报「往前 3 天都没录像」，改成保留当天
 //      抬头 + 灰色说明「当日还没有任何报警消息」，往上拉才去读前一天。
-// v2.9（定案：数据 100% 照搬官方「消息列表」页）：
-//   之前是自己照着消息列表的行为重写一遍（接口参数只能猜），一猜错就整体不对，
-//   所以怎么修都不完美。本版直接把官方那个页面拉起来当数据引擎：
-//     · 类：JANewDevWarnInfoListVC（前面几版 dump 已确认：44 个 ivar 里没有
-//       camera/device 字段，设备来自父类 JABasicViewController 的 myCamera）；
-//     · 塞成子控制器 + 挪到屏幕外 + hidden，让它 viewDidLoad/布局照常跑完，
-//       但一个像素都不显示；
-//     · 日期走它自己的 currentDateStr（yyyy-MM-dd，北京时区）；
-//     · 首屏调它自己的 loadDataFirstWithDate:showHud:isTableRefresh:finish:；
-//     · 补分页替它调 loadMoreFirstDateWithShowHud:isTableRefresh:finish:；
-//     · 结果直接读它的 warnInfoListArr（= 它 tableView 的数据源），
-//       isSelfEndMoreData 判「还有更多」、isSelfNoData 判「这天真没有」。
-//   这样条数、抓拍图、跨天、分页结果与用户在消息列表里看到的完全一致；
-//   格子页只负责「3 列 + 小时分隔」重排。官方通道不通时才依次退回直连消息
-//   模型、官方 SD 段（v2.7 原链路），保证不会比之前更差。
-// v2.9.1（修 v2.9 闪退）：
-//   v2.9 是「新建一个隐藏实例当引擎」，实测点格子回放、数据刚开始读就闪退 ——
-//   官方这页的 viewDidLoad 要建 tableView/顶部条/日历，依赖真实导航栈与窗口尺寸，
-//   屏外隐藏跑不干净。改成「捕获 + 复用」：hook 它的 viewDidLoad，把用户真打开过
-//   的那个实例按设备分桶留下来（强引用，最多 8 台），格子页直接借它自己的
-//   loadDataFirstWithDate: / loadMoreFirstDateWith... 取数。实例生命周期由官方
-//   自己管理，不再新建，从根上不会闪退；没捕获到时退回 v2.8 直连 + SD 段。
+// v2.9（数据源 = 官方「消息列表」的同一批报警消息）：
+//   「消息列表」页就是 JANewDevWarnInfoListVC，它的数据源 warnInfoListArr 来自
+//   JAMessageModel（按天分页拉取的报警消息）。所以不必借用那个页面实例，直接用
+//   JAMessageModel 走同一条接口，就能拿到同一批数据、同一批抓拍图：
+//     · JAGridFetchMessageDay：[[JAMessageModel alloc] init] + KVC 设
+//       selectedCamera / selectedDayString / searchFrom，调
+//       fetchJooanMessagesWithDay:searchFrom:devId:devName:（阿里存量走 fetchAli…）；
+//     · JAGridPollMessageModel：轮询 warnMessageList 到稳定，再替它翻页；
+//     · 结果按秒去重、按天过滤，与消息列表是同一批数据。
+//   格子页只负责「3 列 + 小时分隔」重排；这条通道取不到时才退官方 SD 段。
+// v2.9.1 / v2.9.2（已全部删除）：曾改成「新建隐藏实例 / 捕获复用用户真打开过的
+//   消息列表页」当数据引擎，两次实测都在官方网络回调里 SIGABRT（.ips：
+//   MYAFNetworkingKit handleRequestCompletion → 官方代码 → forwarding）。
+//   根因是复用共享实例：用户刚在那页滑过时，那页正在跑自己的分页请求，我们再改
+//   它的 currentDateStr、清它的 warnInfoListArr 就把它的状态打乱，回调按错状态处理。
+// v2.9.3（当前）：
+//   · 删净整段官方页复用（fetchDayMessageNative / pollNativeMessageVC /
+//     ja_msgList_viewDidLoad / hook 安装），从根上消除那条崩源；
+//   · 直连通道补翻页：首屏稳定后调 loadMoreWarningMessagesWithDay:，某一页一条也
+//     没多出就收工（最多 8 页）—— 修「只读到 22/21/20 点、19 点那条读不到」。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -978,39 +976,6 @@ static NSString *JAGridDeviceId(id cam) {
     return nil;
 }
 
-// ---------- v2.9.1：复用用户真实打开过的「消息列表」页 ----------
-// v2.9 是新建一个隐藏实例当数据引擎，实测点格子回放后闪退：官方这页的
-// viewDidLoad 要建 tableView/顶部条/日历，依赖真实导航栈与窗口尺寸，屏外隐藏
-// 跑不干净。改成「捕获 + 复用」：用户真打开过一次这页，就把这个实例留下来
-// （强引用、按设备分桶），格子页直接借它自己的 loadDataFirstWithDate: /
-// loadMoreFirstDateWith... 去取数。实例生命周期是官方自己管理的，最稳，
-// 而且它内部就是消息列表正在用的那份数据与分页，天然一致。
-// 注意：这里的定义必须排在 JAGridDeviceId 之后（它要按设备 id 分桶）。
-static NSMutableDictionary *g_msgListVCs = nil;
-static IMP g_orig_msgList_vdl = NULL;
-
-static NSString *JAMsgListKey(id cam) {
-    NSString *k = JAGridDeviceId(cam);
-    return k.length ? k : nil;
-}
-
-static id JAMsgListVCFor(id cam) {
-    if (!g_msgListVCs) return nil;
-    NSString *k = JAMsgListKey(cam);
-    if (!k.length) return nil;
-    @try { return g_msgListVCs[k]; } @catch (NSException *e) { return nil; }
-}
-
-// v2.9.2 崩溃根因：官方把 finish 回调存起来、在网络回来之后才调。
-// 若这里传 `^{}`（栈 block），函数一返回它就失效，异步调到时就是
-// 「向已释放对象发消息」→ SIGABRT（.ips 里正是 __forwarding__ + 网络回调链）。
-// 所以统一用一份长驻的堆 block：全局强引用，永不回收。
-static id g_noopFinishBlock = nil;
-static id JANoopFinish(void) {
-    if (!g_noopFinishBlock) g_noopFinishBlock = (id)[^(BOOL ok){} copy];
-    return g_noopFinishBlock;
-}
-
 static NSString *JAGridDeviceName(id cam) {
     for (NSString *k in @[@"name", @"deviceName", @"devName", @"nickName", @"remark"]) {
         id v = JAVal(cam, k);
@@ -1060,12 +1025,15 @@ static NSArray *JAGridEntriesFromMessages(NSArray *list, long long day) {
     return items;
 }
 
-// 官方消息模型是异步网络拉取：warnMessageList 会分段变长，连续 2 次不再增长才收工
+// 官方消息模型是异步网络拉取：warnMessageList 会分段变长，连续 2 次不再增长才收工。
+// v2.9.3：首屏稳定后还替它翻页（loadMoreWarningMessagesWithDay:）直到没有更多。
+// 之前只拿第 1 页 —— 这就是「只读到 22/21/20 点、19 点那条读不到」的原因。
 static void JAGridPollMessageModel(id model, long long day, NSInteger round,
                                    NSArray *best, NSInteger bestN, NSInteger stable,
+                                   NSInteger pages, NSInteger lastPageN,
                                    void (^cb)(NSArray *items)) {
-    if (round > 10) { if (cb) cb(bestN > 0 ? best : nil); return; }
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+    if (round > 40) { if (cb) cb(bestN > 0 ? best : nil); return; }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         NSArray *list = nil;
         @try { list = [model valueForKey:@"warnMessageList"]; } @catch (NSException *e) {}
@@ -1076,8 +1044,26 @@ static void JAGridPollMessageModel(id model, long long day, NSInteger round,
         __block NSInteger st = stable;
         if (n > bn) { cand = items; bn = n; st = 0; }
         else { st += 1; }
-        if (bn > 0 && st >= 2) { if (cb) cb(cand); return; }
-        JAGridPollMessageModel(model, day, round + 1, cand, bn, st, cb);
+
+        if (st >= 2 && bn > 0) {
+            // 这一页已经稳定。翻过页却一条也没多 → 确实没有更多了
+            if (pages > 0 && n <= lastPageN) { if (cb) cb(cand); return; }
+            SEL lm = NSSelectorFromString(@"loadMoreWarningMessagesWithDay:");
+            if (pages < 8 && [model respondsToSelector:lm]) {
+                BOOL ok = NO;
+                @try {
+                    ((void (*)(id, SEL, id))objc_msgSend)(model, lm, JAGridDayStr(day));
+                    ok = YES;
+                } @catch (NSException *e) { ok = NO; }
+                if (ok) {
+                    JAGridPollMessageModel(model, day, round + 1, cand, bn, 0, pages + 1, bn, cb);
+                    return;
+                }
+            }
+            if (cb) cb(cand);
+            return;
+        }
+        JAGridPollMessageModel(model, day, round + 1, cand, bn, st, pages, lastPageN, cb);
     });
 }
 
@@ -1115,7 +1101,7 @@ static void JAGridFetchMessageDay(id cam, long long day, void (^cb)(NSArray *ite
     }
     if (!sent) { if (cb) cb(nil); return; }
 
-    JAGridPollMessageModel(model, day, 0, nil, 0, 0, ^(NSArray *items) {
+    JAGridPollMessageModel(model, day, 0, nil, 0, 0, 0, 0, ^(NSArray *items) {
         if (items.count > 0 || triedAli || ![model respondsToSelector:f2]) {
             if (cb) cb(items);
             return;
@@ -1130,7 +1116,7 @@ static void JAGridFetchMessageDay(id cam, long long day, void (^cb)(NSArray *ite
             ok = YES;
         } @catch (NSException *e) { ok = NO; }
         if (!ok) { if (cb) cb(nil); return; }
-        JAGridPollMessageModel(model, day, 0, nil, 0, 0, cb);
+        JAGridPollMessageModel(model, day, 0, nil, 0, 0, 0, 0, cb);
     });
 }
 
@@ -1725,108 +1711,6 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     [self gridTryFetch:dataVC attempt:0 day:dayStart best:nil stable:0 completion:cb];
 }
 
-// ---------- v2.9：借用官方「消息列表」页的取数能力 ----------
-// 之前的做法是「照着消息列表的行为自己重写一遍」（先猜 JAMessageModel 的参数，
-// 再回退 SD 段），参数一猜错就整体不对。这里改成直接借官方页面自己的取数链路：
-//   * 它是 JABasicViewController 子类，设备走父类的 myCamera（dump 已确认）
-//   * loadDataFirstWithDate:showHud:isTableRefresh:finish: 是它自己的按天首屏
-//   * loadMoreFirstDateWithShowHud:isTableRefresh:finish: 是它自己的翻页
-//   * warnInfoListArr 就是它 tableView 的数据源，isSelfEndMoreData 是"没有更多"
-// 这样条数、抓拍图、跨天、分页结果与用户在消息列表里看到的完全一致。
-// v2.9.1：不再新建隐藏实例（会在它 viewDidLoad 时闪退），改为复用用户真打开过
-// 的那个实例（见 JAMsgListVCFor / ja_msgList_viewDidLoad）。
-
-- (void)fetchDayMessageNative:(long long)day completion:(void (^)(NSArray *items))cb {
-    // 返回约定：cb(nil) = 这条通道走不通；cb(@[]) = 官方明确说这天没有消息
-    // v2.9.1：只借用用户真实打开过的那个实例，不再新建（新建会在它 viewDidLoad
-    // 时闪退）。没捕获到就交回上层，走直连消息模型 + SD 段兜底。
-    id mvc = JAMsgListVCFor(self.myCamera);
-    if (!mvc || ![mvc isKindOfClass:UIViewController.class]) { if (cb) cb(nil); return; }
-    UIViewController *vc = (UIViewController *)mvc;
-
-    NSString *ds = JAGridDayStr(day);
-    @try { [mvc setValue:ds forKey:@"currentDateStr"]; } @catch (NSException *e) {}
-    // 先清掉它上次留下的数据，免得把别的天/别的设备的结果当成本天结果
-    @try {
-        id arr = [mvc valueForKey:@"warnInfoListArr"];
-        if ([arr isKindOfClass:NSMutableArray.class]) [(NSMutableArray *)arr removeAllObjects];
-    } @catch (NSException *e) {}
-
-    SEL ldf = NSSelectorFromString(@"loadDataFirstWithDate:showHud:isTableRefresh:finish:");
-    if (![vc respondsToSelector:ldf]) { if (cb) cb(nil); return; }
-    // finish 由官方异步调用，必须给长驻堆 block（栈 block 会失效→闪退）
-    id noopFinish = JANoopFinish();
-    BOOL sent = NO;
-    @try {
-        ((void (*)(id, SEL, id, BOOL, BOOL, id))objc_msgSend)(vc, ldf, ds, NO, NO, noopFinish);
-        sent = YES;
-    } @catch (NSException *e) {}
-    if (!sent) {
-        // 首参也可能是 NSDate；字符串版本抛了就用 NSDate 再试一次
-        @try {
-            NSDate *d = [NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)day];
-            ((void (*)(id, SEL, id, BOOL, BOOL, id))objc_msgSend)(vc, ldf, d, NO, NO, noopFinish);
-            sent = YES;
-        } @catch (NSException *e2) {}
-    }
-    if (!sent) { if (cb) cb(nil); return; }
-
-    [self pollNativeMessageVC:vc day:day round:0 lastN:0 stable:0 moreLoads:0 completion:cb];
-}
-
-// 轮询官方页的数据源：条数不再增长就收工；还有更多页就替它调翻页
-- (void)pollNativeMessageVC:(UIViewController *)mvc day:(long long)day
-                       round:(NSInteger)round lastN:(NSInteger)lastN
-                      stable:(NSInteger)stable moreLoads:(NSInteger)moreLoads
-                  completion:(void (^)(NSArray *items))cb {
-    __weak typeof(self) ws = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        __strong typeof(ws) s = ws;
-        if (!s) return;
-        NSArray *arr = nil;
-        @try { arr = [mvc valueForKey:@"warnInfoListArr"]; } @catch (NSException *e) {}
-        NSInteger n = [arr isKindOfClass:NSArray.class] ? (NSInteger)arr.count : 0;
-        BOOL end = NO;
-        @try { end = [[mvc valueForKey:@"isSelfEndMoreData"] boolValue]; } @catch (NSException *e) {}
-        // 官方自己判定的「我这台设备这天没有消息」，是这个页面唯一的权威空答案
-        BOOL noData = NO;
-        @try { noData = [[mvc valueForKey:@"isSelfNoData"] boolValue]; } @catch (NSException *e) {}
-
-        NSInteger ls = lastN;
-        NSInteger st = stable;
-        NSInteger ml = moreLoads;
-        if (n > ls) { ls = n; st = 0; } else { st += 1; }
-
-        // 数据停了但官方说还有更多 → 替它翻一页（最多 6 页，防止死循环）
-        if (st >= 2 && n > 0 && !end && ml < 6) {
-            SEL lm = NSSelectorFromString(@"loadMoreFirstDateWithShowHud:isTableRefresh:finish:");
-            if ([mvc respondsToSelector:lm]) {
-                @try {
-                    id noop2 = JANoopFinish();
-                    ((void (*)(id, SEL, BOOL, BOOL, id))objc_msgSend)(mvc, lm, NO, NO, noop2);
-                    ml += 1;
-                    st = 0;
-                } @catch (NSException *e) { end = YES; }
-            } else {
-                end = YES;
-            }
-        }
-
-        // 收工条件只看「数据稳定」，noData 只用来区分「权威空」还是「通道没跑起来」
-        BOOL done = (st >= 3) || (round >= 16) || (st >= 2 && (end || ml >= 6));
-        if (done) {
-            NSArray *items = JAGridEntriesFromMessages(arr, day);
-            // 一条都没拿到、官方也没说自己「无数据」→ 当作通道没跑起来，
-            // 交回上层继续试，避免把「网络没回来」误判成「这天没有报警」
-            if (n == 0 && !noData) { if (cb) cb(nil); return; }
-            if (cb) cb(items ?: @[]);
-            return;
-        }
-        [s pollNativeMessageVC:mvc day:day round:round + 1 lastN:ls
-                          stable:st moreLoads:ml completion:cb];
-    });
-}
 
 // v2.7：多次采样，取「该天有效条数最多」的那次，连续 2 次不再增长才收工。
 // 官方列表是异步/分段回来的，一拿到非空就返回会少条 —— 这正对应
@@ -1898,37 +1782,25 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         self.hintLab.hidden = YES;
     } else if (!cached.count && self.days.count == 0) {
         self.hintLab.hidden = NO;
-        // v2.9.1：要复用官方消息列表的实例才谈得上「完全一样」。还没打开过那页时
-        // 给一句明确引导，不然用户会以为这版没生效。
-        if (!JAMsgListVCFor(self.myCamera)) {
-            self.hintLab.text = @"正在读取该日录像…\n（先在「消息列表」打开一次这台设备，这里的条数就会和它完全一致）";
-        } else {
-            self.hintLab.text = @"正在读取该日录像…";
-        }
+        self.hintLab.text = @"正在读取该日录像…";
     }
 
     __weak typeof(self) ws = self;
-    // ② v2.9：官方消息列表页（隐藏实例）—— 数据/分页/抓拍图与它自己完全一致
-    [self fetchDayMessageNative:day completion:^(NSArray *items) {
+    // ② 直连官方消息模型（v2.8 那层，v2.9.3 补上翻页直到没有更多）
+    // 不再复用「消息列表」页实例：用户刚在那页滑过时，那页正在跑自己的请求，
+    // 我们改它的日期/清它的数组会把它的状态打乱，它的网络回调就崩
+    // （.ips 里 MYAFNetworkingKit 回调 → 官方代码 → forwarding 就是这条）。
+    JAGridFetchMessageDay(self.myCamera, day, ^(NSArray *items) {
         __strong typeof(ws) s = ws;
         if (!s) return;
-        if (items) {              // 非 nil（哪怕是空数组）= 官方给了权威答案
-            [s onDayLoaded:day items:items];
-            return;
-        }
-        // ③ 通道走不通才退到「直连 JAMessageModel」（v2.8 那层）
-        JAGridFetchMessageDay(s.myCamera, day, ^(NSArray *a2) {
+        if (items.count > 0) { [s onDayLoaded:day items:items]; return; }
+        // ③ 最后回退官方 SD 段（v2.7 原链路，保证不比之前差）
+        [s fetchDaySD:day completion:^(NSArray *events) {
             __strong typeof(ws) s2 = ws;
             if (!s2) return;
-            if (a2.count > 0) { [s2 onDayLoaded:day items:a2]; return; }
-            // ④ 最后回退官方 SD 段（v2.7 原链路，保证不比之前差）
-            [s2 fetchDaySD:day completion:^(NSArray *events) {
-                __strong typeof(ws) s3 = ws;
-                if (!s3) return;
-                [s3 onDayLoaded:day items:JAGridEntriesFromEvents(events, day)];
-            }];
-        });
-    }];
+            [s2 onDayLoaded:day items:JAGridEntriesFromEvents(events, day)];
+        }];
+    });
 }
 
 - (void)onDayLoaded:(long long)day items:(NSArray *)items {
@@ -2874,21 +2746,6 @@ static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved) {
 
 static BOOL JAHooked = NO;  // 详情页 hook（clickCloudRecordAction 主链）
 
-static void ja_msgList_viewDidLoad(id self, SEL _cmd) {
-    if (g_orig_msgList_vdl) ((void (*)(id, SEL))g_orig_msgList_vdl)(self, _cmd);
-    @try {
-        NSString *k = JAMsgListKey(JAVal(self, @"myCamera"));
-        if (!k.length) return;
-        if (!g_msgListVCs) g_msgListVCs = [NSMutableDictionary dictionary];
-        // 每台设备留一份；超过 8 台就丢最早的那份，别让多个页面常驻
-        if (g_msgListVCs.count >= 8 && !g_msgListVCs[k]) {
-            id oldest = [[g_msgListVCs allKeys] firstObject];
-            if (oldest) [g_msgListVCs removeObjectForKey:oldest];
-        }
-        g_msgListVCs[k] = self;
-    } @catch (NSException *e) {}
-}
-
 static void JAHook(void) {
     // 详情页主链
     if (!JAHooked) {
@@ -2899,14 +2756,6 @@ static void JAHook(void) {
             JASetImp(detailCls, @selector(handleJumpToOpenCloud), (IMP)ja_handleJumpToOpenCloud,
                      &g_orig_handleJumpToOpenCloud);
             JAHooked = YES;
-        }
-    }
-    // v2.9.1：捕获用户真实打开过的「消息列表」页（按设备分桶留用）
-    {
-        Class msgCls = NSClassFromString(@"JANewDevWarnInfoListVC");
-        if (msgCls) {
-            JASetImp(msgCls, @selector(viewDidLoad), (IMP)ja_msgList_viewDidLoad,
-                     &g_orig_msgList_vdl);
         }
     }
     // RTC SD 播放器 hooks（viewDidAppear 自动定位 / viewDidDisappear 返回停流；
