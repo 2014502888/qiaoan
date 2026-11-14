@@ -159,6 +159,14 @@
 //     ② 正在拖 / 惯性滑动时不重建，攒到松手再一次性刷新；
 //     ③ 同一张封面图只发一个下载请求（否则每次重建都重复请求，图在占位与图片之间跳）；
 //     ④ 收工那次如果条数没变就跳过重建。
+// v2.9.15：
+//   · 导航栏去掉「正在加载」横幅，只留「回放」并真正居中（之前容器宽度把那个 alpha=0
+//     的「正在加载」也算进去，字实际偏左）。
+//   · 封面下载限 3 并发 + 失败自动重试 2 次（1s、2s）。第二台那个设备首屏一次要拉十几张图，
+//     全部同时打出去会被服务端吞掉一部分 —— 官方消息列表里就是「最上面那 9 条没封面，
+//     往下拉滑走再滑回来就有了」（cell 复用等于重拉一次）。
+//   · 进页面后 1.2s/3s/6s/12s 各补一次「还没图」的可见格子（不重建列表、不闪），
+//     兜住「抓拍地址晚一点才填到消息对象上」这一种情况。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1558,6 +1566,8 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 @interface JAGridImageCache : NSObject
 @property (nonatomic, strong) NSCache *mem;
 @property (nonatomic, strong) NSMutableDictionary *inflight;   // v2.9.14：同 URL 去重
+@property (nonatomic, strong) NSMutableArray *queue;           // v2.9.15：限并发排队
+@property (nonatomic, assign) NSInteger active;                // 当前在跑的下载数
 + (instancetype)shared;
 - (UIImage *)imageForKey:(NSString *)key;
 - (void)loadURL:(NSString *)url completion:(void (^)(UIImage *img, NSString *key))cb;
@@ -1576,6 +1586,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         _mem = [[NSCache alloc] init];
         _mem.countLimit = 160;
         _inflight = [NSMutableDictionary dictionary];
+        _queue = [NSMutableArray array];
     }
     return self;
 }
@@ -1605,12 +1616,33 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     wait = [NSMutableArray array];
     if (cb) [wait addObject:[cb copy]];
     self.inflight[url] = wait;
-    NSURL *u = [NSURL URLWithString:url];
-    if (!u) {
-        [self.inflight removeObjectForKey:url];
-        if (cb) cb(nil, url);
-        return;
+    [self jaStart:url];
+}
+
+// v2.9.15：限制并发。第二台那个设备首屏一次要拉十几张图，一起打出去服务端会吞掉一部分 ——
+// 官方消息列表里表现为「最上面那 9 条没封面，往下拉滑走再滑回来就有了」（cell 复用等于重拉一次）。
+// 我们这边同时最多跑 3 个，其余排队。
+- (void)jaStart:(NSString *)url {
+    if (self.active >= 3) { [self.queue addObject:url]; return; }
+    self.active += 1;
+    [self jaFetch:url retry:0];
+}
+
+- (void)jaFinish:(NSString *)url image:(UIImage *)img {
+    if (self.active > 0) self.active -= 1;
+    NSArray *ws = [self.inflight[url] copy];
+    [self.inflight removeObjectForKey:url];
+    for (void (^b)(UIImage *, NSString *) in ws) { if (b) b(img, url); }
+    if (self.queue.count > 0) {
+        NSString *next = (NSString *)self.queue.firstObject;
+        [self.queue removeObjectAtIndex:0];
+        [self jaStart:next];
     }
+}
+
+- (void)jaFetch:(NSString *)url retry:(NSInteger)retry {
+    NSURL *u = [NSURL URLWithString:url];
+    if (!u) { [self jaFinish:url image:nil]; return; }
     NSURLSessionDataTask *t = [[NSURLSession sharedSession]
         dataTaskWithURL:u completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
             UIImage *img = nil;
@@ -1621,9 +1653,13 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
                 if (dp.length) [data writeToFile:dp atomically:YES];
             }
             dispatch_async(dispatch_get_main_queue(), ^{
-                NSArray *ws = [self.inflight[url] copy];
-                [self.inflight removeObjectForKey:url];
-                for (void (^b)(UIImage *, NSString *) in ws) { if (b) b(img, url); }
+                if (img || retry >= 2) { [self jaFinish:url image:img]; return; }
+                // 失败自动重试两次（1s、2s）—— 官方列表靠滑动重新拉才出图，这里直接补
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                             (int64_t)((1.0 + retry) * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    [self jaFetch:url retry:retry + 1];
+                });
             });
         }];
     [t resume];
@@ -1638,6 +1674,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 @property (nonatomic, strong) UILabel *noneLab;      // v2.6：没有封面时的占位文字
 @property (nonatomic, strong) UIView *playDot;
 @property (nonatomic, copy) NSString *imgURL;
+@property (nonatomic, strong) NSDictionary *entryRef;   // v2.9.15：延迟补封面用
 - (void)setImageURL:(NSString *)url;
 - (void)showImage:(UIImage *)img;   // v2.8：消息模型自带 thumbImg，直接显示
 @end
@@ -1877,7 +1914,6 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 @property (nonatomic, strong) NSMutableArray *flat;    // 与 secs 顺序完全一致，连播/翻页索引用
 @property (nonatomic, strong) UICollectionView *cv;
 @property (nonatomic, strong) UILabel *hintLab;
-@property (nonatomic, strong) UILabel *loadingLab;      // v2.9.6：标题右边的「正在加载」
 @property (nonatomic, strong) NSMutableArray *retained; // 借用中的官方 dataVC（保活）
 @property (nonatomic, assign) long long nextDay;
 @property (nonatomic, assign) BOOL loading;
@@ -1896,42 +1932,29 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 
 @implementation JAGridReplayViewController
 
-// v2.9.6：导航中间「回放 + 正在加载」—— 加载时右边出现蓝色「正在加载」，读完自动消失，
-// 不用再去消息列表确认读完没有
+// v2.9.15：去掉「正在加载」横幅，标题只剩「回放」，并且真正居中 ——
+// 之前 titleView 容器宽度把那个 alpha=0 的「正在加载」也算进去了，「回放」实际偏左。
 - (void)buildTitleView {
     UILabel *t = [[UILabel alloc] initWithFrame:CGRectZero];
     t.text = @"回放";
     t.font = [UIFont boldSystemFontOfSize:17];
     t.textColor = [UIColor blackColor];
+    t.textAlignment = NSTextAlignmentCenter;
     [t sizeToFit];
 
-    UILabel *ld = [[UILabel alloc] initWithFrame:CGRectZero];
-    ld.text = @"正在加载";
-    ld.font = [UIFont systemFontOfSize:13];
-    ld.textColor = [UIColor colorWithRed:0.13 green:0.55 blue:0.95 alpha:1.0];
-    [ld sizeToFit];
-    // 用 alpha 而不是 hidden：宽度一直留着，「回放」不会随加载状态左右跳
-    ld.alpha = 0.0;
-    self.loadingLab = ld;
-
-    CGFloat h = MAX(CGRectGetHeight(t.frame), CGRectGetHeight(ld.frame));
-    CGFloat gap = 10.0;
+    CGFloat h = 32.0;
     CGFloat wt = CGRectGetWidth(t.frame);
-    CGFloat wl = CGRectGetWidth(ld.frame);
-    UIView *box = [[UIView alloc] initWithFrame:CGRectMake(0, 0, wt + gap + wl, h)];
-    t.frame = CGRectMake(0, (h - CGRectGetHeight(t.frame)) / 2.0, wt, CGRectGetHeight(t.frame));
-    ld.frame = CGRectMake(wt + gap, (h - CGRectGetHeight(ld.frame)) / 2.0,
-                          wl, CGRectGetHeight(ld.frame));
+    CGFloat w = wt + 12.0;      // 容器只包住这两个字，左右各留 6pt；容器整体在导航栏居中
+    UIView *box = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
+    t.frame = CGRectMake((w - wt) / 2.0, (h - CGRectGetHeight(t.frame)) / 2.0,
+                         wt, CGRectGetHeight(t.frame));
     [box addSubview:t];
-    [box addSubview:ld];
     self.navigationItem.titleView = box;
 }
 
+// v2.9.15：横幅已去掉，保留空实现，原来的调用点不用动
 - (void)setLoadingBadge:(BOOL)on {
-    if (!self.loadingLab) return;
-    [UIView animateWithDuration:0.18 animations:^{
-        self.loadingLab.alpha = on ? 1.0 : 0.0;
-    }];
+    (void)on;
 }
 
 - (void)viewDidLoad {
@@ -2043,6 +2066,19 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         self.didFirstLoad = YES;
         if (self.nextDay <= 0 || self.nextDay > today) self.nextDay = today;
         [self loadOneMoreDay];
+    }
+
+    // v2.9.15：分几个时间点补一次「还没有封面」的格子。第二台设备的抓拍图在首屏那一刻
+    // 可能还没填到消息对象上 —— 官方消息列表里那几条也是滑动之后才出图的。这里只补图，
+    // 不重建列表，所以不会闪。
+    __weak typeof(self) wself = self;
+    for (NSNumber *d in @[@1.2, @3.0, @6.0, @12.0]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            __strong typeof(wself) s = wself;
+            if (s) [s refreshMissingCovers];
+        });
     }
 }
 
@@ -2377,6 +2413,29 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     if (fabs(y - off.y) > 0.5) cv.contentOffset = CGPointMake(off.x, y);
 }
 
+// v2.9.15：只给「还没有图」的可见格子补一次封面 —— 重新从消息对象取地址。
+// 第二台设备首屏那几条的抓拍地址要晚一点才填上（官方消息列表里也是滑动之后才出图，
+// 我们这边不靠滑动，直接定时补）。只补图不重建列表，所以不闪。
+- (void)refreshMissingCovers {
+    UICollectionView *cv = self.cv;
+    if (!cv) return;
+    for (JAGridCell *c in cv.visibleCells) {
+        if (![c isKindOfClass:JAGridCell.class]) continue;
+        if (c.thumb.image) continue;
+        NSDictionary *e = c.entryRef;
+        if (!e) continue;
+        NSString *u = nil;
+        id raw = e[@"img"];
+        if ([raw isKindOfClass:NSString.class]) u = (NSString *)raw;
+        if (!u.length) u = JAGridImageURL(e[@"ev"]);
+        if (!u.length) continue;
+        if ([e isKindOfClass:NSMutableDictionary.class]) {
+            [(NSMutableDictionary *)e setObject:u forKey:@"img"];
+        }
+        [c setImageURL:u];
+    }
+}
+
 // ---------- 集合视图 ----------
 
 - (NSInteger)numberOfSectionsInCollectionView:(UICollectionView *)collectionView {
@@ -2397,6 +2456,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         NSArray *items = (NSArray *)secDict[@"items"];
         if (ip.item < (NSInteger)items.count) {
             NSDictionary *e = (NSDictionary *)items[ip.item];
+            c.entryRef = e;
             NSNumber *sec = (NSNumber *)e[@"sec"];
             c.timeLab.text = JAGridTimeText(sec.longLongValue);
             id imgObj = e[@"imgObj"];
