@@ -149,6 +149,10 @@
 //     父视图里有没有「云存储/AI分析」文字 —— 第三台那种型号入口容器和文字不在同一层，
 //     于是被误判成残影删掉，下一 tick 又装回来，入口一直闪。现在改成往 cell 内整条链
 //     找文字，并且必须连续 3 次 tick 都判无效才删，防滚动/复用瞬间抖动。
+// v2.9.13：
+//   · 格子页改成「边读边显示」：以前要等翻满 24 页才一次性上屏，用户盯着
+//     「正在读取该日录像…」等几十秒。现在每翻到一页就把这批格子推上去（最新的在最上面），
+//     后台继续往早补，先看到最近这段时间，再慢慢补到当天最早的一条。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1299,12 +1303,16 @@ static NSArray *JAGridEntriesFromMessages(NSArray *list, long long day) {
 // v2.9.10 不再看 _isLoading，只按结果自适应：每轮 1.5s（首屏 2.4s），翻一页就看长度
 //   有没有变；没变就把同一页重试（最多 3 次），变了继续；成功翻满 24 页收工；
 //   首屏 6s 还一条没有才当空天。
+// v2.9.13：每翻到一页就立刻回调 prog 上屏（不再等全部翻完才一次性显示）——
+//   首屏那页一到，最近这段时间的格子就先出来，后面的页在后台继续往早补。
+//   用户看到的「正在读取该日录像…」因此只存在最前面那一两秒。
 static void JAGridPollMessageModel(id model, long long day, NSInteger round,
                                    NSArray *best, NSInteger bestN, NSInteger okPages,
                                    NSInteger retry,
+                                   void (^prog)(NSArray *items),
                                    void (^cb)(NSArray *items)) {
     if (round > 150) { if (cb) cb(bestN > 0 ? best : nil); return; }
-    NSTimeInterval wait = (round == 0) ? 2.4 : 1.5;
+    NSTimeInterval wait = (round == 0) ? 2.0 : 1.4;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         NSArray *list = nil;
@@ -1313,21 +1321,25 @@ static void JAGridPollMessageModel(id model, long long day, NSInteger round,
         NSInteger n = items ? (NSInteger)items.count : 0;
         NSArray *cand = best;
         NSInteger bn = bestN;
-        if (n > bn) { cand = items; bn = n; }
+        if (n > bn) {
+            cand = items;
+            bn = n;
+            if (prog) prog(cand);       // 有新增就先把这批推上去
+        }
         SEL lm = NSSelectorFromString(@"loadMoreWarningMessagesWithDay:");
         BOOL canMore = [model respondsToSelector:lm];
 
         if (round == 0) {
             // 首屏：数据还没到就再等等（最多 4 次 ≈ 6s），别把「慢」当成「当天没报警」
             if (bn == 0 && retry < 4) {
-                JAGridPollMessageModel(model, day, round + 1, cand, bn, 0, retry + 1, cb);
+                JAGridPollMessageModel(model, day, round + 1, cand, bn, 0, retry + 1, prog, cb);
                 return;
             }
             if (!canMore || okPages >= 24) { if (cb) cb(cand); return; }
             @try {
                 ((void (*)(id, SEL, id))objc_msgSend)(model, lm, JAGridDayStr(day));
             } @catch (NSException *e) { if (cb) cb(cand); return; }
-            JAGridPollMessageModel(model, day, round + 1, cand, bn, 0, 0, cb);
+            JAGridPollMessageModel(model, day, round + 1, cand, bn, 0, 0, prog, cb);
             return;
         }
 
@@ -1337,7 +1349,7 @@ static void JAGridPollMessageModel(id model, long long day, NSInteger round,
             @try {
                 ((void (*)(id, SEL, id))objc_msgSend)(model, lm, JAGridDayStr(day));
             } @catch (NSException *e) { if (cb) cb(cand); return; }
-            JAGridPollMessageModel(model, day, round + 1, cand, bn, okPages + 1, 0, cb);
+            JAGridPollMessageModel(model, day, round + 1, cand, bn, okPages + 1, 0, prog, cb);
             return;
         }
         // 一条没多：可能被官方自己的在途请求吞了，重试同一页（最多 3 次）
@@ -1345,15 +1357,18 @@ static void JAGridPollMessageModel(id model, long long day, NSInteger round,
             @try {
                 ((void (*)(id, SEL, id))objc_msgSend)(model, lm, JAGridDayStr(day));
             } @catch (NSException *e) { if (cb) cb(cand); return; }
-            JAGridPollMessageModel(model, day, round + 1, cand, bn, okPages, retry + 1, cb);
+            JAGridPollMessageModel(model, day, round + 1, cand, bn, okPages, retry + 1, prog, cb);
             return;
         }
         if (cb) cb(cand);
     });
 }
 
-// 拉「某设备某天」的报警消息；cb(nil) 表示这条通道走不通（调用方回退官方 SD 段）
-static void JAGridFetchMessageDay(id cam, long long day, void (^cb)(NSArray *items)) {
+// 拉「某设备某天」的报警消息；prog 每翻到一页就回调一次（先上屏），cb(nil) 表示这条通道
+// 走不通（调用方回退官方 SD 段）
+static void JAGridFetchMessageDay(id cam, long long day,
+                                  void (^prog)(NSArray *items),
+                                  void (^cb)(NSArray *items)) {
     Class mc = NSClassFromString(@"JAMessageModel");
     NSString *devId = JAGridDeviceId(cam);
     if (!mc || !devId.length) { if (cb) cb(nil); return; }
@@ -1386,7 +1401,7 @@ static void JAGridFetchMessageDay(id cam, long long day, void (^cb)(NSArray *ite
     }
     if (!sent) { if (cb) cb(nil); return; }
 
-    JAGridPollMessageModel(model, day, 0, nil, 0, 0, 0, ^(NSArray *items) {
+    JAGridPollMessageModel(model, day, 0, nil, 0, 0, 0, prog, ^(NSArray *items) {
         if (items.count > 0 || triedAli || ![model respondsToSelector:f2]) {
             if (cb) cb(items);
             return;
@@ -1401,7 +1416,7 @@ static void JAGridFetchMessageDay(id cam, long long day, void (^cb)(NSArray *ite
             ok = YES;
         } @catch (NSException *e) { ok = NO; }
         if (!ok) { if (cb) cb(nil); return; }
-        JAGridPollMessageModel(model, day, 0, nil, 0, 0, 0, cb);
+        JAGridPollMessageModel(model, day, 0, nil, 0, 0, 0, prog, cb);
     });
 }
 
@@ -2130,7 +2145,17 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     // 不再复用「消息列表」页实例：用户刚在那页滑过时，那页正在跑自己的请求，
     // 我们改它的日期/清它的数组会把它的状态打乱，它的网络回调就崩
     // （.ips 里 MYAFNetworkingKit 回调 → 官方代码 → forwarding 就是这条）。
-    JAGridFetchMessageDay(self.myCamera, day, ^(NSArray *items) {
+    // v2.9.13：每翻到一页先把这批格子推上屏（最新的在最上面），后台再继续往早补，
+    // 不用盯着「正在读取该日录像…」等几十秒才出东西。
+    JAGridFetchMessageDay(self.myCamera, day,
+                          ^(NSArray *partial) {
+        __strong typeof(ws) s0 = ws;
+        if (!s0 || partial.count == 0) return;
+        [s0.knownDays addObject:@(day)];
+        [s0 appendDay:day items:partial];
+        s0.hintLab.hidden = YES;
+    },
+                          ^(NSArray *items) {
         __strong typeof(ws) s = ws;
         if (!s) return;
         if (items.count > 0) { [s onDayLoaded:day items:items]; return; }
