@@ -238,6 +238,8 @@
 //     （已有 %XX 原样保留，不会二次编码）。
 //   · 格子上失败文字细化：`失败 403`=被拒、`失败 e-1022`=被 ATS 拦、`失败 e-1001`=超时、
 //     `失败 e-1004`=连不上、`失败 e-1003`=DNS 不通、`失败 地址`=URL 非法没发出去。
+// v2.9.28：ProxyPin 抓到官方 UA 是 `Joolink/26101509371 CFNetwork/1312 Darwin/21.0.0`，
+//   我们上一版是自己拼的浏览器式 UA，差的远 —— 已改成照抄官方值，Accept 也改回 `*/*`。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1847,10 +1849,14 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     if (!u) { [self jaFinish:url image:nil]; return; }
     // v2.9.23：带上 App 的 User-Agent 跟常规图片请求头。第二台设备那张抓拍图 jpg 地址是对的，
     // 但裸 session 请求图片 CDN 会被判成非 App 流量直接拒（格子上一直是「失败.jpg」）。
+    // v2.9.28：UA 照抄官方实测值 —— 2026-11-15 用 ProxyPin 抓到的官方请求头就是
+    //   Joolink/26101509371 CFNetwork/1312 Darwin/21.0.0
+    // 上一版是我自己拼的浏览器式 UA（... Joolink/4.79），跟官方差很远，
+    // 如果 CDN 按 UA 做白名单，正好会被挡掉。
     NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:u];
-    [rq setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Joolink/4.79"
+    [rq setValue:@"Joolink/26101509371 CFNetwork/1312 Darwin/21.0.0"
         forHTTPHeaderField:@"User-Agent"];
-    [rq setValue:@"image/*,*/*;q=0.8" forHTTPHeaderField:@"Accept"];
+    [rq setValue:@"*/*" forHTTPHeaderField:@"Accept"];
     [rq setValue:@"https://www.jooancloud.com/" forHTTPHeaderField:@"Referer"];
     rq.timeoutInterval = 12.0;
     NSURLSessionDataTask *t = [[NSURLSession sharedSession]
