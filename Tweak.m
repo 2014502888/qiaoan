@@ -240,6 +240,18 @@
 //     `失败 e-1004`=连不上、`失败 e-1003`=DNS 不通、`失败 地址`=URL 非法没发出去。
 // v2.9.28：ProxyPin 抓到官方 UA 是 `Joolink/26101509371 CFNetwork/1312 Darwin/21.0.0`，
 //   我们上一版是自己拼的浏览器式 UA，差的远 —— 已改成照抄官方值，Accept 也改回 `*/*`。
+// v2.9.29：抓包对图片不敏感（三份 HAR 全是启动流量），改成「失败时让格子自己报域名」。
+// v2.9.30~32：底部诊断条逐步改成三行短文本（状态码|字节数 / 路径尾段 / 签名参数缩写 AK/Exp/Sg），
+//   标签 numberOfLines=0 换行、section 高度 92；发送前把 query 里的 '+' 转成 %2B
+//   （OBS 预签名 URL 的 Signature 是 base64，'+' 在 query 里会被当空格解码）。
+// v2.9.33：诊断再加「返回数据前 8 字节」—— 能不能出图，看这 16 个十六进制字符就知道。
+// v2.9.34（封面根因定案 + 修复）：第 2 台监控的抓拍图存在华为云 OBS
+//   qiaoan-thn.obs.cn-east-3.myhuaweicloud.com，文件名带 `_enc`。实测：
+//   HTTP 200、body 20982 字节，但头是 E8 2A 2D C4 F8 6C DA 93 —— 不是 JPEG 魔数
+//   FF D8 FF，是加密数据。所以跟地址、签名、UA、Referer、解码器统统无关。
+//   官方有 JADecryptionTool：+jaDecryptImagewithURL:withData:withCameraUID:withCameraPwd:，
+//   密钥由「设备 uid + 摄像头查看密码」在本地推出来（日志里的「AES Key: %@」就是这个），
+//   不需要联网取 key。本版直接从 MyCamera 取 uid/viewPwd（空则退 dev_pwd）调官方解密。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1732,14 +1744,56 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     return [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%08x.img", h]];
 }
 
-@interface JAGridImageCache : NSObject
-@property (nonatomic, strong) NSCache *mem;
+// v2.9.34：华为云 OBS 上的抓拍图是**加密**的（文件名带 _enc，返回体头不是 JPEG 魔数
+// FF D8 FF，实测拿到的是 E8 2A 2D C4… 这种随机值，20982 字节）。
+// 官方 App 用 JADecryptionTool 在本地解 —— 密钥由「设备 UID + 摄像头密码」推出来，
+// 不联网也能解。这里直接调用官方这个类方法，不自己实现 AES：
+//   + jaDecryptImagewithURL:withData:withCameraUID:withCameraPwd:  → 返回 UIImage / NSData / 路径字符串
+static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam) {
+    if (!data.length || !url.length || !cam) return nil;
+    Class cls = NSClassFromString(@"JADecryptionTool");
+    if (!cls) return nil;
+    SEL sel = NSSelectorFromString(@"jaDecryptImagewithURL:withData:withCameraUID:withCameraPwd:");
+    if (![cls respondsToSelector:sel]) return nil;
+    NSString *uid = nil, *pwd = nil;
+    @try { id v = [cam valueForKey:@"uid"]; if ([v isKindOfClass:[NSString class]]) uid = v; } @catch (NSException *e) {}
+    @try { id v = [cam valueForKey:@"viewPwd"]; if ([v isKindOfClass:[NSString class]]) pwd = v; } @catch (NSException *e) {}
+    if (!pwd.length) {
+        @try { id v = [cam valueForKey:@"dev_pwd"]; if ([v isKindOfClass:[NSString class]]) pwd = v; } @catch (NSException *e) {}
+    }
+    if (!uid.length) return nil;
+    id r = nil;
+    @try {
+        r = ((id (*)(id, SEL, id, id, id, id))objc_msgSend)(cls, sel, url, data, uid, (pwd.length ? pwd : @""));
+    } @catch (NSException *e) { r = nil; }
+    if ([r isKindOfClass:[UIImage class]]) return (UIImage *)r;
+
+    // 结果可能是 NSData，也可能是「已解密好的本地文件路径」
+    NSData *out = nil;
+    if ([r isKindOfClass:[NSData class]]) out = (NSData *)r;
+    else if ([r isKindOfClass:[NSString class]] && [(NSString *)r length]) {
+        out = [NSData dataWithContentsOfFile:(NSString *)r];
+    }
+    if (!out.length) return nil;
+    UIImage *img = [UIImage imageWithData:out];
+    if (img) return img;
+    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)out, NULL);
+    if (src) {
+        CGImageRef cg = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+        if (cg) { img = [UIImage imageWithCGImage:cg]; CGImageRelease(cg); }
+        CFRelease(src);
+    }
+    return img;
+}
+
+@interface JAGridImageCache : NSObject@property (nonatomic, strong) NSCache *mem;
 @property (nonatomic, strong) NSMutableDictionary *inflight;   // v2.9.14：同 URL 去重
 @property (nonatomic, strong) NSMutableDictionary *fails;      // v2.9.23：同一 URL 连续失败次数
 @property (nonatomic, strong) NSMutableDictionary *codes;      // v2.9.23：失败时的 HTTP 状态码
 @property (nonatomic, strong) NSMutableArray *queue;           // v2.9.15：限并发排队
 @property (nonatomic, assign) NSInteger active;                // 当前在跑的下载数
 @property (nonatomic, strong) NSString *firstFailInfo;         // v2.9.30：第一个失败样本的现场（排查用）
+@property (nonatomic, weak) id cam;                            // v2.9.34：当前设备的 MyCamera（解密加密封面要用 uid+pwd）
 + (instancetype)shared;
 - (UIImage *)imageForKey:(NSString *)key;
 - (void)loadURL:(NSString *)url completion:(void (^)(UIImage *img, NSString *key))cb;
@@ -1901,6 +1955,9 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
                             CFRelease(src);
                         }
                     }
+                    // v2.9.34：还是解不出来 —— 这台设备的抓拍图是加密存的（_enc.jpg），
+                    // 交给官方的 JADecryptionTool 解（密钥来自 uid + 摄像头密码，本地就能解）。
+                    if (!img) img = JADecryptImageDataWithCamera(data, url, self.cam);
                 }
             }
             if (!img) {
@@ -2464,6 +2521,8 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     // v2.9.20：先藏掉官方播放器残留的「回放倍数选择」浮层，它正好压在日期抬头上面，
     // 而且带模态遮罩，会把返回按钮也一起挡掉。
     g_jaGridHostView = self.view;
+    // v2.9.34：把当前设备交给图片缓存 —— 加密抓拍图要拿它的 uid + 查看密码去解。
+    [JAGridImageCache shared].cam = self.myCamera;
     JAGridToggleSpeedPanel(YES);
 }
 
