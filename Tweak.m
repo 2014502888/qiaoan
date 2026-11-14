@@ -225,6 +225,9 @@
 //   触发（这也解释了为什么空天反而更容易卡死）。
 //   · 蒙层直接挂在窗口上时，连整个窗口一起 hidden（只关窗口，状态栏才回得来）；
 //   · 摘完之后由格子页自己接管状态栏：prefersStatusBarHidden 恒为 NO，并主动刷新。
+// v2.9.26：**彻底去掉 SD 卡回退通道**。方案 1 的数据源就是消息列表，读不到就是「当天没有」。
+//   回退要现建官方 SD 回放 VC —— 它一初始化就把三屏引导蒙层挂到窗口上（全屏吞手势 + 藏
+//   状态栏），空天最容易触发，还要多等一轮。去掉后空天第一页返回就收工，不再等待。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -2453,6 +2456,10 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
 }
 
 // ---------- 拉一天事件（借官方数据层） ----------
+// v2.9.26：**已停用**，不再被任何地方调用。留在这里只作排查参考。
+// 停用原因：它要现建一个官方 JANewRtcSDPlayViewController，那个 VC 初始化时会把
+// JATHreeScreenGuidedSlidingView（三屏引导蒙层）挂到窗口上 —— 全屏吞手势、藏状态栏，
+// 「当天没报警消息」时反而最容易触发。方案 1 的数据源是消息列表，SD 通道不需要。
 
 - (void)fetchDaySD:(long long)dayStart completion:(void (^)(NSArray *events))cb {
     Class rtc = NSClassFromString(@"JANewRtcSDPlayViewController");
@@ -2602,12 +2609,10 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
         __strong typeof(ws) s = ws;
         if (!s) return;
         if (items.count > 0) { [s onDayLoaded:day items:items]; return; }
-        // ③ 最后回退官方 SD 段（v2.7 原链路，保证不比之前差）
-        [s fetchDaySD:day completion:^(NSArray *events) {
-            __strong typeof(ws) s2 = ws;
-            if (!s2) return;
-            [s2 onDayLoaded:day items:JAGridEntriesFromEvents(events, day)];
-        }];
+        // v2.9.26：**不再回退 SD 通道**。方案 1 的数据源就是消息列表，没有就是没有。
+        // 回退要现建一个官方 SD 回放 VC，它一初始化就把「三屏引导蒙层」挂到窗口上
+        // （全屏吞手势 + 藏状态栏），空天反而最容易触发，而且还要多等一轮。
+        [s onDayLoaded:day items:nil];
     });
 }
 
