@@ -134,6 +134,12 @@
 //   · 封面再兜一层：递归扫字段值里的字典 / 数组 / JSON 字符串（有的型号把抓拍图塞在
 //     eventData 里，不在顶层字段上）。
 //   · 去掉自动连播（35 秒自动跳下一格），播放节奏完全交给用户。
+// v2.9.10：
+//   · 修「第一台只显示 18:00 之后」：v2.9.8 加的「翻页前先看官方 _isLoading，忙就等」
+//     在有的设备上是毒药 —— 这个值一直为 YES，于是永远不翻页，只剩首屏一页。
+//     改为完全不看 _isLoading，只按结果自适应：翻一页就看列表长度变没变，没变就把同一页
+//     重试（最多 3 次），变了继续，成功翻满 24 页收工；首屏 6s 一条没有才当空天。
+//     这样「请求被官方在途请求吞掉」也能靠重试救回来。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1275,68 +1281,65 @@ static NSArray *JAGridEntriesFromMessages(NSArray *list, long long day) {
     return items;
 }
 
-// 官方消息模型是异步网络拉取：warnMessageList 会分段变长。
-// v2.9.3：首屏稳定后替它翻页（loadMoreWarningMessagesWithDay:）直到没有更多。
-// v2.9.6：翻页后服务端比首屏慢得多，旧版「0.45s × 2 次没增长」就判「这页没数据」→
-//   消息多的设备被误判成没有更多（正是「滑到底只到 12:32:46、条数比消息列表少」）。
-//   翻页后第一次等 1.0s 再判，一页一条没多也再等 2 轮才收工；页数上限 8 → 20。
-// v2.9.8：v2.9.6 把稳定判定放松到 1 次，正好撞进官方自己还在请求（_isLoading）的窗口 ——
-//   此时翻页会被它吞掉，于是「一条没多」→ 提前收工，第一台反而只到 18:32:32。
-//   现在恢复「连续 2 次不增长」，并且翻页前先看 _isLoading，忙就等它跑完。
+// 官方消息模型是异步网络拉取：warnMessageList 会分段变长，翻页靠
+// -loadMoreWarningMessagesWithDay:。历次教训：
+//   v2.9.3 只翻 8 页 → 消息多的设备读不到最后几条；
+//   v2.9.6 把「稳定」判定放松到 1 次 → 撞进官方还在请求的窗口，翻页请求被吞 → 提前收工；
+//   v2.9.8 改成「先看 _isLoading，忙就等」→ 有的设备这个值一直是 YES，于是永远不翻页，
+//          只剩首屏，正是第一台「只显示 18:00 之后」。
+// v2.9.10 不再看 _isLoading，只按结果自适应：每轮 1.5s（首屏 2.4s），翻一页就看长度
+//   有没有变；没变就把同一页重试（最多 3 次），变了继续；成功翻满 24 页收工；
+//   首屏 6s 还一条没有才当空天。
 static void JAGridPollMessageModel(id model, long long day, NSInteger round,
-                                   NSArray *best, NSInteger bestN, NSInteger stable,
-                                   NSInteger pages, NSInteger idle,
+                                   NSArray *best, NSInteger bestN, NSInteger okPages,
+                                   NSInteger retry,
                                    void (^cb)(NSArray *items)) {
-    if (round > 120) { if (cb) cb(bestN > 0 ? best : nil); return; }
-    // 1.0s 只在「刚翻页、等这一页第一批数据」时用，其余 0.6s
-    NSTimeInterval wait = (pages > 0 && stable == 0) ? 1.0 : 0.6;
+    if (round > 150) { if (cb) cb(bestN > 0 ? best : nil); return; }
+    NSTimeInterval wait = (round == 0) ? 2.4 : 1.5;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(wait * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         NSArray *list = nil;
         @try { list = [model valueForKey:@"warnMessageList"]; } @catch (NSException *e) {}
         NSArray *items = JAGridEntriesFromMessages(list, day);
         NSInteger n = items ? (NSInteger)items.count : 0;
-        __block NSArray *cand = best;
-        __block NSInteger bn = bestN;
-        __block NSInteger st = stable;
-        __block NSInteger idl = idle;
-        if (n > bn) { cand = items; bn = n; st = 0; idl = 0; }
-        else { st += 1; }
+        NSArray *cand = best;
+        NSInteger bn = bestN;
+        if (n > bn) { cand = items; bn = n; }
+        SEL lm = NSSelectorFromString(@"loadMoreWarningMessagesWithDay:");
+        BOOL canMore = [model respondsToSelector:lm];
 
-        // 首屏和翻页都要求连续 2 次不再增长才算这一页到齐
-        BOOL ready = (st >= 2);
-        if (ready && bn > 0) {
-            // v2.9.8：官方自己还在跑请求时（_isLoading）翻页会被它吞掉，请求发出去但没效果，
-            // 于是这一页「一条没多」→ 收工 → 条数变少。v2.9.6 把判定放松到 1 次，正好撞上
-            // 这个窗口，所以第一台反而只读到 18:32:32。先等它跑完再翻。
-            BOOL busy = NO;
-            @try { busy = [[model valueForKey:@"isLoading"] boolValue]; } @catch (NSException *e) {}
-            if (busy) {
-                JAGridPollMessageModel(model, day, round + 1, cand, bn, 0, pages, idl, cb);
+        if (round == 0) {
+            // 首屏：数据还没到就再等等（最多 4 次 ≈ 6s），别把「慢」当成「当天没报警」
+            if (bn == 0 && retry < 4) {
+                JAGridPollMessageModel(model, day, round + 1, cand, bn, 0, retry + 1, cb);
                 return;
             }
-            if (pages > 0 && n <= bn) {
-                // 翻过页却一条没多：可能只是这页还没回来，再等 2 轮才下结论
-                if (idl >= 2) { if (cb) cb(cand); return; }
-                JAGridPollMessageModel(model, day, round + 1, cand, bn, 0, pages, idl + 1, cb);
-                return;
-            }
-            SEL lm = NSSelectorFromString(@"loadMoreWarningMessagesWithDay:");
-            if (pages < 20 && [model respondsToSelector:lm]) {
-                BOOL ok = NO;
-                @try {
-                    ((void (*)(id, SEL, id))objc_msgSend)(model, lm, JAGridDayStr(day));
-                    ok = YES;
-                } @catch (NSException *e) { ok = NO; }
-                if (ok) {
-                    JAGridPollMessageModel(model, day, round + 1, cand, bn, 0, pages + 1, 0, cb);
-                    return;
-                }
-            }
-            if (cb) cb(cand);
+            if (!canMore || okPages >= 24) { if (cb) cb(cand); return; }
+            @try {
+                ((void (*)(id, SEL, id))objc_msgSend)(model, lm, JAGridDayStr(day));
+            } @catch (NSException *e) { if (cb) cb(cand); return; }
+            JAGridPollMessageModel(model, day, round + 1, cand, bn, 0, 0, cb);
             return;
         }
-        JAGridPollMessageModel(model, day, round + 1, cand, bn, st, pages, idl, cb);
+
+        // 上一轮已经发过翻页，这里看它有没有效果
+        if (n > bestN) {
+            if (okPages + 1 >= 24 || !canMore) { if (cb) cb(cand); return; }
+            @try {
+                ((void (*)(id, SEL, id))objc_msgSend)(model, lm, JAGridDayStr(day));
+            } @catch (NSException *e) { if (cb) cb(cand); return; }
+            JAGridPollMessageModel(model, day, round + 1, cand, bn, okPages + 1, 0, cb);
+            return;
+        }
+        // 一条没多：可能被官方自己的在途请求吞了，重试同一页（最多 3 次）
+        if (retry < 3 && canMore) {
+            @try {
+                ((void (*)(id, SEL, id))objc_msgSend)(model, lm, JAGridDayStr(day));
+            } @catch (NSException *e) { if (cb) cb(cand); return; }
+            JAGridPollMessageModel(model, day, round + 1, cand, bn, okPages, retry + 1, cb);
+            return;
+        }
+        if (cb) cb(cand);
     });
 }
 
@@ -1374,7 +1377,7 @@ static void JAGridFetchMessageDay(id cam, long long day, void (^cb)(NSArray *ite
     }
     if (!sent) { if (cb) cb(nil); return; }
 
-    JAGridPollMessageModel(model, day, 0, nil, 0, 0, 0, 0, ^(NSArray *items) {
+    JAGridPollMessageModel(model, day, 0, nil, 0, 0, 0, ^(NSArray *items) {
         if (items.count > 0 || triedAli || ![model respondsToSelector:f2]) {
             if (cb) cb(items);
             return;
@@ -1389,7 +1392,7 @@ static void JAGridFetchMessageDay(id cam, long long day, void (^cb)(NSArray *ite
             ok = YES;
         } @catch (NSException *e) { ok = NO; }
         if (!ok) { if (cb) cb(nil); return; }
-        JAGridPollMessageModel(model, day, 0, nil, 0, 0, 0, 0, cb);
+        JAGridPollMessageModel(model, day, 0, nil, 0, 0, 0, cb);
     });
 }
 
