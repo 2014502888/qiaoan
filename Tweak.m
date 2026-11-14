@@ -1812,7 +1812,12 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         __strong typeof(ws) s = ws;
-        if (s && s.inflight[key]) [s jaFinish:key image:nil];
+        if (s && s.inflight[key]) {
+            // v2.9.28：8 秒一条回调都没有时，记一个自定义码，格子上会显示「失败 e-9000」。
+            // 之前这种情况下 codes 是空的，只能显示「失败.jpg」，看不出是超时还是根本没发出去。
+            if (!s.codes[key]) s.codes[key] = @(-9000);
+            [s jaFinish:key image:nil];
+        }
     });
 }
 
@@ -1999,9 +2004,18 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
             else if (st < 0) s.noneLab.text = [NSString stringWithFormat:@"失败 e%ld", (long)st];
             else if (![NSURL URLWithString:key]) s.noneLab.text = @"失败 地址";
             else {
-                NSString *ext = [[NSURL URLWithString:key] pathExtension].lowercaseString;
-                s.noneLab.text = ext.length ? [NSString stringWithFormat:@"失败.%@", ext]
-                                            : @"加载失败";
+                // v2.9.28：没有状态码也没有错误码时，把域名首段打出来 ——
+                // 一眼就能看出这张图到底在问哪个服务器要（jooancloud / oss / 内网 IP …）。
+                NSString *host = [NSURL URLWithString:key].host;
+                if (host.length) {
+                    if (host.length > 9) host = [[host componentsSeparatedByString:@"."] firstObject];
+                    if (host.length > 9) host = [host substringToIndex:9];
+                    s.noneLab.text = [NSString stringWithFormat:@"失败 %@", host];
+                } else {
+                    NSString *ext = [[NSURL URLWithString:key] pathExtension].lowercaseString;
+                    s.noneLab.text = ext.length ? [NSString stringWithFormat:@"失败.%@", ext]
+                                                : @"加载失败";
+                }
             }
             s.noneLab.hidden = NO;
         }
