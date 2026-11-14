@@ -200,6 +200,11 @@
 //     UIImage 解不出来 —— 现象正是「载入中很久 → 加载失败」，而别的设备都正常。
 //     视频类字段挪到末尾，统一过「不许是视频」的过滤。
 //   · 失败时格子上带后缀：「失败.mp4」= 拿到的是录像；「失败.jpg」= 地址对但下载被拒。
+// v2.9.22：
+//   · 过 0 点当天没报警时，页面上会多出一个「无封面 / 00:00:00」的假格子 —— 时间字段一个
+//     都解析不出来时 JAGridSecForMessage 兜底成了当天 0 点整。现在 sec <= 当天 0 点的直接丢。
+//   · 「回放倍数选择」浮层带模态遮罩，一旦显示回来就把格子页的触摸全吃掉（连返回都点不了，
+//     只能退后台）。改成格子页前台期间每 0.6s 压一次，扫描范围扩到所有 window，且不再恢复。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1345,6 +1350,10 @@ static NSDictionary *JAGridEntryFromMessage(id msg, long long day) {
     if (!msg) return nil;
     long long sec = JAGridSecForMessage(msg, day);
     if (sec < day || sec >= day + 86400LL) return nil;     // 只收本天
+    // v2.9.22：正好落在「当天 0 点整」的一律丢掉 —— 时间字段一个都解析不出来时，
+    // JAGridSecForMessage 会兜底成当天 0 点，于是 0 点整多出一个「无封面 00:00:00」的假格子
+    // （过 0 点当天没报警时最明显：明明一条消息都没有，页面上却有一个空格子）。
+    if (sec <= day) return nil;
     NSMutableDictionary *e = [NSMutableDictionary dictionary];
     e[@"sec"] = @(sec);
     e[@"day"] = @(day);
@@ -2048,8 +2057,11 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 // ---------- 格子页本体 ----------
 
 // v2.9.20：过 0 点再进格子页时，官方播放器留在 window 上的「回放倍数选择」浮层还挂着，
-// 正好盖住日期抬头。进页面先把它藏起来，离开再放回去（官方播放页还要用）。
-// 只处理挂在 window 直接子视图上的浮层，播放页自己的 view 一带一律不碰。
+// 正好盖住日期抬头，而且它是模态的 —— 遮罩吃掉所有触摸，连左上角返回都点不了。
+// v2.9.22：改成「格子页在前台期间持续压住它」：
+//   · 每次都重新扫一遍（官方后台可能又把它 hidden = NO），扫到就藏；
+//   · 不恢复。官方播放页要用就自己重建，留着它只会再遮一次。
+// 只处理挂在任一 window 直接子视图上的浮层，播放页自己的 view 一律不碰。
 static NSMutableArray *g_jaHiddenPanels = nil;
 
 static void JAGridToggleSpeedPanel(BOOL hide) {
@@ -2058,31 +2070,28 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
         g_jaHiddenPanels = nil;
         return;
     }
-    if (g_jaHiddenPanels.count > 0) return;
-    UIWindow *win = nil;
+    if (!g_jaHiddenPanels) g_jaHiddenPanels = [NSMutableArray array];
     NSArray *wins = [UIApplication sharedApplication].windows;
-    for (UIWindow *w in wins) { if (w.isKeyWindow) { win = w; break; } }
-    if (!win && wins.count) win = [wins lastObject];
-    if (!win) return;
-    NSMutableArray *roots = [NSMutableArray array];
-    NSMutableArray *stack = [NSMutableArray arrayWithObject:win];
-    int budget = 6000;
-    while (stack.count > 0 && budget-- > 0) {
-        UIView *v = (UIView *)stack.lastObject;
-        [stack removeLastObject];
-        if ([v isKindOfClass:UILabel.class]) {
-            UILabel *l = (UILabel *)v;
-            if (l.text.length && [l.text containsString:@"回放倍数"]) {
-                UIView *root = l;
-                while (root.superview && root.superview != win) root = root.superview;
-                if (root.superview == win && ![roots containsObject:root]) [roots addObject:root];
+    for (UIWindow *win in wins) {
+        NSMutableArray *os = [NSMutableArray arrayWithObject:win];
+        int budget = 6000;
+        while (os.count > 0 && budget-- > 0) {
+            UIView *v = (UIView *)os.lastObject;
+            [os removeLastObject];
+            if ([v isKindOfClass:UILabel.class]) {
+                UILabel *l = (UILabel *)v;
+                if (l.text.length && [l.text containsString:@"回放倍数"]) {
+                    UIView *root = l;
+                    while (root.superview && root.superview != win) root = root.superview;
+                    if (root.superview == win && ![g_jaHiddenPanels containsObject:root]) {
+                        root.hidden = YES;
+                        [g_jaHiddenPanels addObject:root];
+                    }
+                }
             }
+            for (UIView *s in v.subviews) [os addObject:s];
         }
-        for (UIView *s in v.subviews) [stack addObject:s];
     }
-    if (roots.count == 0) return;
-    for (UIView *r in roots) r.hidden = YES;
-    g_jaHiddenPanels = roots;
 }
 
 @interface JAGridReplayViewController : UIViewController <UICollectionViewDataSource, UICollectionViewDelegateFlowLayout>
@@ -2099,6 +2108,7 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
 @property (nonatomic, assign) BOOL coverRefetch;      // v2.9.18：正在静默补一次最新页
 @property (nonatomic, assign) NSInteger emptyStreak;
 @property (nonatomic, assign) BOOL gaveUp;
+@property (nonatomic, strong) NSTimer *speedTimer;   // v2.9.22：前台期间持续压住官方倍数浮层
 @property (nonatomic, assign) NSInteger playIndex;
 @property (nonatomic, strong) id playingVC;
 @property (nonatomic, strong) NSMutableSet *knownDays;   // v2.8：已确认有录像的日期（日历红点）
@@ -2226,17 +2236,30 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
-    // v2.9.20：先藏掉官方播放器残留的「回放倍数选择」浮层，它正好压在日期抬头上面
+    // v2.9.20：先藏掉官方播放器残留的「回放倍数选择」浮层，它正好压在日期抬头上面，
+    // 而且带模态遮罩，会把返回按钮也一起挡掉。
     JAGridToggleSpeedPanel(YES);
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
     [super viewWillDisappear:animated];
-    JAGridToggleSpeedPanel(NO);
+    [self.speedTimer invalidate];
+    self.speedTimer = nil;
 }
 
 - (void)viewDidAppear:(BOOL)animated {
     [super viewDidAppear:animated];
+    // v2.9.22：官方播放页在后台可能又把「回放倍数选择」浮层显示回来（它带模态遮罩，
+    // 一出来就把整个格子页的触摸吃掉，返回都点不了）。前台期间每 0.6s 压一次。
+    if (!self.speedTimer) {
+        __weak JAGridReplayViewController *wsv = self;
+        self.speedTimer = [NSTimer scheduledTimerWithTimeInterval:0.6 repeats:YES
+                                                            block:^(NSTimer *t) {
+            __strong JAGridReplayViewController *sv = wsv;
+            if (!sv) { [t invalidate]; return; }
+            JAGridToggleSpeedPanel(YES);
+        }];
+    }
     if (!self.myCamera) {
         self.hintLab.hidden = NO;
         self.hintLab.text = @"没拿到设备对象（myCamera 为空），格子页无法读取录像";
