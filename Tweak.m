@@ -701,14 +701,15 @@ static void ja_didEnterLive(id self, SEL _cmd) {
     }
 }
 
-// v3.2：SD 回放页 4 个 hook 的安装入口（幂等）
+// v3.2：SD 回放页 hook 的安装入口（幂等）
+// v3.8：只装 viewDidAppear/viewDidDisappear —— 与 v2.9.27 完全一致。
+// v3.2 曾额外拦 shouldBlockLiveUIBecauseSDUnavailable / didEnterLive 两个"退回实时"开关，
+// 但 v2.9.27（实测可用版）从来没拦过这两个，拦它们等于替官方改了状态机走向，
+// 反而逼出"必须先把 playBackActionType 摆对"的连锁依赖 —— 一并撤掉。
 static void JAHookRtcExtras(Class cls) {
     if (!cls) return;
     JASetImp(cls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
     JASetImp(cls, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
-    JASetImp(cls, @selector(shouldBlockLiveUIBecauseSDUnavailable),
-             (IMP)ja_shouldBlockLive, &g_orig_shouldBlockLive);
-    JASetImp(cls, @selector(didEnterLive), (IMP)ja_didEnterLive, &g_orig_didEnterLive);
     g_rtcHooked = YES;
 }
 
@@ -932,63 +933,46 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-            // v3.0：按 v1.32 原样 —— 无条件定位，不做任何「事件列表到了没」的判断。
-            // （v2.9.36 曾在这里加 JAGridValidEventCount 门禁，它靠运行时去猜事件数组，
-            //   列表还没拉回来时恒为 0 → 定位被推迟甚至整段跳过，是"越改越乱"的来源之一。）
-            // 定位一律用报警秒原值（v2.5 定案：报警常落在某段中间，替换成段起点会把画面挪走）。
+            // v3.8：回到 v2.9.27 的判定方式 —— 先看一眼"该日事件列表回来了没"。
+            // v2.9.27 是唯一被实测证明"点格子直接就能看回放、时间轴有段时间颜色"的版本。
+            // 它的做法：列表已回来 → 立刻定位、1.5s 拨时间轴；还没回来 → 再等 2s 重查
+            // 一次，回来了才重新定位。v3.0 把这段判断删成"无条件定位"，之后每一版又在
+            // 这里叠加"同参再调一次""再切一次日期重来一轮"，越叠越乱 —— 官方定位一次
+            // 就会改自己的状态机，多调几次反而把它带偏。整段回到 v2.9.27。
+            NSInteger evCount = JAGridValidEventCount(self);
+            // 定位一律用报警秒原值（v2.5 定案：报警常落在某段中间，替换成段起点会把画面挪走）
             SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
             if ([self respondsToSelector:s]) {
                 ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
             }
-            // v3.1：同参再调一次。
-            // 第一次调用时官方 _isEnterSDPlay 多半还是 NO（3.0s 那句 stopSDPlay 把它打成 NO，
-            // 而且此刻流正在重建 —— 就是界面上那个加载进度），于是官方走的是"startSDPlay
-            // 无时间戳分支"：流建起来就播最新，报警秒被忽略 → 时间轴对、画面不对。
-            // 等流建好，_isEnterSDPlay 会回到 YES，这时同参再调一次就走 seek 分支，真正落到段秒。
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                SEL s2 = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
-                if ([self respondsToSelector:s2]) {
-                    ((void(*)(id, SEL, long long))objc_msgSend)(self, s2, sec);
-                }
+            if (evCount > 0) {
                 // v1.18：定位已发出，再等 1.5s 拨时间轴指示器到定位时间点
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
                     if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
                     JATimeLineSyncToSec(self, sec);
-                    // v3.6：冷启动第一次进来时，平台可能还没把设备通道完全建好 ——
-                    // 3.0s 那次 switchToSDDay 触发的「该日录像段列表」拉取因此拿不到东西：
-                    // 时间轴没有段颜色、画面只能是现在。走一次官方回放后通道就绪，之后
-                    // 才一直正常，正是实测到的现象。这里再给一轮机会：重切日期让官方重新
-                    // 拉一次该日段列表，再定位一次、再拨一次时间轴。
-                    // 第一轮已经成功的情况会被官方自身状态吸收（同一天再切一次无副作用）。
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), ^{
-                        if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                        SEL sw2 = NSSelectorFromString(@"switchToSDDay:dateString:");
-                        if ([self respondsToSelector:sw2]) {
-                            ((void(*)(id, SEL, long long, id))objc_msgSend)(self, sw2, dayStart, ds);
+                });
+            } else {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                    NSInteger c2 = JAGridValidEventCount(self);
+                    if (c2 > 0) {
+                        SEL s2 = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
+                        if ([self respondsToSelector:s2]) {
+                            ((void(*)(id, SEL, long long))objc_msgSend)(self, s2, sec);
                         }
-                        @try {
-                            [self setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"];
-                        } @catch (NSException *e) {}
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                     (int64_t)(1.5 * NSEC_PER_SEC)),
                                        dispatch_get_main_queue(), ^{
                             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                            SEL s3 = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
-                            if ([self respondsToSelector:s3]) {
-                                ((void(*)(id, SEL, long long))objc_msgSend)(self, s3, sec);
-                            }
-                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                                           dispatch_get_main_queue(), ^{
-                                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                                JATimeLineSyncToSec(self, sec);
-                            });
+                            JATimeLineSyncToSec(self, sec);
                         });
-                    });
+                    } else {
+                        JATimeLineSyncToSec(self, sec);
+                    }
                 });
-            });
+            }
         });
     });
 }
@@ -3413,20 +3397,13 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     }
 
     id vc = [[rtc alloc] init];
-    // v3.7：先把 camera 换成官方那份共享实例，并把官方回放时抓到的设备状态填回去。
-    // 放在最前面，后面 myCamera / sdSelectiontDay 都落在同一份对象上 ——
-    // 官方"查看录像"查询到的 SD 卡状态/支持回放 也写在这份对象上，所以点过它之后
-    // 格子就能用；这样冷启动也不必先走官方入口。
-    id ccam = JAPrepareSDPlatform(self.myCamera);
-    if (ccam) self.myCamera = ccam;
+    // v3.8：完全回到 v2.9.27 的进页面方式 —— 只给三个入参：myCamera / currentTimeStamp /
+    // sdSelectiontDay。不设 currentEvent，也不预先把 JADevicePlatform 的状态摆一遍。
+    // v2.9.27 是被实测证明"点格子直接就能看回放、时间轴有段时间颜色"的版本。
+    // v2.9.55 在这里加了 currentEvent（想"照搬查看录像"那条链），v3.3 起又加摆平台状态、
+    // 连设备通道、换共享实例 —— 每加一样，官方 setupData 就多一条初始化路径可选，
+    // 结果页面进来了却只按"直播"跑。少给入参，反而回到能用那版。
     @try { [vc setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
-    // v2.9.55：照搬「消息列表 → 查看录像」那条链 —— 它会把这条报警消息本身作为
-    // currentEvent 挂到播放页上，官方 setupData 靠它确定"初始选中的就是这条记录/这个时刻"。
-    // 格子链从 v1.x 起一直没传这个，官方拿不到当前事件，只能按默认（今日/最新）来，
-    // 于是进页面播的是实时，后面 startSDPlayWithSelectTimeStamp: 也定位不到那条段。
-    // 这是两条链唯一实质差异（详情链 JATryOpenSDReplay 里就有这一句），补上对齐。
-    id ev = entry[@"ev"];
-    if (ev) JASet(vc, @"currentEvent", ev);
     JASet(vc, @"currentTimeStamp", @(sec));
     JASet(self.myCamera, @"sdSelectiontDay", @(JADayStartSec(@(sec))));
 
