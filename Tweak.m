@@ -861,6 +861,20 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
             if (!ok) JASet(cam, @"sdTodayTimeStamp", @(want));
             JALog(@"set sdTodayTimeStamp want=%lld wrote=%d readback=%lld",
                   want, (int)ok, [JAVal(cam, @"sdTodayTimeStamp") longLongValue]);
+            // v4.17.1：真正决定段数的是这个字段。对照两次实测：
+            //   sdSelectionDayNotAdjust=1794672000 → 拉到 359 条（时间轴有颜色）
+            //   sdSelectionDayNotAdjust=0          → 只回 22 条（时间轴空、画面回实时）
+            // 今天一直只盯着 sdTodayTimeStamp，把它漏了。
+            BOOL ok2 = NO;
+            if ([cam respondsToSelector:@selector(setSdSelectionDayNotAdjust:)]) {
+                @try {
+                    ((void (*)(id, SEL, long long))objc_msgSend)(cam, @selector(setSdSelectionDayNotAdjust:), d0);
+                    ok2 = YES;
+                } @catch (NSException *e) {}
+            }
+            if (!ok2) JASet(cam, @"sdSelectionDayNotAdjust", @(d0));
+            JALog(@"set sdSelectionDayNotAdjust want=%lld wrote=%d readback=%lld",
+                  d0, (int)ok2, [JAVal(cam, @"sdSelectionDayNotAdjust") longLongValue]);
         }
         // v4.10：时间轴拉取上限。v4.9 把这段去掉了，结果官方一段都没拉到（段=0）——
         // 说明它必须给，且要给到"当天最后一秒"，否则官方只拉到进入那一刻。
