@@ -733,6 +733,9 @@ static BOOL g_lastIsSDPlayer = NO;
 static BOOL g_hasIsSDPlayer = NO;
 static IMP g_orig_setPlayBackType = NULL;
 static IMP g_orig_setIsSDPlayer = NULL;
+// v4.2：JALiveManager 的三屏 SD 模式真值（取值不确定 → 只学不猜）
+static NSInteger g_lastThreeScreenSD = 0;
+static BOOL g_hasThreeScreenSD = NO;
 
 static void ja_setPlayBackActionType(id self, SEL _cmd, NSUInteger t) {
     g_lastPlayBackType = t;
@@ -761,6 +764,63 @@ static void JALoadPlayState(void) {
     if ([ud objectForKey:@"jasd_isSDPlayer"]) {
         g_lastIsSDPlayer = [ud boolForKey:@"jasd_isSDPlayer"];
         g_hasIsSDPlayer = YES;
+    }
+    if ([ud objectForKey:@"jasd_threeScreenSD"]) {
+        g_lastThreeScreenSD = (NSInteger)[ud integerForKey:@"jasd_threeScreenSD"];
+        g_hasThreeScreenSD = YES;
+    }
+}
+
+// ---------- v4.2：JALiveManager 上那组「回放态」全局开关 ----------
+// 实测铁证：冷启动点格子必失败；先点一次官方「查看录像」，之后**每一格、每台设备、
+// 每一天**都正常 —— 包括换设备换日期。这不是"每次都要重新取"的东西，而是某个
+// 全局开关被**永久打开**了，一旦打开，之后所有 SD 页都按回放走。
+// v3.3 只盯了 JADevicePlatform 的两个值（playBackActionType / isSDPlayer），
+// 把 JALiveManager 这一整组漏了。dump（objc_dump17）里它明确有：
+//     - setIsEnterBackPlayer:                 是否处于回放（最关键的一个）
+//     - setSDPlayerIsPlay:                    SD 是否在播
+//     - setIsSDNoRecord:                      本次 SD 有没有录像（必须 NO，否则官方不拉段）
+//     - setThreeScreenCurrentModelSDPlay:     三屏 SD 模式（数值型，取值不确定）
+// 前三个语义明确，冷启动直接设；第四个取值不确定，只学官方真值，学到才回填。
+static IMP g_orig_lm_setThreeScreenSD = NULL;
+static BOOL g_lmHooked = NO;
+
+static void ja_lm_setThreeScreenSD(id self, SEL _cmd, NSInteger v) {
+    g_lastThreeScreenSD = v;
+    g_hasThreeScreenSD = YES;
+    [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)v forKey:@"jasd_threeScreenSD"];
+    if (g_orig_lm_setThreeScreenSD) {
+        ((void(*)(id, SEL, NSInteger))g_orig_lm_setThreeScreenSD)(self, _cmd, v);
+    }
+}
+
+static void JAHookLiveManager(Class cls) {
+    if (!cls || g_lmHooked) return;
+    g_lmHooked = YES;
+    JASetImp(cls, NSSelectorFromString(@"setThreeScreenCurrentModelSDPlay:"),
+             (IMP)ja_lm_setThreeScreenSD, &g_orig_lm_setThreeScreenSD);
+}
+
+// push SD 页前把 JALiveManager 摆成"正在回放"的样子
+static void JAApplyLiveManagerPlayState(id lm) {
+    if (!lm) return;
+    SEL sEB = NSSelectorFromString(@"setIsEnterBackPlayer:");
+    if ([lm respondsToSelector:sEB]) {
+        @try { ((void(*)(id, SEL, BOOL))objc_msgSend)(lm, sEB, YES); } @catch (NSException *e) {}
+    }
+    SEL sSP = NSSelectorFromString(@"setSDPlayerIsPlay:");
+    if ([lm respondsToSelector:sSP]) {
+        @try { ((void(*)(id, SEL, BOOL))objc_msgSend)(lm, sSP, YES); } @catch (NSException *e) {}
+    }
+    SEL sNR = NSSelectorFromString(@"setIsSDNoRecord:");
+    if ([lm respondsToSelector:sNR]) {
+        @try { ((void(*)(id, SEL, BOOL))objc_msgSend)(lm, sNR, NO); } @catch (NSException *e) {}
+    }
+    if (g_hasThreeScreenSD) {
+        SEL sTS = NSSelectorFromString(@"setThreeScreenCurrentModelSDPlay:");
+        if ([lm respondsToSelector:sTS]) {
+            @try { ((void(*)(id, SEL, NSInteger))objc_msgSend)(lm, sTS, g_lastThreeScreenSD); } @catch (NSException *e) {}
+        }
     }
 }
 
@@ -909,6 +969,9 @@ static id JAPrepareSDPlatform(id cam) {
             if ([lm respondsToSelector:sConnCam]) {
                 @try { ((void(*)(id, SEL, id))objc_msgSend)(lm, sConnCam, cam); } @catch (NSException *e) {}
             }
+            // v4.2：把"正在回放"这组全局开关打开 —— 官方入口跑过一次之后它们一直是开的，
+            // 所以之后每一格都好用；冷启动时它们是关的，页面就按直播跑（没段颜色、画面是现在）。
+            JAApplyLiveManagerPlayState(lm);
         }
     }
     return cam;
@@ -4252,6 +4315,8 @@ static void JAHook(void) {
         Class rtcCls = NSClassFromString(@"JANewRtcSDPlayViewController");
         if (rtcCls) {
             JAHookRtcExtras(rtcCls);
+            // v4.2：JALiveManager 的「回放态」开关 hook（学三屏 SD 模式真值）
+            JAHookLiveManager(NSClassFromString(@"JALiveManager"));
             // v2.0：入口 —— 给官方回放页加「格子」按钮（viewWillAppear 可能继承自
             // UIViewController，所以用 class_addMethod 只挂在本类，避免污染全局）
             if (!g_orig_rtc_vwa) {
