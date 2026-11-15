@@ -1459,6 +1459,27 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
             tries++;
             id arrObj = JAVal(self, @"sdRecordFileArr");
             int n = [arrObj isKindOfClass:[NSArray class]] ? (int)[arrObj count] : -1;
+            // v4.19：实测三次连点 —— 同进程第 1 次只回 22 条，第 2/3 次回 360/367 条。
+            // 原因是第 1 次请求发出时设备连接还没真正打通，拿到的是残缺列表；后台连接
+            // 通了以后第二次进页面才正常。这里改成页面内自动重拉，不再靠人点第二次。
+            if (n > 0 && n < 150 && tries <= 6) {
+                id vm = JAVal(self, @"viewModel");
+                JALog(@"VDA re-setup arr=%d tries=%d sess=%lld", n, tries,
+                      [JAVal(vm, @"isSessionConnected") longLongValue]);
+                SEL sd = NSSelectorFromString(@"setupData");
+                if ([self respondsToSelector:sd]) {
+                    @try {
+                        ((void (*)(id, SEL))objc_msgSend)(self, sd);
+                    } @catch (NSException *e) {
+                        JALog(@"VDA re-setup threw %@", e.name);
+                    }
+                }
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    poll();
+                });
+                return;
+            }
             if (n <= 0 && tries <= 16) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
