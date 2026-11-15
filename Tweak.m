@@ -897,6 +897,26 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
                         @try { camd = [cam valueForKey:@"sdSelectiontDay"]; } @catch (NSException *e) {}
                         @try { uid = [cam valueForKey:@"uid"]; } @catch (NSException *e) {}
                     }
+                    // v2.9.47：红色段（用户说的"带颜色"）的真正来源找到了 ——
+                    // 它不在 VC 上，而在 _viewModel（JANewRtcSDPlayViewModel）里：
+                    //   _recordRedMark : NSString          ← 红标记串
+                    //   _detectRedArray / _detectPersonArray / _detectVehicleArray ... : NSMutableArray
+                    //   _isEnterSDPlay : BOOL               ← 真正在 SD 回放模式（VC 上没有这个字段）
+                    //   _isSessionConnected : BOOL          ← P2P 会话是否连上（没连上就拉不到这些数据）
+                    // 所以以前读 VC 的 isEnterSDPlay 永远是 null，判断全部失效。
+                    id vm = nil;
+                    @try { vm = [self valueForKey:@"viewModel"]; } @catch (NSException *e) {}
+                    id vEnt = nil, vSess = nil, vRed = nil, vDRed = nil, vDPer = nil;
+                    if (vm) {
+                        @try { vEnt = [vm valueForKey:@"isEnterSDPlay"]; } @catch (NSException *e) {}
+                        @try { vSess = [vm valueForKey:@"isSessionConnected"]; } @catch (NSException *e) {}
+                        @try { vRed = [vm valueForKey:@"recordRedMark"]; } @catch (NSException *e) {}
+                        @try { vDRed = [vm valueForKey:@"detectRedArray"]; } @catch (NSException *e) {}
+                        @try { vDPer = [vm valueForKey:@"detectPersonArray"]; } @catch (NSException *e) {}
+                    }
+                    NSUInteger redLen = ([vRed respondsToSelector:@selector(length)] ? [vRed length] : 0);
+                    NSUInteger nDRed = ([vDRed isKindOfClass:[NSArray class]] ? [(NSArray *)vDRed count] : 0);
+                    NSUInteger nDPer = ([vDPer isKindOfClass:[NSArray class]] ? [(NSArray *)vDPer count] : 0);
                     // v2.9.46：v2.9.45 诊断证明 isEnterSDPlay 不是这个 VC 的字段（取到 null），
                     // 改成读 JADevicePlatform 的 isSDPlayer —— 那才是决定走实时还是走 SD 回放的开关。
                     Class dp3 = NSClassFromString(@"JADevicePlatform");
@@ -915,8 +935,10 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
                     NSInteger n = -1;
                     if ([arr isKindOfClass:[NSArray class]]) n = (NSInteger)arr.count;
                     NSString *txt = [NSString stringWithFormat:
-                        @"段=%ld  VC日=%@\n摄像日=%@\nUID=%@\n平台SD=%@  目标=%@",
-                        (long)n, vcd, camd, uid, ent, JAGridTimeText(sec)];
+                        @"段=%ld  VC日=%@\n摄像日=%@\nUID=%@\n平台SD=%@\nVM入SD=%@ 会话=%@\n红串长=%lu 红数=%lu 人数=%lu\n目标=%@",
+                        (long)n, vcd, camd, uid, ent,
+                        vEnt, vSess, (unsigned long)redLen, (unsigned long)nDRed, (unsigned long)nDPer,
+                        JAGridTimeText(sec)];
                     UILabel *lab = [[UILabel alloc] initWithFrame:CGRectZero];
                     lab.tag = 0x1A66;
                     lab.numberOfLines = 0;
