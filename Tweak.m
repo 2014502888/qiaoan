@@ -644,6 +644,9 @@ static long long JAGridDayFromMessage(id msg);
 static long long JAGridSecForMessage(id msg, long long day);
 static NSArray *JAGridFindEvents(id vc);
 static NSNumber *JAGridTimestamp(id ev);
+// v2.9.45：v2.9.44 的诊断块要在 viewDidAppear（第 899 行附近）里用 JAGridTimeText，
+// 而它实现在 1057 行 —— 缺前置声明时 Clang 按 C99 报「隐式函数声明」直接编译失败。
+static NSString *JAGridTimeText(long long sec);
 
 // v2.6：统计该 VC 当前拿到的有效 SD 录像段条数（只用于判断列表是否已拉回来）
 static NSInteger JAGridValidEventCount(id vc) {
