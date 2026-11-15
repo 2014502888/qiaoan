@@ -574,6 +574,8 @@ static long long JASegSec(id msg);
 // v3.2：SD 播放页 4 个 hook 统一安装入口（viewDidAppear / viewDidDisappear /
 // shouldBlockLiveUIBecauseSDUnavailable / didEnterLive）
 static void JAHookRtcExtras(Class cls);
+// v3.3：进 SD 回放页前，按官方入口的做法把 JADevicePlatform 的回放状态摆好
+static void JAPrepareSDPlatform(id cam);
 static NSArray *JAGridFindEvents(id vc);
 static NSNumber *JAGridTimestamp(id ev);
 
@@ -653,6 +655,8 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     }
 
     // 3) push
+    // v3.3：push 之前，照着官方入口把平台的回放状态摆好（playBackActionType / isSDPlayer）。
+    JAPrepareSDPlatform(cam);
     UINavigationController *nav = detailVC.navigationController;
     if (!nav) nav = JATopVC().navigationController;
     if (nav) {
@@ -703,6 +707,55 @@ static void JAHookRtcExtras(Class cls) {
              (IMP)ja_shouldBlockLive, &g_orig_shouldBlockLive);
     JASetImp(cls, @selector(didEnterLive), (IMP)ja_didEnterLive, &g_orig_didEnterLive);
     g_rtcHooked = YES;
+}
+
+// ---------- v3.3：照着官方入口把「回放状态」摆好 ----------
+// JADevicePlatform 上有两个全局回放状态：playBackActionType（回放动作类型）、
+// isSDPlayer（是否处于 SD 播放器）。官方那两个能用的入口，在跳转前都会把它们设好；
+// 我们是直接 alloc + push，这两个值还是上一次残留的（多半是"直播"），
+// 于是页面进来了、时间轴也在，但内部按"直播"跑：没有录像段颜色、画面一直是现在。
+// 这里不猜取值：官方每设一次就记下来，格子点击时把这些真值原样设回去。
+static NSUInteger g_lastPlayBackType = 0;
+static BOOL g_hasPlayBackType = NO;
+static BOOL g_lastIsSDPlayer = NO;
+static BOOL g_hasIsSDPlayer = NO;
+static IMP g_orig_setPlayBackType = NULL;
+static IMP g_orig_setIsSDPlayer = NULL;
+
+static void ja_setPlayBackActionType(id self, SEL _cmd, NSUInteger t) {
+    g_lastPlayBackType = t;
+    g_hasPlayBackType = YES;
+    if (g_orig_setPlayBackType) ((void(*)(id, SEL, NSUInteger))g_orig_setPlayBackType)(self, _cmd, t);
+}
+
+static void ja_setIsSDPlayer(id self, SEL _cmd, BOOL v) {
+    g_lastIsSDPlayer = v;
+    g_hasIsSDPlayer = YES;
+    if (g_orig_setIsSDPlayer) ((void(*)(id, SEL, BOOL))g_orig_setIsSDPlayer)(self, _cmd, v);
+}
+
+static id JADevicePlatformShared(void) {
+    Class cls = NSClassFromString(@"JADevicePlatform");
+    if (!cls) return nil;
+    for (NSString *n in @[@"sharedInstance", @"shared", @"defaultInstance", @"manager"]) {
+        SEL s = NSSelectorFromString(n);
+        if ([cls respondsToSelector:s]) {
+            id o = ((id(*)(id, SEL))objc_msgSend)((id)cls, s);
+            if (o) return o;
+        }
+    }
+    return nil;
+}
+
+static void JAPrepareSDPlatform(id cam) {
+    id plat = JADevicePlatformShared();
+    if (!plat) return;
+    if (cam) {
+        @try { [plat setValue:cam forKey:@"myCamera"]; } @catch (NSException *e) {}
+        @try { [plat setValue:cam forKey:@"currentCamera"]; } @catch (NSException *e) {}
+    }
+    if (g_hasPlayBackType) JASet(plat, @"playBackActionType", @(g_lastPlayBackType));
+    if (g_hasIsSDPlayer)   JASet(plat, @"isSDPlayer", @(g_lastIsSDPlayer));
 }
 
 // v1.15 核心：JANewRtcSDPlayViewController viewDidAppear（官方本地 SD 回放界面）
@@ -3185,6 +3238,8 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
 
     UINavigationController *nav = self.navigationController;
     if (!nav) return;
+    // v3.3：push 前把平台的回放状态摆成官方那套（否则页面进来了仍按"直播"跑）
+    JAPrepareSDPlatform(self.myCamera);
     [nav pushViewController:vc animated:YES];
 
     // v2.9.8：官方 SD 回放页自带的时间轴/拖动条不再隐藏（用户要能自己拖）。
@@ -3922,6 +3977,15 @@ static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved) {
 static BOOL JAHooked = NO;  // 详情页 hook（clickCloudRecordAction 主链）
 
 static void JAHook(void) {
+    // v3.3：记下官方入口设的回放状态（playBackActionType / isSDPlayer）。
+    // 这是纯"读取"——原实现照常执行，只顺手把真值存下来给格子链复用。
+    Class platCls = NSClassFromString(@"JADevicePlatform");
+    if (platCls) {
+        JASetImp(platCls, @selector(setPlayBackActionType:),
+                 (IMP)ja_setPlayBackActionType, &g_orig_setPlayBackType);
+        JASetImp(platCls, @selector(setIsSDPlayer:),
+                 (IMP)ja_setIsSDPlayer, &g_orig_setIsSDPlayer);
+    }
     // 详情页主链
     if (!JAHooked) {
         Class detailCls = NSClassFromString(@"JANewsWarnInfoDetailVC");
