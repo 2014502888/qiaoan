@@ -880,6 +880,36 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
                                dispatch_get_main_queue(), ^{
                     if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
                     JATimeLineSyncToSec(self, sec);
+                    // v3.6：冷启动第一次进来时，平台可能还没把设备通道完全建好 ——
+                    // 3.0s 那次 switchToSDDay 触发的「该日录像段列表」拉取因此拿不到东西：
+                    // 时间轴没有段颜色、画面只能是现在。走一次官方回放后通道就绪，之后
+                    // 才一直正常，正是实测到的现象。这里再给一轮机会：重切日期让官方重新
+                    // 拉一次该日段列表，再定位一次、再拨一次时间轴。
+                    // 第一轮已经成功的情况会被官方自身状态吸收（同一天再切一次无副作用）。
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                        SEL sw2 = NSSelectorFromString(@"switchToSDDay:dateString:");
+                        if ([self respondsToSelector:sw2]) {
+                            ((void(*)(id, SEL, long long, id))objc_msgSend)(self, sw2, dayStart, ds);
+                        }
+                        @try {
+                            [self setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"];
+                        } @catch (NSException *e) {}
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{
+                            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                            SEL s3 = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
+                            if ([self respondsToSelector:s3]) {
+                                ((void(*)(id, SEL, long long))objc_msgSend)(self, s3, sec);
+                            }
+                            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                                           dispatch_get_main_queue(), ^{
+                                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                                JATimeLineSyncToSec(self, sec);
+                            });
+                        });
+                    });
                 });
             });
         });
@@ -1868,7 +1898,52 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     return [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%08x.img", h]];
 }
 
+// v2.9.34：华为云 OBS 上的抓拍图是**加密**的（文件名带 _enc，返回体头不是 JPEG 魔数
+// FF D8 FF，实测拿到的是 E8 2A 2D C4… 这种随机值，20982 字节）。
+// 官方 App 用 JADecryptionTool 在本地解 —— 密钥由「设备 UID + 摄像头密码」推出来，
+// 不联网也能解。这里直接调用官方这个类方法，不自己实现 AES：
+//   + jaDecryptImagewithURL:withData:withCameraUID:withCameraPwd:  → 返回 UIImage / NSData / 路径字符串
+// v3.6：v2.9.54 回退到 v2.9.27 基线时这段被一并带走了，导致第 2 台（华为云）封面又变成
+// 「载入中…永远不出来」。这里原样加回来。
+static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam) {
+    if (!data.length || !url.length || !cam) return nil;
+    Class cls = NSClassFromString(@"JADecryptionTool");
+    if (!cls) return nil;
+    SEL sel = NSSelectorFromString(@"jaDecryptImagewithURL:withData:withCameraUID:withCameraPwd:");
+    if (![cls respondsToSelector:sel]) return nil;
+    NSString *uid = nil, *pwd = nil;
+    @try { id v = [cam valueForKey:@"uid"]; if ([v isKindOfClass:[NSString class]]) uid = v; } @catch (NSException *e) {}
+    @try { id v = [cam valueForKey:@"viewPwd"]; if ([v isKindOfClass:[NSString class]]) pwd = v; } @catch (NSException *e) {}
+    if (!pwd.length) {
+        @try { id v = [cam valueForKey:@"dev_pwd"]; if ([v isKindOfClass:[NSString class]]) pwd = v; } @catch (NSException *e) {}
+    }
+    if (!uid.length) return nil;
+    id r = nil;
+    @try {
+        r = ((id (*)(id, SEL, id, id, id, id))objc_msgSend)(cls, sel, url, data, uid, (pwd.length ? pwd : @""));
+    } @catch (NSException *e) { r = nil; }
+    if ([r isKindOfClass:[UIImage class]]) return (UIImage *)r;
+
+    // 结果可能是 NSData，也可能是「已解密好的本地文件路径」
+    NSData *out = nil;
+    if ([r isKindOfClass:[NSData class]]) out = (NSData *)r;
+    else if ([r isKindOfClass:[NSString class]] && [(NSString *)r length]) {
+        out = [NSData dataWithContentsOfFile:(NSString *)r];
+    }
+    if (!out.length) return nil;
+    UIImage *img = [UIImage imageWithData:out];
+    if (img) return img;
+    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)out, NULL);
+    if (src) {
+        CGImageRef cg = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+        if (cg) { img = [UIImage imageWithCGImage:cg]; CGImageRelease(cg); }
+        CFRelease(src);
+    }
+    return img;
+}
+
 @interface JAGridImageCache : NSObject
+@property (nonatomic, weak) id cam;   // v3.6：当前设备的 MyCamera（解密华为云 sealed 封面要 uid+pwd）
 @property (nonatomic, strong) NSCache *mem;
 @property (nonatomic, strong) NSMutableDictionary *inflight;   // v2.9.14：同 URL 去重
 @property (nonatomic, strong) NSMutableDictionary *fails;      // v2.9.23：同一 URL 连续失败次数
@@ -1941,7 +2016,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
 // v2.9.19：上限从 3 提到 6 —— 限 3 时首屏 9 个格子要排三批，看着全是「载入中」；
 // 同时加了 8 秒兜底，任何一个请求不回调也会被收掉，不会把队列堵死。
 - (void)jaStart:(NSString *)url {
-    if (self.active >= 6) { [self.queue addObject:url]; return; }
+    if (self.active >= 8) { [self.queue addObject:url]; return; }   // v3.6：6→8，首屏九格基本一批出
     self.active += 1;
     [self jaFetch:url retry:0];
     __weak typeof(self) ws = self;
@@ -1991,11 +2066,20 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
         forHTTPHeaderField:@"User-Agent"];
     [rq setValue:@"image/*,*/*;q=0.8" forHTTPHeaderField:@"Accept"];
     [rq setValue:@"https://www.jooancloud.com/" forHTTPHeaderField:@"Referer"];
-    rq.timeoutInterval = 12.0;
+    rq.timeoutInterval = 8.0;   // v3.6：12→8s，卡住的别一直挂着
     NSURLSessionDataTask *t = [[NSURLSession sharedSession]
         dataTaskWithRequest:rq completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
             UIImage *img = nil;
             if (data) { @autoreleasepool { img = [UIImage imageWithData:data]; } }
+            // v3.6：华为云那几张是加密的（头不是 FF D8 FF），imageWithData 必然返回 nil。
+            // 交给官方 JADecryptionTool 用「设备 uid + 查看密码」本地解一次；
+            // 解不出来才走失败/重试，避免把"能解开的图"当失败反复重试。
+            if (!img && data.length) {
+                @autoreleasepool {
+                    img = JADecryptImageDataWithCamera(data, url, self.cam);
+                }
+                if (img) [self.mem setObject:img forKey:url];
+            }
             if (!img) {
                 // v2.9.23：记 HTTP 状态码（403/404）
                 if ([resp isKindOfClass:NSHTTPURLResponse.class]) {
@@ -2018,7 +2102,7 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
                 // v2.9.19：重试 3 次（1.5s、3s、6s）。上一版给到 4 次 16s，最长要 30 秒才收工，
                 // 这段时间格子上一直挂着「载入中」，看起来像整页卡住。
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                             (int64_t)((1.5 * (double)(1 << retry)) * NSEC_PER_SEC)),
+                                             (int64_t)((1.0 * (double)(1 << retry)) * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
                     [self jaFetch:url retry:retry + 1];
                 });
@@ -2506,6 +2590,8 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     // 而且带模态遮罩，会把返回按钮也一起挡掉。
     g_jaGridHostView = self.view;
     JAGridToggleSpeedPanel(YES);
+    // v3.6：把当前设备交给封面缓存 —— 华为云那台的图是加密的，解密要 uid + 查看密码
+    [JAGridImageCache shared].cam = self.myCamera;
 }
 
 - (void)viewWillDisappear:(BOOL)animated {
