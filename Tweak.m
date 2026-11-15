@@ -866,6 +866,23 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
             if ([self respondsToSelector:s]) {
                 ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
             }
+            // v2.9.48：红色录像段（用户说的"带颜色"）的真凶找到了。
+            // -getRecordRedMarkData 就是官方「把已拉到的录像段列表算出红标、写回 _recordRedMark、
+            // 再画到时间轴」的唯一入口（反汇编确认：它遍历录像段数组逐段取时间字段拼串）。
+            // 我们从自己的格子页 push 进来，官方那条初始化路径没走到这一步 ——
+            // 所以现场是 段=14（段拉到了）、会话=1、VM入SD=1，但 红串长=1 / 红数=0，时间轴上没有红块。
+            // 这里在录像段已到位后主动补调两次（第二次兜住晚到的段），不加任何门禁判断。
+            for (int ri = 0; ri < 2; ri++) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                             (int64_t)((1.0 + ri * 1.5) * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                    SEL r = NSSelectorFromString(@"getRecordRedMarkData");
+                    if ([self respondsToSelector:r]) {
+                        ((void(*)(id, SEL))objc_msgSend)(self, r);
+                    }
+                });
+            }
             // v1.18：定位已发出，再等 1.5s 拨时间轴指示器到该时间点
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
