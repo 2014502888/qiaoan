@@ -1188,6 +1188,21 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         @try {
             [self setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"];
         } @catch (NSException *e) {}
+        // v4.8：switchToSDDay 之后官方会按"当前事件类型"重拉段列表（只回 18 条），
+        // 而正确页是 271 条全天段。这里按"全部类型"再补拉一次 —— loadRecordListWithType:
+        // 的入参是 q（不是枚举），传 0 即不带类型过滤（也等价于从当天 0 点起拉）。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+            SEL lr = NSSelectorFromString(@"loadRecordListWithType:");
+            if ([self respondsToSelector:lr]) {
+                ((void(*)(id, SEL, long long))objc_msgSend)(self, lr, 0LL);
+            }
+            SEL lrd = NSSelectorFromString(@"loadRecordListWithSelectiontDay:");
+            if ([self respondsToSelector:lrd]) {
+                ((void(*)(id, SEL, long long))objc_msgSend)(self, lrd, dayStart);
+            }
+        });
         // 事件列表加载是异步的（网络拉取），等 2.5s 后再建流定位。
         // v1.28：1.5s→2.5s —— switchToSDDay 切日（尤其跨天场景 10-19）后官方要重新
         // 网络拉取该日事件列表，网络稍慢时 1.5s 内列表未到 → startSDPlay 定位时官方
