@@ -871,22 +871,24 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
     }
 
     // 3) push
-    UINavigationController *nav = detailVC.navigationController;
-    if (!nav) nav = JATopVC().navigationController;
-    if (nav) {
-        g_activeSDPlayer = vc;  // 登记当前活跃 RTC SD 播放器（viewDidAppear hook 守卫用）
-        // v4.13.4：自造页也走"轻量"分支 —— 进页后只做定位，不 stopSDPlay、不切天、不重拉。
-        // 官方 setupData 自己会拉当天全部录像段；我们以前"进来先停流再切天再重拉"
-        // 很可能把它刚拉好的列表冲成只剩事件条数（段=19/0、首段为空就是这么来的）。
-        g_rtcOfficialMode = YES;
-        [nav pushViewController:vc animated:YES];
-        JADiagAttach(vc, g_rtcTargetSec, cam, nil);
-        // v4.15 的自动实验块会把已拉好的列表冲成空，回退时去掉
-        // JAExpStart(vc, cam, d0);
-        // RTC 版是官方完整播放器，官方链自己建流 → 不做任何状态强制
-    } else {
-        [UIApplication.sharedApplication.keyWindow.rootViewController presentViewController:vc animated:YES completion:nil];
-    }
+    // v4.19.1：不立刻推。实测同一进程第 1 次点只回 22 条、第 2 次起回 360/367 条，
+    // 两次的 VC/CAM/VM/PLT 字段完全一致（tmax、today、notAdj、newReplay 都一样），
+    // 说明差别不在任何字段值上，而在"设备连接从直播态切到 SD 态"这件事还没做完，
+    // 页面就已经发请求了 —— 拿回来的是事件级列表。所以让准备先落地，再把页面推出去。
+    long long secCap = g_rtcTargetSec;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        UINavigationController *nav = detailVC.navigationController;
+        if (!nav) nav = JATopVC().navigationController;
+        if (nav) {
+            g_activeSDPlayer = vc;  // 登记当前活跃 RTC SD 播放器（viewDidAppear hook 守卫用）
+            g_rtcOfficialMode = YES;
+            [nav pushViewController:vc animated:YES];
+            JADiagAttach(vc, secCap, cam, nil);
+        } else {
+            [UIApplication.sharedApplication.keyWindow.rootViewController presentViewController:vc animated:YES completion:nil];
+        }
+    });
     return vc;
 }
 
