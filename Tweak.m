@@ -844,17 +844,28 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         @try {
             [self setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"];
         } @catch (NSException *e) {}
-        // v2.9.39 兜底补拉：switchToSDDay 没生效时 _sdRecordFileArr 仍是空的，时间轴就没颜色。
-        // 这里主动补一次官方自己的拉段入口（只补、不覆盖，已有列表就不动）。
+        // v2.9.49：这里原来有个"列表已经有段就不拉"的判断，正是它把官方那条事件处理链跳过了。
+        // 官方进页面是无条件走一次 loadRecordListWithSelectiontDay: → 内部完成回调 _handleAllEventResult:，
+        // 由它填充 viewModel 的 detectRedArray / detectPersonArray 等检测数组并算出红标。
+        // 我们靠 switchToSDDay: 拿到的 14 条只是"录像段"，事件/检测数据一个都没有
+        // （现场：段=14、会话=1、入SD=1，但 红串长=1、红数=0、人数=0）。
+        // 所以这里改成照官方那样无条件拉一遍，不再看列表是否为空。
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-            NSArray *arr = nil;
-            @try { arr = [self valueForKey:@"sdRecordFileArr"]; } @catch (NSException *e) {}
-            if ([arr isKindOfClass:[NSArray class]] && arr.count > 0) return;
             SEL lr = NSSelectorFromString(@"loadRecordListWithSelectiontDay:");
             if ([self respondsToSelector:lr]) {
                 ((void(*)(id, SEL, long long))objc_msgSend)(self, lr, dayStart);
+            }
+        });
+        // v2.9.49：官方 reloadLatestEventList 是"重新加载最新事件列表"的完整刷新入口，
+        // 消息列表那条链进页面后官方自己会调。我们补一次，让事件/检测数据真正到位。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+            SEL rl = NSSelectorFromString(@"reloadLatestEventList");
+            if ([self respondsToSelector:rl]) {
+                ((void(*)(id, SEL))objc_msgSend)(self, rl);
             }
         });
         // 等 2.5s 让该日事件列表拉回来，然后**无条件**定位（v1.28 原链路，不做 evCount 门禁）
