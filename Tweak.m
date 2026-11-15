@@ -886,19 +886,78 @@ static void ja_didEnterLive(id self, SEL _cmd) {
 static IMP g_orig_load_type = NULL;
 static IMP g_orig_load_day = NULL;
 static IMP g_orig_rtc_vdl = NULL;
+// v4.14：运行日志。走 NSLog → 系统日志，电脑端 USB 直接读，不用截图
+#define JALog(fmt, ...) NSLog((@"[JASD] " fmt), ##__VA_ARGS__)
+
+// 该页当前持有的录像段数组摘要（条数/首元素类名），用来判断"是谁把它填满的"
+static NSString *JASDArrDesc(id vc) {
+    @try {
+        id a = [vc valueForKey:@"sdRecordFileArr"];
+        if (![a isKindOfClass:[NSArray class]]) return @"-";
+        NSArray *arr = (NSArray *)a;
+        NSString *cls = @"-";
+        if ([arr count] > 0) cls = NSStringFromClass([(id)arr[0] class]);
+        return [NSString stringWithFormat:@"%lu/%@", (unsigned long)[arr count], cls];
+    } @catch (NSException *e) { return @"?"; }
+}
+
+static IMP g_orig_setupData = NULL;
+static IMP g_orig_redmark = NULL;
+static IMP g_orig_respSaved = NULL;
+static IMP g_orig_maxts = NULL;
+static IMP g_orig_switchday = NULL;
+
+// 官方页的核心装载入口：前后各看一次数组，就能知道到底是谁填的
+static void ja_rtc_setupData(id self, SEL _cmd) {
+    JALog(@"setupData> arr=%@ tmax=%.0f sdCard=%d myCam=%p",
+          JASDArrDesc(self), [JAVal(self, @"todayMaxTimestamp") doubleValue],
+          (int)[JAVal(self, @"sdCardState") integerValue], (void *)JAVal(self, @"myCamera"));
+    if (g_orig_setupData) ((void (*)(id, SEL))g_orig_setupData)(self, _cmd);
+    JALog(@"setupData< arr=%@ tmax=%.0f", JASDArrDesc(self),
+          [JAVal(self, @"todayMaxTimestamp") doubleValue]);
+}
+
+static void ja_rtc_redmark(id self, SEL _cmd) {
+    NSString *b = JASDArrDesc(self);
+    if (g_orig_redmark) ((void (*)(id, SEL))g_orig_redmark)(self, _cmd);
+    JALog(@"getRecordRedMarkData %@ -> %@", b, JASDArrDesc(self));
+}
+
+static void ja_rtc_respsaved(id self, SEL _cmd) {
+    NSString *b = JASDArrDesc(self);
+    if (g_orig_respSaved) ((void (*)(id, SEL))g_orig_respSaved)(self, _cmd);
+    JALog(@"respDeviceRecordSaved %@ -> %@", b, JASDArrDesc(self));
+}
+
+static id ja_rtc_maxts(id self, SEL _cmd) {
+    id r = nil;
+    if (g_orig_maxts) r = ((id (*)(id, SEL))g_orig_maxts)(self, _cmd);
+    JALog(@"maxTimestampRecord -> %@ arr=%@", r, JASDArrDesc(self));
+    return r;
+}
+
+static void ja_rtc_switchday(id self, SEL _cmd, long long d, id ds) {
+    JALog(@"switchToSDDay %lld date=%@ arrBefore=%@", d, ds, JASDArrDesc(self));
+    if (g_orig_switchday) ((void (*)(id, SEL, long long, id))g_orig_switchday)(self, _cmd, d, ds);
+    JALog(@"switchToSDDay done arrAfter=%@", JASDArrDesc(self));
+}
 
 static void ja_rtc_viewDidLoad(id self, SEL _cmd) {
     g_rtcVdlCount++;
+    JALog(@"viewDidLoad #%ld ctrl=%p", (long)g_rtcVdlCount, (void *)self);
     if (g_orig_rtc_vdl) ((void (*)(id, SEL))g_orig_rtc_vdl)(self, _cmd);
+    JALog(@"viewDidLoad done arr=%@", JASDArrDesc(self));
 }
 
 static void ja_load_record_type(id self, SEL _cmd, long long t) {
     g_lastLoadType = t;
+    JALog(@"loadRecordListWithType %lld arrBefore=%@", t, JASDArrDesc(self));
     if (g_orig_load_type) ((void (*)(id, SEL, long long))g_orig_load_type)(self, _cmd, t);
 }
 
 static void ja_load_record_day(id self, SEL _cmd, long long d) {
     g_lastLoadDay = d;
+    JALog(@"loadRecordListWithSelectiontDay %lld arrBefore=%@", d, JASDArrDesc(self));
     if (g_orig_load_day) ((void (*)(id, SEL, long long))g_orig_load_day)(self, _cmd, d);
 }
 
@@ -916,6 +975,13 @@ static void JAHookRtcExtras(Class cls) {
              (IMP)ja_load_record_type, &g_orig_load_type);
     JASetImp(cls, @selector(loadRecordListWithSelectiontDay:),
              (IMP)ja_load_record_day, &g_orig_load_day);
+    // v4.14：把"会填 sdRecordFileArr"的候选入口全挂上，日志里看谁把条数变了
+    JASetImp(cls, @selector(setupData), (IMP)ja_rtc_setupData, &g_orig_setupData);
+    JASetImp(cls, @selector(getRecordRedMarkData), (IMP)ja_rtc_redmark, &g_orig_redmark);
+    JASetImp(cls, @selector(respDeviceRecordSaved), (IMP)ja_rtc_respsaved, &g_orig_respSaved);
+    JASetImp(cls, @selector(maxTimestampRecord), (IMP)ja_rtc_maxts, &g_orig_maxts);
+    JASetImp(cls, @selector(switchToSDDay:dateString:),
+             (IMP)ja_rtc_switchday, &g_orig_switchday);
     g_rtcHooked = YES;
 }
 
@@ -1227,6 +1293,10 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     }
     long long sec = g_rtcTargetSec;
     if (sec < 1000000000LL) return;
+    JALog(@"VDA self=%p officialMode=%d arr=%@ tmax=%.0f platSD=%d",
+          (void *)self, (int)g_rtcOfficialMode, JASDArrDesc(self),
+          [JAVal(self, @"todayMaxTimestamp") doubleValue],
+          (int)[JAVal(JADevicePlatformShared(), @"isSDPlayer") integerValue]);
     // v1.20：世代去重 —— 官方可能多次触发 viewDidAppear，只保留最后一次生效
     unsigned long long myGen = ++g_rtcVdaGen;
     // v4.12：官方链模式 —— 段（红蓝段）由官方自己拉满，这里只补一刀"定位到目标秒"。
@@ -1472,6 +1542,8 @@ static id JAOpenViaOfficialDetailUnsafe(UIViewController *host, id warn, id cam,
     // 先把平台状态喂好（myCamera/currentCamera/isSDPlayer/connectCamera）。
     // 缺这一步官方 click 拿不到摄像头，连 SD 都不查（诊断里 platSD=0 就是这个）。
     if (cam) JAPrepareSDPlatform(cam);
+    JALog(@"officialDetail prepare done platSD=%d",
+          (int)[JAVal(JADevicePlatformShared(), @"isSDPlayer") integerValue]);
 
     id dvc = nil;
     @try { dvc = [[cls alloc] init]; } @catch (NSException *e) { return nil; }
@@ -1497,6 +1569,12 @@ static id JAOpenViaOfficialDetailUnsafe(UIViewController *host, id warn, id cam,
     } @catch (NSException *e) {}
 
     NSArray *before = [[nav viewControllers] copy];
+    JALog(@"officialDetail dvc=%p devId=%@ pwd=%@ list=%lu idx=%@ respondsClick=%d navDepth=%lu",
+          (void *)dvc, JAVal(dvc, @"deviceId"),
+          ([JAVal(dvc, @"devicePwd") length] ? @"有" : @"空"),
+          (unsigned long)[JAVal(dvc, @"warnInfoListArr") count], JAVal(dvc, @"playIndex"),
+          (int)[dvc respondsToSelector:NSSelectorFromString(@"clickCloudRecordAction:")],
+          (unsigned long)[before count]);
     g_fakeNavHost = dvc;
     g_fakeNav = nav;
     SEL click = NSSelectorFromString(@"clickCloudRecordAction:");
@@ -1505,17 +1583,23 @@ static id JAOpenViaOfficialDetailUnsafe(UIViewController *host, id warn, id cam,
         // 而那个 IMP 是从另一个同名类 JANewsWarnInfoDetailVC（无 En）身上抓的 ——
         // 它只是一段判断、根本不建 SD 页，所以永远拿不到页（诊断 src=官方链nil 就是它）。
         if ([dvc respondsToSelector:click]) {
+            JALog(@"officialDetail call click ...");
             ((void(*)(id, SEL, id))objc_msgSend)(dvc, click, nil);
+            JALog(@"officialDetail click returned");
         }
-    } @catch (NSException *e) {}
+    } @catch (NSException *e) {
+        JALog(@"officialDetail click threw %@", e.name);
+    }
 
     // 官方这次 push 出来的就是 SD 回放页（它自己 new、自己拉段）
     id sdvc = nil;
     for (id v in [nav viewControllers]) {
+        JALog(@"officialDetail nav item %@ %p", NSStringFromClass([v class]), (void *)v);
         BOOL old = NO;
         for (id o in before) { if (o == v) { old = YES; break; } }
         if (!old) sdvc = v;
     }
+    JALog(@"officialDetail result sdvc=%p", (void *)sdvc);
     if (!sdvc) return nil;
     return sdvc;
 }
@@ -3959,7 +4043,12 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     g_rtcTargetSec = sec;
     g_rtcOfficialMode = NO;
     g_rtcOfficialPending = YES;
+    JALog(@"GRID CLICK sec=%lld day=%lld cam=%p devId=%@ warns=%lu ev0=%@",
+          sec, JADayStartSec(@(sec)), (void *)self.myCamera,
+          JAGridDeviceId(self.myCamera), (unsigned long)[warns count],
+          NSStringFromClass([ev0 class]));
     id vc = JATryOpenViaOfficialDetail(self, ev0, self.myCamera, sec, [warns copy]);
+    JALog(@"GRID official chain vc=%p %@", (void *)vc, vc ? NSStringFromClass([vc class]) : @"nil");
     if (!vc) {
         // 官方链没建起来 → 退回自造页，至少保证能进页面
         g_rtcOfficialPending = NO;
