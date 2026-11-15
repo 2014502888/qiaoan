@@ -637,7 +637,7 @@ static NSString *JADiagText(UIViewController *vc, id cam, long long sec) {
         if ([arr respondsToSelector:@selector(count)]) {
             segN = (NSUInteger)[arr performSelector:@selector(count)];
             if (segN > 0) {
-                id f = [arr performSelector:@selector(objectAtIndex:) withObject:@(0)];
+                id f = [(NSArray *)arr objectAtIndex:0];
                 NSString *d = [f description];
                 if (d.length > 96) d = [d substringToIndex:96];
                 firstSeg = d;
@@ -658,7 +658,8 @@ static NSString *JADiagText(UIViewController *vc, id cam, long long sec) {
     } @catch (NSException *e) { sdMode = @"err"; }
 
     // ③ 官方 SD 页自己的两个关键布尔（决定它要不要退回实时）
-    BOOL cardState = 0, startLive = 0, statusChecked = 0;
+    BOOL startLive = 0, statusChecked = 0;
+    int cardState = 0;
     @try {
         cardState = [[vc valueForKey:@"sdCardState"] intValue];
         startLive = [[vc valueForKey:@"shouldStartLiveAfterSDCheck"] boolValue];
@@ -670,7 +671,8 @@ static NSString *JADiagText(UIViewController *vc, id cam, long long sec) {
     BOOL isSD = NO;
     id plat = JADevicePlatformShared();
     if (plat) {
-        pbType = (NSUInteger)[[JAVal(plat, @"playBackActionType") unsignedIntegerValue] unsignedLongLongValue];
+        id pbv = JAVal(plat, @"playBackActionType");
+        pbType = pbv ? (NSUInteger)[pbv unsignedLongLongValue] : 0;
         isSD = [JAVal(plat, @"isSDPlayer") boolValue];
     }
 
@@ -695,7 +697,7 @@ static NSString *JADiagText(UIViewController *vc, id cam, long long sec) {
     long long rel = sec - day;
     return [NSString stringWithFormat:@"段=%lu 入SD=%@ pb=%lu platSD=%d\n卡态=%d 待直播=%d 已检=%d %@\n日=%lld 目标=%lld rel=%lld\n首段=%@",
             (unsigned long)segN, sdMode, (unsigned long)pbType, isSD ? 1 : 0,
-            cardState ? 1 : 0, startLive ? 1 : 0, statusChecked ? 1 : 0, lmTxt,
+            cardState, startLive ? 1 : 0, statusChecked ? 1 : 0, lmTxt,
             day, sec, rel, firstSeg];
 }
 
