@@ -628,7 +628,7 @@ static unsigned long long g_rtcVdaGen = 0;
 //   ① 官方 SD 页有没有拿到段列表（_sdRecordFileArr 条数）—— 时间轴上的红/黄/蓝段就是它渲染的
 //   ② 页内 ViewModel 的 isEnterSDPlay 是不是 YES —— 不是 YES 就说明整页按"直播"在跑
 //   ③ JALiveManager 的 回放态 / 无录像 两个全局开关，以及 cam 的 SD 支持字段
-static NSString *JADiagText(UIViewController *vc, id cam, long long sec) {
+static NSString *JADiagText(UIViewController *vc, id cam, long long sec, NSString *src) {
     // ① 段列表条数 + 第一条长什么样（判断是"录像段"还是"告警事件"）
     NSUInteger segN = 0;
     NSString *firstSeg = @"-";
@@ -695,25 +695,30 @@ static NSString *JADiagText(UIViewController *vc, id cam, long long sec) {
 
     long long day = JADayStartSec(@(sec));
     long long rel = sec - day;
-    return [NSString stringWithFormat:@"段=%lu 入SD=%@ pb=%lu platSD=%d\n卡态=%d 待直播=%d 已检=%d %@\n日=%lld 目标=%lld rel=%lld\n首段=%@",
+    // v4.5：把 cam 的**对象指针**打出来 —— 两页一比，就知道是不是同一个实例。
+    // 段数 269 vs 17 而其余字段全同，最可能就是"两份等值但不同的 MyCamera"，
+    // 其中官方那份缓存着全天段列表，我们那份只拿到一小段。
+    id vcCam = JAVal(vc, @"myCamera");
+    return [NSString stringWithFormat:@"段=%lu 入SD=%@ pb=%lu platSD=%d\n卡态=%d 待直播=%d 已检=%d %@\n日=%lld 目标=%lld rel=%lld\ncam=%p vcam=%p\nsrc=%@\n首段=%@",
             (unsigned long)segN, sdMode, (unsigned long)pbType, isSD ? 1 : 0,
             cardState, startLive ? 1 : 0, statusChecked ? 1 : 0, lmTxt,
-            day, sec, rel, firstSeg];
+            day, sec, rel, (void *)cam, (void *)vcCam, src ? src : @"-", firstSeg];
 }
 
-static void JADiagAttach(UIViewController *vc, long long sec, id cam) {
+static void JADiagAttach(UIViewController *vc, long long sec, id cam, NSString *src) {
     if (!vc) return;
     NSArray *times = @[@1.2, @3.2, @5.2, @8.0];
     for (NSNumber *tn in times) {
         __weak UIViewController *wv = vc;
         __weak id wc = cam;
+        NSString *s0 = [src copy];
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(tn.doubleValue * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             UIViewController *p = wv;
             if (!p || !p.isViewLoaded) return;
             UILabel *lab = (UILabel *)[p.view viewWithTag:0x1A66];
             if (!lab) {
-                lab = [[UILabel alloc] initWithFrame:CGRectMake(8, 100, p.view.bounds.size.width - 16, 76)];
+                lab = [[UILabel alloc] initWithFrame:CGRectMake(8, 96, p.view.bounds.size.width - 16, 96)];
                 lab.tag = 0x1A66;
                 lab.numberOfLines = 0;
                 lab.font = [UIFont systemFontOfSize:11];
@@ -724,7 +729,7 @@ static void JADiagAttach(UIViewController *vc, long long sec, id cam) {
                 lab.clipsToBounds = YES;
                 [p.view addSubview:lab];
             }
-            lab.text = JADiagText(p, wc, sec);
+            lab.text = JADiagText(p, wc, sec, s0);
             [p.view bringSubviewToFront:lab];
         });
     }
@@ -780,7 +785,7 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {    
     if (nav) {
         g_activeSDPlayer = vc;  // 登记当前活跃 RTC SD 播放器（viewDidAppear hook 守卫用）
         [nav pushViewController:vc animated:YES];
-        JADiagAttach(vc, g_rtcTargetSec, cam);
+        JADiagAttach(vc, g_rtcTargetSec, cam, nil);
         // RTC 版是官方完整播放器，官方链自己建流 → 不做任何状态强制
     } else {
         [UIApplication.sharedApplication.keyWindow.rootViewController presentViewController:vc animated:YES completion:nil];
@@ -3641,6 +3646,13 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     //   ④ 挂 currentTimeStamp + sdSelectiontDay
     // 这四步就是"点格子时先按消息列表那条路把东西拿到手"的具体落地。
     id ev0 = entry[@"ev"];
+    // v4.5：cam 换成 JAGroupManager 的 myCameraMap 里**那一个对象** —— 官方所有入口
+    // （详情页「查看录像」、卡回放）用的都是它，当天完整的录像段列表缓存在它身上。
+    // 格子以前用的 self.myCamera 是等值但不同的实例，字段一模一样，段却只拉回 17 条
+    //（官方那页是 269 条）。这就是"其余全同、只有段数不同"的来源。
+    NSString *camSrc = nil;
+    id gmCam = JAFindCameraFromGroupManager(ev0, &camSrc);
+    if (gmCam) self.myCamera = gmCam;
     id cam2 = JAPrepareSDPlatform(self.myCamera);
     if (cam2) self.myCamera = cam2;
     @try { [vc setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
@@ -3662,7 +3674,7 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     UINavigationController *nav = self.navigationController;
     if (!nav) return;
     [nav pushViewController:vc animated:YES];
-    JADiagAttach(vc, sec, self.myCamera);
+    JADiagAttach(vc, sec, self.myCamera, camSrc);
 
     // v2.9.8：官方 SD 回放页自带的时间轴/拖动条不再隐藏（用户要能自己拖）。
     // v2.8：画面右上角标出这一格的目标时间 —— 定位有没有生效靠这个角标和画面对照
