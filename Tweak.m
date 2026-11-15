@@ -622,12 +622,11 @@ static IMP g_orig_rtc_vdd = NULL;    // 原 viewDidDisappear: IMP（v1.30 返回
 static long long g_rtcTargetSec = 0; // 报警时间戳（秒），viewDidAppear 后自动定位播放
 // v1.20：viewDidAppear 世代去重（官方可能多次触发 → 只保留最后一次的 3.0s 定位）
 static unsigned long long g_rtcVdaGen = 0;
-// v4.11：冷启动自愈重进的参数备份（点格子时存，检测到"一段都没拉到"就用它再进一次）
-static id g_rtcReopenDetailVC = nil;
-static id g_rtcReopenWarn = nil;
-static id g_rtcReopenCam = nil;
-static long long g_rtcReopenSec = 0;
-static BOOL g_rtcWarmedOnce = NO;   // 每次点格子允许自愈一次，防无限重进
+// v4.12：真正走官方"查看录像"链
+// g_rtcOfficialPending：点格子时置 YES，官方链把 SD 页 push 出来时由 hook 认领它
+// g_rtcOfficialMode：认领成功后置 YES —— 该页的段是官方自己拉满的，只补一刀定位
+static BOOL g_rtcOfficialPending = NO;
+static BOOL g_rtcOfficialMode = NO;
 
 // ---------- v4.3：诊断条（用户同意，用来定位"没段颜色"卡在哪一环） ----------
 // 只看三件事，别的都不看了：
@@ -826,11 +825,6 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
     // 3) push
     UINavigationController *nav = detailVC.navigationController;
     if (!nav) nav = JATopVC().navigationController;
-    // v4.11：备份进去的参数，供"冷启动自愈重进"用
-    g_rtcReopenDetailVC = detailVC;
-    g_rtcReopenWarn = warn;
-    g_rtcReopenCam = cam;
-    g_rtcReopenSec = forceSec > 0 ? forceSec : g_rtcTargetSec;
     if (nav) {
         g_activeSDPlayer = vc;  // 登记当前活跃 RTC SD 播放器（viewDidAppear hook 守卫用）
         [nav pushViewController:vc animated:YES];
@@ -1186,40 +1180,41 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
                 }
             }
         }
-        return;
+        // v4.12：点格子走官方"查看录像"链时，新建出来的 SD 页在 push 的瞬间就 didAppear，
+        // 此刻 g_activeSDPlayer 还没设。用 g_rtcOfficialPending 认领这一次 —— 认领后它的段
+        // 是官方自己拉满的（实测 269 条红段），我们只补一刀定位，别的什么都不碰。
+        if (!g_rtcOfficialPending) return;
+        g_rtcOfficialPending = NO;
+        g_rtcOfficialMode = YES;
+        g_activeSDPlayer = self;
+        JADiagAttach((UIViewController *)self, g_rtcTargetSec, c, @"官方链");
     }
     long long sec = g_rtcTargetSec;
     if (sec < 1000000000LL) return;
     // v1.20：世代去重 —— 官方可能多次触发 viewDidAppear，只保留最后一次生效
     unsigned long long myGen = ++g_rtcVdaGen;
+    // v4.12：官方链模式 —— 段（红蓝段）由官方自己拉满，这里只补一刀"定位到目标秒"。
+    // 绝不能再 stopSDPlay / switchToSDDay / 重拉段：那套是给"自造页救段"用的，
+    // 在官方页上做会把刚拉好的 269 段直接冲成十几条。
+    if (g_rtcOfficialMode) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+            SEL sp = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
+            if ([self respondsToSelector:sp]) {
+                ((void(*)(id, SEL, long long))objc_msgSend)(self, sp, sec);
+            }
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                JATimeLineSyncToSec(self, sec);
+            });
+        });
+        return;
+    }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-        // v4.11 —— 冷启动自愈。
-        // 实测三分表：冷启动直接点格子 = 段 0（不能回放）；消息详情→查看录像 = 段 271（能回放）；
-        // 看完录像再点格子 = 满屏红段且精准定位。差别只有一件：官方在**第一次进入**时会把
-        // 该设备当天的录像段在进程里初始化一遍，第二次进入直接复用。
-        // 所以这里一旦发现"一段都没拉到"，就自动退出去、隔 1 秒用同一套参数重进一次 ——
-        // 第二次就是"已经走过一次"的状态，和用户手点查看录像再回来完全等价。
-        @try {
-            id segArr0 = [self valueForKey:@"sdRecordFileArr"];
-            NSInteger n0 = [segArr0 isKindOfClass:[NSArray class]]
-                           ? (NSInteger)[(NSArray *)segArr0 count] : 0;
-            if (n0 <= 0 && !g_rtcWarmedOnce) {
-                // 注意：这里的 self 是 C 函数里的 id，点语法取属性会编译报错，必须用消息
-                UINavigationController *nav0 = [self navigationController];
-                if (nav0 && nav0.viewControllers.count >= 2) {
-                    g_rtcWarmedOnce = YES;
-                    [nav0 popViewControllerAnimated:NO];
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), ^{
-                        JATryOpenSDReplayAt(g_rtcReopenDetailVC, g_rtcReopenWarn,
-                                            g_rtcReopenCam, g_rtcReopenSec);
-                    });
-                    return;
-                }
-            }
-        } @catch (NSException *e) {}
         // v1.21：先停官方 viewDidLoad 自动起的流（避免双流并存交替渲染），再建定位流。
         // 每次进入都"停旧→建新"，绕开复用流上 seekSDPlay 前置闸门（0x103429ee0 bit0）
         // 导致的"第二次起偶发定位不生效/播最新"。
@@ -1337,6 +1332,64 @@ static void JATimeLineSyncToSec(id sdVC, long long sec) {
             ((void(*)(id, SEL, long long))objc_msgSend)(tl, c, rel);
         }
     }
+}
+
+// ---------- v4.12：真正走官方"查看录像"链 ----------
+// 实测铁证（用户反复确认）：手动点「查看录像」= 段 269、满屏红段、能拖动能回放；
+// 点格子 = 段 17/18、只有蓝条、拖了不回放。而"手动返回再进格子"依然不行 ——
+// 说明差别不是"进出次数"，而是官方那条链本身做了什么。
+// 十八版都在自造 SD 页（init 后一个个塞 ivar），段数永远是当天事件数（17/18 条），
+// 永远不是 5 分钟切片数（269 条）。所以这版不再自造：
+// 造一个真实的「消息详情」页，直接调它 clickCloudRecordAction: 的**官方原实现**，
+// 让官方自己 new 出 SD 页、自己把段拉满；我们只把中间那层详情页从栈里摘掉，
+// 再在 SD 页 didAppear 时补一刀"定位到目标秒"（见 g_rtcOfficialMode 分支）。
+static id JATryOpenViaOfficialDetail(UIViewController *host, id warn, id cam,
+                                     long long sec, NSArray *warnList) {
+    Class cls = NSClassFromString(@"JANewsEnWarnInfoDetailVC");
+    if (!cls || !host || !warn) return nil;
+    UINavigationController *nav = [host navigationController];
+    if (!nav) return nil;
+    id dvc = nil;
+    @try { dvc = [[cls alloc] init]; } @catch (NSException *e) { return nil; }
+    if (!dvc) return nil;
+    // 只喂它 viewDidLoad / 官方 click 分支真正会读的那几个字段，别的都不塞
+    JASet(dvc, @"warnInfoEntityModelEx", warn);
+    if (warnList.count > 0) JASet(dvc, @"warnInfoListArr", warnList);
+    NSString *devId = JAGridDeviceId(cam);
+    if (devId.length > 0) JASet(dvc, @"deviceId", devId);
+    id pwd = JAVal(cam, @"viewPwd");
+    if (![pwd isKindOfClass:[NSString class]] || [(NSString *)pwd length] == 0) {
+        pwd = JAVal(cam, @"dev_pwd");
+    }
+    if ([pwd isKindOfClass:[NSString class]] && [(NSString *)pwd length] > 0) {
+        JASet(dvc, @"devicePwd", pwd);
+    }
+
+    NSArray *before = [[nav viewControllers] copy];
+    [nav pushViewController:dvc animated:NO];
+    SEL click = NSSelectorFromString(@"clickCloudRecordAction:");
+    @try {
+        if (g_orig_clickCloudRecordAction) {
+            ((void(*)(id, SEL, id))g_orig_clickCloudRecordAction)(dvc, click, nil);
+        } else if ([dvc respondsToSelector:click]) {
+            ((void(*)(id, SEL, id))objc_msgSend)(dvc, click, nil);
+        }
+    } @catch (NSException *e) {}
+
+    // 找官方这次新建的 SD 页（栈里新出现的、且不是刚才那个详情页）
+    id sdvc = nil;
+    for (id v in [nav viewControllers]) {
+        if (v == dvc) continue;
+        BOOL old = NO;
+        for (id o in before) { if (o == v) { old = YES; break; } }
+        if (!old) sdvc = v;
+    }
+    // 把中间那层详情页摘掉，只留官方 SD 页（用户只该看到回放页，不该看到消息详情）
+    NSMutableArray *vcs = [[nav viewControllers] mutableCopy];
+    if ([vcs containsObject:dvc]) [vcs removeObject:dvc];
+    if (vcs.count > 0) [nav setViewControllers:vcs animated:NO];
+    if (!sdvc) return nil;
+    return sdvc;
 }
 
 // 防抖：同一详情页实例 2 秒内只 push 一次（官方可能触发两次点击事件 → 双 push 闪烁）
@@ -3732,37 +3785,33 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     }
 
     id ev0 = entry[@"ev"];
-    // v4.11：每次点格子都允许"冷启动自愈重进"一次
-    g_rtcWarmedOnce = NO;
-    // v4.9 —— 按用户要求：**点格子就直接模拟一次「查看录像」**。
-    // 不再自己 [[rtc alloc] init] 后往 VC 上一个个塞 ivar（currentEvent / currentTimeStamp /
-    // todayMaxTimestamp / sdSelectiontDay 这一串），那条自造链实测段数只有 18 条、
-    // 时间轴画到 15:50 就断、画面停在实时 —— 而「查看录像」同一条界面是 271 条、能回放。
-    // 现在格子直接调 JATryOpenSDReplayAt —— 它就是 hook 官方「查看录像」
-    // (clickCloudRecordAction:) 之后走的那个函数，一字不差，只是多给一个目标秒。
-    // cam 依旧先换到 JAGroupManager.myCameraMap 里那一个对象（官方所有入口共用的那份）。
+    // v4.12 —— 点格子 = 真的走一次官方「查看录像」。
+    // 不再自造 SD 页、不再往 VC 上塞 ivar、不再灌 eventList：那四版实测全没用，
+    // 段永远是当天事件数（17/18 条），而官方「查看录像」是 269 条 5 分钟切片、满屏红段。
+    // 这里改为造一个真实的「消息详情」页，调它的官方 clickCloudRecordAction: 原实现，
+    // 让官方自己把 SD 页和整天的段建出来，我们只把中间那层详情页从栈里摘掉。
     NSString *camSrc = nil;
     id gmCam = JAFindCameraFromGroupManager(ev0, &camSrc);
     if (gmCam) self.myCamera = gmCam;
 
-    // v4.10 —— 这就是用户说的"点格子时先读一次消息列表，把东西拿到手"。
-    // 官方 SD 页的录像段不是它自己现拉的，而是读 MyCamera.eventList（当天事件列表）：
-    // 走一次「消息 → 报警消息 → 监控 → 消息列表 → 查看录像」时，前面的列表页已经把这个
-    // 数组填好了，所以同一份 camera 再进就满屏红蓝段；冷启动直接点格子它是空的，
-    // 于是段落全无、时间轴只有蓝带、画面留在实时（v4.9 实测段=0）。
-    // 格子页本来就把当天全部事件攥在手里（封面就是它们拉的），这里直接灌进去。
+    NSMutableArray *warns = [NSMutableArray array];
     @try {
-        NSMutableArray *evs = [NSMutableArray array];
         for (NSDictionary *e0 in self.flat) {
             id ev = e0[@"ev"];
-            if (ev) [evs addObject:ev];
-        }
-        if (evs.count > 0) {
-            JASet(self.myCamera, @"eventList", [evs copy]);
+            if (ev) [warns addObject:ev];
         }
     } @catch (NSException *e) {}
 
-    id vc = JATryOpenSDReplayAt(self, ev0, self.myCamera, sec);
+    g_rtcTargetSec = sec;
+    g_rtcOfficialMode = NO;
+    g_rtcOfficialPending = YES;
+    id vc = JATryOpenViaOfficialDetail(self, ev0, self.myCamera, sec, [warns copy]);
+    if (!vc) {
+        // 官方链没建起来（极少见）→ 退回自造页，至少保证能进页面
+        g_rtcOfficialPending = NO;
+        g_rtcOfficialMode = NO;
+        vc = JATryOpenSDReplayAt(self, ev0, self.myCamera, sec);
+    }
     if (!vc) return;
 
     self.playIndex = index;
