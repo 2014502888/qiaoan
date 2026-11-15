@@ -866,6 +866,52 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
                 if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
                 JATimeLineSyncToSec(self, sec);
             });
+            // v2.9.44：现场诊断（临时）。时间轴到底有没有录像段，看这几个数就知道 ——
+            //   段   = _sdRecordFileArr.count（0 就是一条段都没拉到 → 时间轴整条空白）
+            //   VC日 = 播放页自己的 _currentSelectedSDDay（应该等于报警日 0 点）
+            //   摄像日 = myCamera.sdSelectiontDay（跨天算相对秒用）
+            //   入SD = isEnterSDPlay（官方播放状态机有没有进 SD 分支）
+            //   UID  = 这台设备到底是谁（和用户点的那台对不上的话，就是设备上下文错了）
+            // 每秒刷一次、共 6 次，用户截一张图就够定位。
+            for (int di = 0; di < 6; di++) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                             (int64_t)((3.5 + di * 1.0) * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                    UIViewController *pv = (UIViewController *)self;
+                    if (!pv.isViewLoaded) return;
+                    UIView *old = [pv.view viewWithTag:0x1A66];
+                    if (old) [old removeFromSuperview];
+                    NSArray *arr = nil;
+                    id vcd = nil, cam = nil, camd = nil, uid = nil, ent = nil;
+                    @try { arr = [self valueForKey:@"sdRecordFileArr"]; } @catch (NSException *e) {}
+                    @try { vcd = [self valueForKey:@"currentSelectedSDDay"]; } @catch (NSException *e) {}
+                    @try { cam = [self valueForKey:@"myCamera"]; } @catch (NSException *e) {}
+                    if (cam) {
+                        @try { camd = [cam valueForKey:@"sdSelectiontDay"]; } @catch (NSException *e) {}
+                        @try { uid = [cam valueForKey:@"uid"]; } @catch (NSException *e) {}
+                    }
+                    @try { ent = [self valueForKey:@"isEnterSDPlay"]; } @catch (NSException *e) {}
+                    NSInteger n = -1;
+                    if ([arr isKindOfClass:[NSArray class]]) n = (NSInteger)arr.count;
+                    NSString *txt = [NSString stringWithFormat:
+                        @"段=%ld  VC日=%@\n摄像日=%@\nUID=%@\n入SD=%@  目标=%@",
+                        (long)n, vcd, camd, uid, ent, JAGridTimeText(sec)];
+                    UILabel *lab = [[UILabel alloc] initWithFrame:CGRectZero];
+                    lab.tag = 0x1A66;
+                    lab.numberOfLines = 0;
+                    lab.font = [UIFont systemFontOfSize:11];
+                    lab.textColor = [UIColor blackColor];
+                    lab.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.85];
+                    lab.layer.cornerRadius = 6;
+                    lab.clipsToBounds = YES;
+                    lab.text = txt;
+                    CGFloat w2 = pv.view.bounds.size.width;
+                    CGSize fs = [lab sizeThatFits:CGSizeMake(w2 - 48, CGFLOAT_MAX)];
+                    lab.frame = CGRectMake(14, 104, MIN(w2 - 28, fs.width + 16), fs.height + 12);
+                    [pv.view addSubview:lab];
+                });
+            }
             // 纯附加旁路：这台设备官方明确说自己不支持 SD 回放 → 说白一句，不干预上面的定位
             if (noSD) {
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
