@@ -252,6 +252,13 @@
 //   官方有 JADecryptionTool：+jaDecryptImagewithURL:withData:withCameraUID:withCameraPwd:，
 //   密钥由「设备 uid + 摄像头查看密码」在本地推出来（日志里的「AES Key: %@」就是这个），
 //   不需要联网取 key。本版直接从 MyCamera 取 uid/viewPwd（空则退 dev_pwd）调官方解密。
+//   **实测已出图**（第 2 台监控的格子回放显示真实抓拍画面）。
+// v2.9.35（撤掉排查期诊断）：图片出来了，但底部还挂着「封面失败 [403|382] 头=3C3F786D6C207665」
+//   —— 3C 3F 78 6D 6C = `<?xml`，这是 OBS 的 XML 错误体；Exp=1794680488 换算成时间是
+//   当天 02:21，请求时 URL 早已过期 → 403。而 firstFailInfo 只记第一次、不随后续成功清除，
+//   于是几小时前那条败仗一直留在底部。既然根因已定案修复，诊断整体撤掉：
+//   ① rebuildLayout 不再把 firstFailInfo 塞进底部提示条；
+//   ② 格子失败态从「失败 403 / 失败 e-1002 / 失败 qiaoan-th / 失败.jpg」收回成「无封面」。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -2121,30 +2128,10 @@ static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam
         if (!key || ![s.imgURL isEqualToString:key]) return;
         if (img) { s.thumb.image = img; s.noneLab.hidden = YES; }
         else {
-            // v2.9.21：把后缀带出来 —— 显示「失败.mp4」就说明拿到的根本不是图。
-            // v2.9.23：有 HTTP 状态码时优先显示码 —— 「失败 403」是被拒，「失败 404」是地址错。
-            // v2.9.27：负数是网络错误码 —— 「失败 e-1022」是被 ATS 拦、e-1001 超时、
-            // e-1004 连不上、e-1003 DNS 解析不出来；「失败 地址」是 URL 本身非法，请求没发出去。
-            NSInteger st = [[JAGridImageCache shared] statusForURL:key];
-            // v2.9.30：状态码只要拿到了就显示 —— 包括 200。
-            // 「失败 200」= 服务器正常回应了，但回来的是空内容或非图片，这跟 403 完全两回事。
-            if (st > 0) s.noneLab.text = [NSString stringWithFormat:@"失败 %ld", (long)st];
-            else if (st < 0) s.noneLab.text = [NSString stringWithFormat:@"失败 e%ld", (long)st];
-            else if (![NSURL URLWithString:key]) s.noneLab.text = @"失败 地址";
-            else {
-                // v2.9.28：没有状态码也没有错误码时，把域名首段打出来 ——
-                // 一眼就能看出这张图到底在问哪个服务器要（jooancloud / oss / 内网 IP …）。
-                NSString *host = [NSURL URLWithString:key].host;
-                if (host.length) {
-                    if (host.length > 9) host = [[host componentsSeparatedByString:@"."] firstObject];
-                    if (host.length > 9) host = [host substringToIndex:9];
-                    s.noneLab.text = [NSString stringWithFormat:@"失败 %@", host];
-                } else {
-                    NSString *ext = [[NSURL URLWithString:key] pathExtension].lowercaseString;
-                    s.noneLab.text = ext.length ? [NSString stringWithFormat:@"失败.%@", ext]
-                                                : @"加载失败";
-                }
-            }
+            // v2.9.35：解密链路已经打通（华为云 OBS 上的 _enc 加密图交给官方
+            // JADecryptionTool 解），失败已经是极少数（多为预签名 URL 过期后 403）。
+            // 排查期的状态码/域名/后缀全撤掉，格子恢复干净的两态：无封面 / 载入中。
+            s.noneLab.text = @"无封面";
             s.noneLab.hidden = NO;
         }
     }];
@@ -2998,22 +2985,8 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
                           @"items": @[],
                           @"note": @"当日已全部加载完毕，选择日期重新加载"}];
     }
-    // v2.9.30：排查期临时 —— 有封面失败时，把第一条失败样本的现场顶到底部那行：
-    // 完整 URL + [状态码|返回字节数]。看到它就够定案了（200|0 是空响应，200|5000 是回来的不是图）。
-    // 补完就删掉这段。
-    NSString *failInfo = [JAGridImageCache shared].firstFailInfo;
-    if (failInfo.length && secs.count > 0) {
-        NSDictionary *last = secs.lastObject;
-        if ([last[@"day"] isEqualToNumber:@(0)]) {
-            NSMutableDictionary *md = [last mutableCopy];
-            // v2.9.32：firstFailInfo 本身就是三行短文本（状态码/字节数 + 路径尾段 + 签名参数缩写），
-            // 交给多行标签自己换行，不用再截。
-            md[@"note"] = failInfo;
-            NSMutableArray *arr = [secs mutableCopy];
-            arr[arr.count - 1] = md;
-            secs = arr;
-        }
-    }
+    // v2.9.35：排查期的「封面失败 [码|字节] 头=…」已经完成任务、问题也定案修复了
+    // （加密图交给官方 JADecryptionTool 解），这里整段撤掉 —— 不再往底部提示条塞诊断文本。
     self.secs = secs;
     self.flat = flat;
     // v2.9.14：正在拖 / 惯性滑动时不重建 —— 否则每页都刷新一次，会打断滑动、位置被拉回，
