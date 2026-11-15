@@ -1419,9 +1419,10 @@ static id JAOpenViaOfficialDetailUnsafe(UIViewController *host, id warn, id cam,
     g_fakeNav = nav;
     SEL click = NSSelectorFromString(@"clickCloudRecordAction:");
     @try {
-        if (g_orig_clickCloudRecordAction) {
-            ((void(*)(id, SEL, id))g_orig_clickCloudRecordAction)(dvc, click, nil);
-        } else if ([dvc respondsToSelector:click]) {
+        // 必须走 dvc 自己那个类的真实实现。之前优先用 g_orig_clickCloudRecordAction，
+        // 而那个 IMP 是从另一个同名类 JANewsWarnInfoDetailVC（无 En）身上抓的 ——
+        // 它只是一段判断、根本不建 SD 页，所以永远拿不到页（诊断 src=官方链nil 就是它）。
+        if ([dvc respondsToSelector:click]) {
             ((void(*)(id, SEL, id))objc_msgSend)(dvc, click, nil);
         }
     } @catch (NSException *e) {}
