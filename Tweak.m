@@ -238,13 +238,6 @@
 //     （已有 %XX 原样保留，不会二次编码）。
 //   · 格子上失败文字细化：`失败 403`=被拒、`失败 e-1022`=被 ATS 拦、`失败 e-1001`=超时、
 //     `失败 e-1004`=连不上、`失败 e-1003`=DNS 不通、`失败 地址`=URL 非法没发出去。
-// v2.9.51（本版基线 = v2.9.27）：v2.9.27 时格子回放能精准定位到选中时间点的录像，
-//   之后的版本为了修封面/时间轴颜色一路改播放链路，反而把"能不能回到选中时间点"弄坏了。
-//   所以这里把源码整体回到 v2.9.27，只把 v2.9.34 那套"能把第二台封面解出来"的东西加回来：
-//   ① 请求头照官方 UA（Joolink/26101509371 CFNetwork/1312 Darwin/21.0.0）、Accept 用 */*、不发 Referer；
-//   ② 图片直接解不出来时，调官方 JADecryptionTool 解密（uid + 摄像头查看密码，本地推密钥，不联网）；
-//   ③ 格子页 viewWillAppear 把当前 MyCamera 交给图片缓存，供解密取 uid/viewPwd。
-//   播放链路（stopSDPlay / switchToSDDay / startSDPlayWithSelectTimeStamp: / 时间轴同步）保持 v2.9.27 原样，一行没动。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -1736,56 +1729,6 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     return [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%08x.img", h]];
 }
 
-// v2.9.52：按服务器做物理划分 —— 只有华为云 OBS 那批（文件名带 _enc 的加密图）才走官方解密；
-// 乔安服务器（1345 那几台）的图一律不进这段代码，连函数都不会被调用。
-static BOOL JAIsEncryptedCoverURL(NSString *url) {
-    if (!url.length) return NO;
-    if ([url rangeOfString:@"myhuaweicloud.com"].location != NSNotFound) return YES;
-    if ([url rangeOfString:@"_enc."].location != NSNotFound) return YES;
-    return NO;
-}
-
-// v2.9.34：华为云 OBS 上的抓拍图是加密的（文件名带 _enc，返回体头不是 JPEG 魔数 FF D8 FF，
-// 实测是 E8 2A 2D C4… 这种数据）。官方 App 用 JADecryptionTool 在本地解 ——
-// 密钥由「设备 UID + 摄像头查看密码」推出来，不联网也能解。这里直接调官方类方法，不自己实现 AES：
-//   + jaDecryptImagewithURL:withData:withCameraUID:withCameraPwd:   → UIImage / NSData / 文件路径
-static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam) {
-    if (!data.length || !url.length || !cam) return nil;
-    Class cls = NSClassFromString(@"JADecryptionTool");
-    if (!cls) return nil;
-    SEL sel = NSSelectorFromString(@"jaDecryptImagewithURL:withData:withCameraUID:withCameraPwd:");
-    if (![cls respondsToSelector:sel]) return nil;
-    NSString *uid = nil, *pwd = nil;
-    @try { id v = [cam valueForKey:@"uid"]; if ([v isKindOfClass:[NSString class]]) uid = v; } @catch (NSException *e) {}
-    @try { id v = [cam valueForKey:@"viewPwd"]; if ([v isKindOfClass:[NSString class]]) pwd = v; } @catch (NSException *e) {}
-    if (!pwd.length) {
-        @try { id v = [cam valueForKey:@"dev_pwd"]; if ([v isKindOfClass:[NSString class]]) pwd = v; } @catch (NSException *e) {}
-    }
-    if (!uid.length) return nil;
-    id r = nil;
-    @try {
-        r = ((id (*)(id, SEL, id, id, id, id))objc_msgSend)(cls, sel, url, data, uid, (pwd.length ? pwd : @""));
-    } @catch (NSException *e) { r = nil; }
-    if ([r isKindOfClass:[UIImage class]]) return (UIImage *)r;
-
-    // 返回可能是 NSData，也可能是已解密好的本地文件路径
-    NSData *out = nil;
-    if ([r isKindOfClass:[NSData class]]) out = (NSData *)r;
-    else if ([r isKindOfClass:[NSString class]] && [(NSString *)r length]) {
-        out = [NSData dataWithContentsOfFile:(NSString *)r];
-    }
-    if (!out.length) return nil;
-    UIImage *img = [UIImage imageWithData:out];
-    if (img) return img;
-    CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)out, NULL);
-    if (src) {
-        CGImageRef cg = CGImageSourceCreateImageAtIndex(src, 0, NULL);
-        if (cg) { img = [UIImage imageWithCGImage:cg]; CGImageRelease(cg); }
-        CFRelease(src);
-    }
-    return img;
-}
-
 @interface JAGridImageCache : NSObject
 @property (nonatomic, strong) NSCache *mem;
 @property (nonatomic, strong) NSMutableDictionary *inflight;   // v2.9.14：同 URL 去重
@@ -1793,7 +1736,6 @@ static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam
 @property (nonatomic, strong) NSMutableDictionary *codes;      // v2.9.23：失败时的 HTTP 状态码
 @property (nonatomic, strong) NSMutableArray *queue;           // v2.9.15：限并发排队
 @property (nonatomic, assign) NSInteger active;                // 当前在跑的下载数
-@property (nonatomic, weak) id cam;                             // v2.9.34：当前设备 MyCamera（解密要 uid + 查看密码）
 + (instancetype)shared;
 - (UIImage *)imageForKey:(NSString *)key;
 - (void)loadURL:(NSString *)url completion:(void (^)(UIImage *img, NSString *key))cb;
@@ -1906,36 +1848,15 @@ static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam
     // v2.9.23：带上 App 的 User-Agent 跟常规图片请求头。第二台设备那张抓拍图 jpg 地址是对的，
     // 但裸 session 请求图片 CDN 会被判成非 App 流量直接拒（格子上一直是「失败.jpg」）。
     NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:u];
-    // v2.9.28：UA 照抄官方（ProxyPin 抓到的真值），自拼的浏览器式 UA 会让 CDN 判成非 App 流量。
-    [rq setValue:@"Joolink/26101509371 CFNetwork/1312 Darwin/21.0.0"
+    [rq setValue:@"Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 Joolink/4.79"
         forHTTPHeaderField:@"User-Agent"];
-    [rq setValue:@"*/*" forHTTPHeaderField:@"Accept"];
-    // v2.9.31：OBS 预签名地址带 Referer 会被防盗链拒（403 返回 XML），这里不发 Referer。
+    [rq setValue:@"image/*,*/*;q=0.8" forHTTPHeaderField:@"Accept"];
+    [rq setValue:@"https://www.jooancloud.com/" forHTTPHeaderField:@"Referer"];
     rq.timeoutInterval = 12.0;
     NSURLSessionDataTask *t = [[NSURLSession sharedSession]
         dataTaskWithRequest:rq completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-            __block UIImage *img = nil;   // v2.9.53：下面解密在 dispatch_sync block 里赋值，必须 __block，否则编译失败
+            UIImage *img = nil;
             if (data) { @autoreleasepool { img = [UIImage imageWithData:data]; } }
-            // v2.9.52：这里原来是无条件在后台队列里直接调解密 —— 两个问题：
-            // ① 乔安服务器（1345）的图本来就能直接解，却也会进这段，没必要；
-            // ② 官方 JADecryptionTool 是 App 内部工具，会碰全局设备/会话状态，而格子页
-            //    同时下 6 张图 → 6 次解密在后台并发执行，把全局设备上下文改乱，
-            //    回放页正靠它绑设备，于是 1345 也被带歪。
-            // 现在：只对华为云 OBS 的加密图解密，并且串行回主队列执行，一次一张，不并发。
-            if (!img && data.length && JAIsEncryptedCoverURL(url)) {
-                // v2.9.53：当前若已在主线程就直接调，不能再 dispatch_sync 到主队列（会死锁）。
-                if ([NSThread isMainThread]) {
-                    @autoreleasepool {
-                        img = JADecryptImageDataWithCamera(data, url, self.cam);
-                    }
-                } else {
-                    dispatch_sync(dispatch_get_main_queue(), ^{
-                        @autoreleasepool {
-                            img = JADecryptImageDataWithCamera(data, url, self.cam);
-                        }
-                    });
-                }
-            }
             if (!img) {
                 // v2.9.23：记 HTTP 状态码（403/404）
                 if ([resp isKindOfClass:NSHTTPURLResponse.class]) {
@@ -2445,8 +2366,6 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     // v2.9.20：先藏掉官方播放器残留的「回放倍数选择」浮层，它正好压在日期抬头上面，
     // 而且带模态遮罩，会把返回按钮也一起挡掉。
     g_jaGridHostView = self.view;
-    // v2.9.34：把当前设备交给图片缓存 —— 加密抓拍图要用它的 uid + 查看密码来解。
-    [JAGridImageCache shared].cam = self.myCamera;
     JAGridToggleSpeedPanel(YES);
 }
 
