@@ -570,6 +570,8 @@ static long long JADayStartSec(NSNumber *ts) {
 
 // 前置声明（实现位于下方 hook 区，JATryOpenSDReplay 需提前引用）
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
+// v4.15：点一次格子后自动跑整套实验（试各种拉列表入参），不再需要人反复点
+static void JAExpStart(id vc, id cam, long long day);
 static void ja_rtc_viewDidAppear(id self, SEL _cmd);
 static void ja_rtc_viewDidDisappear(id self, SEL _cmd);
 static void JATimeLineSyncToSec(id sdVC, long long sec);
@@ -786,6 +788,7 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
     // 时间轴/日历/SD 卡检测/播放控制；用户手动进本地回放看到的就是它）。
     Class cls = NSClassFromString(@"JANewRtcSDPlayViewController");
     if (!cls) return nil;
+    long long d0 = 0;
     // RTC hooks 补装（类晚加载/轮询错过场景兜底）
     if (!g_rtcHooked) {
         JAHookRtcExtras(cls);
@@ -808,7 +811,7 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
         if (warn) JASet(vc, @"currentEvent", warn);
         NSNumber *ts = warn ? JABuildTimestamp(warn) : nil;
         // v3.0：目标秒和格子页同一来源 —— 服务器段秒优先（v1.32 那条能用的链）。
-        long long d0 = forceSec > 0 ? JADayStartSec(@(forceSec)) : JAGridDayFromMessage(warn);
+        d0 = forceSec > 0 ? JADayStartSec(@(forceSec)) : JAGridDayFromMessage(warn);
         if (d0 <= 0) d0 = JADayStartSec(ts);
         long long fixed = forceSec > 0 ? forceSec : JASegSec(warn);
         if (fixed > 0) {
@@ -878,6 +881,8 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
         g_rtcOfficialMode = YES;
         [nav pushViewController:vc animated:YES];
         JADiagAttach(vc, g_rtcTargetSec, cam, nil);
+        // v4.15：点一次就把整套实验跑完，不再让人一轮轮点
+        JAExpStart(vc, cam, d0);
         // RTC 版是官方完整播放器，官方链自己建流 → 不做任何状态强制
     } else {
         [UIApplication.sharedApplication.keyWindow.rootViewController presentViewController:vc animated:YES completion:nil];
@@ -1004,6 +1009,98 @@ static void ja_load_record_day(id self, SEL _cmd, long long d) {
     g_lastLoadDay = d;
     JALog(@"loadRecordListWithSelectiontDay %lld arrBefore=%@", d, JASDArrDesc(self));
     if (g_orig_load_day) ((void (*)(id, SEL, long long))g_orig_load_day)(self, _cmd, d);
+}
+
+// ===== v4.15 自动实验：一次点击跑完所有候选拉列表入参 =====
+// 目的：不再让人一轮轮点。每步调用一个候选入口，3 秒后读取录像段条数并打印。
+static id g_expVC = nil;
+static id g_expCam = nil;
+static long long g_expDay = 0;
+static int g_expStep = 0;
+
+static void JACallSelLong(id obj, NSString *selName, long long v) {
+    SEL s = NSSelectorFromString(selName);
+    if (obj && [obj respondsToSelector:s]) {
+        @try {
+            ((void (*)(id, SEL, long long))objc_msgSend)(obj, s, v);
+        } @catch (NSException *e) {}
+    }
+}
+
+static void JACallSelLongStr(id obj, NSString *selName, long long v, id str) {
+    SEL s = NSSelectorFromString(selName);
+    if (obj && [obj respondsToSelector:s]) {
+        @try {
+            ((void (*)(id, SEL, long long, id))objc_msgSend)(obj, s, v, str);
+        } @catch (NSException *e) {}
+    }
+}
+
+static void JAExpRunStep(void);
+
+static void JAExpNext(void) {
+    if (!g_expVC) return;
+    JALog(@"EXP[%d] arr=%@ tmax=%.0f", g_expStep, JASDArrDesc(g_expVC),
+          [JAVal(g_expVC, @"todayMaxTimestamp") doubleValue]);
+    g_expStep++;
+    JAExpRunStep();
+}
+
+static void JAExpRunStep(void) {
+    id vc = g_expVC;
+    if (!vc || g_expStep > 5) {
+        JALog(@"EXP ALL DONE");
+        return;
+    }
+    @try {
+        switch (g_expStep) {
+            case 0:
+                JALog(@"EXP[0] baseline");
+                break;
+            case 1:
+                JALog(@"EXP[1] loadRecordListWithType:0");
+                JACallSelLong(vc, @"loadRecordListWithType:", 0LL);
+                break;
+            case 2:
+                JALog(@"EXP[2] loadRecordListWithType:1");
+                JACallSelLong(vc, @"loadRecordListWithType:", 1LL);
+                break;
+            case 3:
+                JALog(@"EXP[3] loadRecordListWithType:2");
+                JACallSelLong(vc, @"loadRecordListWithType:", 2LL);
+                break;
+            case 4:
+                JALog(@"EXP[4] loadRecordListWithType:3");
+                JACallSelLong(vc, @"loadRecordListWithType:", 3LL);
+                break;
+            case 5:
+                JALog(@"EXP[5] switchToSDDay day=%lld", g_expDay);
+                JACallSelLongStr(vc, @"switchToSDDay:dateString:", g_expDay, @"");
+                break;
+            default:
+                break;
+        }
+    } @catch (NSException *e) {
+        JALog(@"EXP[%d] threw %@", g_expStep, e.name);
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        JAExpNext();
+    });
+}
+
+static void JAExpStart(id vc, id cam, long long day) {
+    if (g_expVC) return;          // 只跑一次，避免官方链重复触发
+    if (!vc) return;
+    g_expVC = vc;
+    g_expCam = cam;
+    g_expDay = day;
+    g_expStep = 0;
+    JALog(@"EXP START day=%lld cam=%p", day, (__bridge void *)cam);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        JAExpRunStep();
+    });
 }
 
 static void JAHookRtcExtras(Class cls) {
