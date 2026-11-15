@@ -496,10 +496,13 @@ static NSNumber *JASecFromEID(id warn) {
 static NSNumber *JABuildTimestamp(id warn) {
     if (!warn) return nil;
     // ① event_file_url 文件名内嵌秒：xxx/2310111541-1792304458.jpg
+    // v3.0：放宽成只要求「前面是横杠」，不再强制后面紧跟 '.'。
+    // 原因：华为云那台的抓拍名是 ...-1794675460_enc.jpg（下划线结尾），
+    // 旧正则 -(\d{10})\. 匹配不上 → 掉到下一优先级 → 段秒就不准了。
     id url = JAVal(warn, @"event_file_url");
     if ([url isKindOfClass:NSString.class]) {
         NSString *u = (NSString *)url;
-        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"-(\\d{10})\\."
+        NSRegularExpression *re = [NSRegularExpression regularExpressionWithPattern:@"-(\\d{10})"
                                                                             options:0 error:nil];
         NSTextCheckingResult *m = [re firstMatchInString:u options:0
                                                    range:NSMakeRange(0, u.length)];
@@ -565,6 +568,9 @@ static void JATimeLineSyncToSec(id sdVC, long long sec);
 // 解析出来的比对，偏差大就以显示时间为准（第二台就是 eid 解析结果和显示时间对不上）。
 static long long JAGridDayFromMessage(id msg);
 static long long JAGridSecForMessage(id msg, long long day);
+// v3.0：定位用的「段秒」—— 一律取服务器写进 event_file_url 文件名里的那个 10 位秒
+//（就是那一段录像的真实起点，v1.32「查看录像」能精准定位全靠它）。解析不出来才退回双源校正。
+static long long JASegSec(id msg);
 static NSArray *JAGridFindEvents(id vc);
 static NSNumber *JAGridTimestamp(id ev);
 
@@ -626,11 +632,10 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     if (warn) {
         JASet(vc, @"currentEvent", warn);
         NSNumber *ts = JABuildTimestamp(warn);
-        // v2.9.9：这个秒如果和消息列表上显示的时间不一致，官方「查看录像」也会定错位
-        // （第二台的情况：定位了不播、又回到实时）。统一走双源校正。
+        // v3.0：目标秒和格子页同一来源 —— 服务器段秒优先（v1.32 那条能用的链）。
         long long d0 = JAGridDayFromMessage(warn);
         if (d0 <= 0) d0 = JADayStartSec(ts);
-        long long fixed = JAGridSecForMessage(warn, d0);
+        long long fixed = JASegSec(warn);
         if (fixed > 0) {
             JASet(vc, @"currentTimeStamp", @(fixed));
             g_rtcTargetSec = fixed;
@@ -724,42 +729,20 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-            // v2.5 定案：定位一律用报警秒原值（不用"最近一段"替换 —— 报警常落在
-            // 某段中间，替换会把画面挪到段起点）。v2.6 只保留"列表是否已回来"的判断：
-            // 列表为空时 2s 后补一次定位，避免该日事件网络拉取稍慢导致定位失败。
-            NSInteger evCount = JAGridValidEventCount(self);
+            // v3.0：按 v1.32 原样 —— 无条件定位，不做任何「事件列表到了没」的判断。
+            // （v2.9.36 曾在这里加 JAGridValidEventCount 门禁，它靠运行时去猜事件数组，
+            //   列表还没拉回来时恒为 0 → 定位被推迟甚至整段跳过，是"越改越乱"的来源之一。）
+            // 定位一律用报警秒原值（v2.5 定案：报警常落在某段中间，替换成段起点会把画面挪走）。
             SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
             if ([self respondsToSelector:s]) {
                 ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
             }
-            if (evCount > 0) {
-                // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到定位时间点
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                    JATimeLineSyncToSec(self, sec);
-                });
-            } else {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                    NSInteger c2 = JAGridValidEventCount(self);
-                    if (c2 > 0) {
-                        SEL s2 = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
-                        if ([self respondsToSelector:s2]) {
-                            ((void(*)(id, SEL, long long))objc_msgSend)(self, s2, sec);
-                        }
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                                     (int64_t)(1.5 * NSEC_PER_SEC)),
-                                       dispatch_get_main_queue(), ^{
-                            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                            JATimeLineSyncToSec(self, sec);
-                        });
-                    } else {
-                        JATimeLineSyncToSec(self, sec);
-                    }
-                });
-            }
+            // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到定位时间点
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                JATimeLineSyncToSec(self, sec);
+            });
         });
     });
 }
@@ -1378,10 +1361,27 @@ static long long JAGridSecForMessage(id msg, long long day) {
     return -1;
 }
 
-// 一条报警消息 → 格子 entry（sec 用 v2.9.9 的双源校正）
+// v3.0：定位用的「段秒」。优先级 = v1.32 那条能用的链：
+//   ① JABuildTimestamp 里 event_file_url 文件名内嵌的 10 位秒（服务器写的段起点，最可靠）
+//   ② 该函数其余兜底（eventTimeUTC / event_date+event_time）
+//   ③ 都拿不到才退回旧的「双源校正」（解析列表显示文字）
+// 这样格子页点进去的目标秒和「消息列表 → 查看录像」完全同一来源，不再出现
+// 「时间轴对、画面不对 / 定位不到、超时退回实时」。
+static long long JASegSec(id msg) {
+    if (!msg) return -1;
+    NSNumber *ts = JABuildTimestamp(msg);
+    if (ts) {
+        long long v = ts.longLongValue;
+        if (JASecSane(v)) return v;
+    }
+    long long day = JAGridDayFromMessage(msg);
+    return JAGridSecForMessage(msg, day);
+}
+
+// 一条报警消息 → 格子 entry（sec 用 v3.0：服务器段秒优先）
 static NSDictionary *JAGridEntryFromMessage(id msg, long long day) {
     if (!msg) return nil;
-    long long sec = JAGridSecForMessage(msg, day);
+    long long sec = JASegSec(msg);
     if (sec < day || sec >= day + 86400LL) return nil;     // 只收本天
     // v2.9.22：正好落在「当天 0 点整」的一律丢掉 —— 时间字段一个都解析不出来时，
     // JAGridSecForMessage 会兜底成当天 0 点，于是 0 点整多出一个「无封面 00:00:00」的假格子
