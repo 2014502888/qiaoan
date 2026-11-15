@@ -296,6 +296,14 @@
 //   改法：openPlayerAtIndex 里把 entry[@"ev"]（JAGridEntryFromMessage 一直在存的原始模型）
 //   通过 currentEvent 传给播放页，与消息链完全对齐。缓存命中的条目暂时没有 ev（缓存只存 sec/img），
 //   等网络数据回来覆盖后就有 —— 不影响正常流程。
+//   —— 实测 v2.9.40 这样仍然没颜色。仿 "查看录像" 的完整入口会设 JADevicePlatform ——> v2.9.41。
+// v2.9.41（问题不在播放页参数，在"进入前的全局设备上下文"）：JADevicePlatform（单例）持有
+//   myCamera / currentCamera / connectCamera / isSDPlayer，官方 SD 播放页就是拿这份上下文去建
+//   P2P 连接、再拉该日录像段（拉到了才有 sdRecordFileArr，时间轴才画出带颜色的段）。
+//   「消息列表 → 查看录像」进得去有颜色，是因为详情页（JABasicViewController 有 _myCamera）
+//   早把这台设备设进 JADevicePlatform 了；我们自己写的格子页是从没碰过它的 —— 官方进去
+//   连的是上一次的设备或空 → 拉不到段 → 时间轴整条空白。修法：格子页 push 之前，
+//   把 myCamera 通过 setCurrentCamera: / setMyCamera: 设进 JADevicePlatform.sharedInstance。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -3338,6 +3346,34 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     }
 
     id vc = [[rtc alloc] init];
+
+    // v2.9.41（换方向：问题不在播放页参数，在"进入前的全局设备上下文"）：
+    // 官方 SD 播放页是拿 JADevicePlatform.sharedInstance 里的设备上下文去建 P2P 连接、
+    // 再拉该日录像段的（该类有 setMyCamera: / setCurrentCamera: / connectCamera / setIsSDPlayer:）。
+    // 「消息列表 → 查看录像」之所以有时间轴颜色，是因为详情页早就把这台设备设进去了；
+    // 而我们自己写的格子页从头到尾没碰过它 —— 官方进去连的是上一次的设备或空，
+    // 拉不到段 → sdRecordFileArr 空 → 时间轴整条空白。这里 push 前补设一次。
+    Class dpc = NSClassFromString(@"JADevicePlatform");
+    if (dpc && self.myCamera) {
+        id shared = nil;
+        SEL si = NSSelectorFromString(@"sharedInstance");
+        if ([(id)dpc respondsToSelector:si]) {
+            @try {
+                shared = ((id(*)(id, SEL))objc_msgSend)((id)dpc, si);
+            } @catch (NSException *e) {}
+        }
+        if (shared) {
+            SEL sc = NSSelectorFromString(@"setCurrentCamera:");
+            if ([shared respondsToSelector:sc]) {
+                ((void(*)(id, SEL, id))objc_msgSend)(shared, sc, self.myCamera);
+            }
+            SEL sm = NSSelectorFromString(@"setMyCamera:");
+            if ([shared respondsToSelector:sm]) {
+                ((void(*)(id, SEL, id))objc_msgSend)(shared, sm, self.myCamera);
+            }
+        }
+    }
+
     @try { [vc setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
     // v2.9.40（时间轴整条没颜色的真凶）：和「消息列表 → 查看录像」对齐 —— 那条链路
     // 比格子多传了一样东西：currentEvent（原始报警模型）。官方 setupData 会读它来决定
