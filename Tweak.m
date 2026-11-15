@@ -743,7 +743,7 @@ static NSString *JADiagText(UIViewController *vc, id cam, long long sec, NSStrin
             (unsigned long)segN, sdMode, ceTxt, evN, (long)g_rtcVdlCount, g_lastLoadType, g_lastLoadDay,
             (unsigned long)pbType, isSD ? 1 : 0,
             cardState, startLive ? 1 : 0, statusChecked ? 1 : 0, lmTxt,
-            tmax, cts, day, sec, rel, (void *)cam, (void *)vcCam, src ? src : @"-", firstSeg];
+            tmax, cts, day, sec, rel, (__bridge void *)cam, (__bridge void *)vcCam, src ? src : @"-", firstSeg];
 }
 
 static void JADiagAttach(UIViewController *vc, long long sec, id cam, NSString *src) {
@@ -911,7 +911,7 @@ static IMP g_orig_switchday = NULL;
 static void ja_rtc_setupData(id self, SEL _cmd) {
     JALog(@"setupData> arr=%@ tmax=%.0f sdCard=%d myCam=%p",
           JASDArrDesc(self), [JAVal(self, @"todayMaxTimestamp") doubleValue],
-          (int)[JAVal(self, @"sdCardState") integerValue], (void *)JAVal(self, @"myCamera"));
+          (int)[JAVal(self, @"sdCardState") integerValue], (__bridge void *)JAVal(self, @"myCamera"));
     if (g_orig_setupData) ((void (*)(id, SEL))g_orig_setupData)(self, _cmd);
     JALog(@"setupData< arr=%@ tmax=%.0f", JASDArrDesc(self),
           [JAVal(self, @"todayMaxTimestamp") doubleValue]);
@@ -944,7 +944,7 @@ static void ja_rtc_switchday(id self, SEL _cmd, long long d, id ds) {
 
 static void ja_rtc_viewDidLoad(id self, SEL _cmd) {
     g_rtcVdlCount++;
-    JALog(@"viewDidLoad #%ld ctrl=%p", (long)g_rtcVdlCount, (void *)self);
+    JALog(@"viewDidLoad #%ld ctrl=%p", (long)g_rtcVdlCount, (__bridge void *)self);
     if (g_orig_rtc_vdl) ((void (*)(id, SEL))g_orig_rtc_vdl)(self, _cmd);
     JALog(@"viewDidLoad done arr=%@", JASDArrDesc(self));
 }
@@ -1294,7 +1294,7 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     long long sec = g_rtcTargetSec;
     if (sec < 1000000000LL) return;
     JALog(@"VDA self=%p officialMode=%d arr=%@ tmax=%.0f platSD=%d",
-          (void *)self, (int)g_rtcOfficialMode, JASDArrDesc(self),
+          (__bridge void *)self, (int)g_rtcOfficialMode, JASDArrDesc(self),
           [JAVal(self, @"todayMaxTimestamp") doubleValue],
           (int)[JAVal(JADevicePlatformShared(), @"isSDPlayer") integerValue]);
     // v1.20：世代去重 —— 官方可能多次触发 viewDidAppear，只保留最后一次生效
@@ -1570,7 +1570,7 @@ static id JAOpenViaOfficialDetailUnsafe(UIViewController *host, id warn, id cam,
 
     NSArray *before = [[nav viewControllers] copy];
     JALog(@"officialDetail dvc=%p devId=%@ pwd=%@ list=%lu idx=%@ respondsClick=%d navDepth=%lu",
-          (void *)dvc, JAVal(dvc, @"deviceId"),
+          (__bridge void *)dvc, JAVal(dvc, @"deviceId"),
           ([JAVal(dvc, @"devicePwd") length] ? @"有" : @"空"),
           (unsigned long)[JAVal(dvc, @"warnInfoListArr") count], JAVal(dvc, @"playIndex"),
           (int)[dvc respondsToSelector:NSSelectorFromString(@"clickCloudRecordAction:")],
@@ -1594,12 +1594,12 @@ static id JAOpenViaOfficialDetailUnsafe(UIViewController *host, id warn, id cam,
     // 官方这次 push 出来的就是 SD 回放页（它自己 new、自己拉段）
     id sdvc = nil;
     for (id v in [nav viewControllers]) {
-        JALog(@"officialDetail nav item %@ %p", NSStringFromClass([v class]), (void *)v);
+        JALog(@"officialDetail nav item %@ %p", NSStringFromClass([v class]), (__bridge void *)v);
         BOOL old = NO;
         for (id o in before) { if (o == v) { old = YES; break; } }
         if (!old) sdvc = v;
     }
-    JALog(@"officialDetail result sdvc=%p", (void *)sdvc);
+    JALog(@"officialDetail result sdvc=%p", (__bridge void *)sdvc);
     if (!sdvc) return nil;
     return sdvc;
 }
@@ -4044,11 +4044,11 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     g_rtcOfficialMode = NO;
     g_rtcOfficialPending = YES;
     JALog(@"GRID CLICK sec=%lld day=%lld cam=%p devId=%@ warns=%lu ev0=%@",
-          sec, JADayStartSec(@(sec)), (void *)self.myCamera,
+          sec, JADayStartSec(@(sec)), (__bridge void *)self.myCamera,
           JAGridDeviceId(self.myCamera), (unsigned long)[warns count],
           NSStringFromClass([ev0 class]));
     id vc = JATryOpenViaOfficialDetail(self, ev0, self.myCamera, sec, [warns copy]);
-    JALog(@"GRID official chain vc=%p %@", (void *)vc, vc ? NSStringFromClass([vc class]) : @"nil");
+    JALog(@"GRID official chain vc=%p %@", (__bridge void *)vc, vc ? NSStringFromClass([vc class]) : @"nil");
     if (!vc) {
         // 官方链没建起来 → 退回自造页，至少保证能进页面
         g_rtcOfficialPending = NO;
