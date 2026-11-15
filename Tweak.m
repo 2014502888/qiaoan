@@ -1348,6 +1348,44 @@ static id g_fakeNavHost = nil;
 static id g_fakeNav = nil;
 static IMP g_orig_detailNavImp = NULL;
 
+// v4.13.2：官方 click 不是同步 push —— 它要先查 SD 卡容量、连设备，成功了才把
+// SD 页推上来（异步）。所以当场遍历导航栈永远是空的（诊断 src=官方链nil 就是这么来的）。
+// 解决办法：给 UINavigationController 的 push 装一个捕获器，谁把 SD 播放页推上来就记下来，
+// 然后在一小段 runloop 里等它，拿到就是官方自己建的页。
+static __weak id g_capturedSDVC = nil;
+static BOOL g_captureSDPush = NO;
+static IMP g_orig_nav_push = NULL;
+static BOOL g_navPushHooked = NO;
+
+static BOOL JAIsSDPlayClass(id obj) {
+    if (!obj) return NO;
+    NSString *n = NSStringFromClass([obj class]);
+    if (!n) return NO;
+    return ([n rangeOfString:@"SDPlay"].location != NSNotFound ||
+            [n rangeOfString:@"SDPlayer"].location != NSNotFound);
+}
+
+static void ja_nav_pushViewController(id self, SEL _cmd, UIViewController *vc, BOOL animated) {
+    if (g_captureSDPush && JAIsSDPlayClass(vc)) {
+        g_capturedSDVC = vc;
+        g_captureSDPush = NO;
+    }
+    if (g_orig_nav_push) {
+        ((void (*)(id, SEL, id, BOOL))g_orig_nav_push)(self, _cmd, vc, animated);
+    }
+}
+
+static void JAHookNavPush(void) {
+    if (g_navPushHooked) return;
+    Class cls = [UINavigationController class];
+    SEL sel = @selector(pushViewController:animated:);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return;
+    g_orig_nav_push = method_getImplementation(m);
+    method_setImplementation(m, (IMP)ja_nav_pushViewController);
+    g_navPushHooked = YES;
+}
+
 // v4.12.1：让"借用"的那个详情页返回我们要的导航栈，但它自己**不进栈** ——
 // 这样它的 viewDidLoad 永远不会跑（那里面要建整套 UI，还要按 pythonIndex 找
 // "上一条/下一条"，冷启动数据不齐就数组越界，v4.12.0 点格子闪退就是崩在这里）。
@@ -1390,6 +1428,9 @@ static id JAOpenViaOfficialDetailUnsafe(UIViewController *host, id warn, id cam,
     UINavigationController *nav = [host navigationController];
     if (!nav) return nil;
     JAPatchDetailNavigation(cls);
+    // 先把平台状态喂好（myCamera/currentCamera/isSDPlayer/connectCamera）。
+    // 缺这一步官方 click 拿不到摄像头，连 SD 都不查（诊断里 platSD=0 就是这个）。
+    if (cam) JAPrepareSDPlatform(cam);
 
     id dvc = nil;
     @try { dvc = [[cls alloc] init]; } @catch (NSException *e) { return nil; }
@@ -1426,8 +1467,6 @@ static id JAOpenViaOfficialDetailUnsafe(UIViewController *host, id warn, id cam,
             ((void(*)(id, SEL, id))objc_msgSend)(dvc, click, nil);
         }
     } @catch (NSException *e) {}
-    g_fakeNavHost = nil;
-    g_fakeNav = nil;
 
     // 官方这次 push 出来的就是 SD 回放页（它自己 new、自己拉段）
     id sdvc = nil;
@@ -1446,11 +1485,21 @@ static id JAOpenViaOfficialDetailUnsafe(UIViewController *host, id warn, id cam,
 static id JATryOpenViaOfficialDetail(UIViewController *host, id warn, id cam,
                                      long long sec, NSArray *warnList) {
     id sdvc = nil;
+    g_capturedSDVC = nil;
+    g_captureSDPush = YES;
     @try {
         sdvc = JAOpenViaOfficialDetailUnsafe(host, warn, cam, sec, warnList);
     } @catch (NSException *e) {
         sdvc = nil;
     }
+    // 官方是异步 push：给它一小段 runloop 把页推上来。捕获到就退出（g_captureSDPush 被清）。
+    NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1.6];
+    while (g_captureSDPush && [[NSDate date] compare:deadline] == NSOrderedAscending) {
+        [[NSRunLoop currentRunLoop] runMode:NSDefaultRunLoopMode
+                                 beforeDate:[NSDate dateWithTimeIntervalSinceNow:0.05]];
+    }
+    g_captureSDPush = NO;
+    if (!sdvc) sdvc = g_capturedSDVC;
     g_fakeNavHost = nil;
     g_fakeNav = nil;
     return sdvc;
@@ -4649,6 +4698,8 @@ static void JAHook(void) {
         Class rtcCls = NSClassFromString(@"JANewRtcSDPlayViewController");
         if (rtcCls) {
             JAHookRtcExtras(rtcCls);
+            // v4.13.2：捕获官方异步 push 上来的 SD 播放页（它先查容量再推页）
+            JAHookNavPush();
             // v4.2：JALiveManager 的「回放态」开关 hook（学三屏 SD 模式真值）
             JAHookLiveManager(NSClassFromString(@"JALiveManager"));
             // v2.0：入口 —— 给官方回放页加「格子」按钮（viewWillAppear 可能继承自
