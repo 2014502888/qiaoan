@@ -570,6 +570,8 @@ static long long JADayStartSec(NSNumber *ts) {
 
 // 前置声明（实现位于下方 hook 区，JATryOpenSDReplay 需提前引用）
 static void JASetImp(Class cls, SEL sel, IMP newImp, IMP *saved);
+// v4.15：点一次格子后自动跑整套实验（试各种拉列表入参），不再需要人反复点
+static void JAExpStart(id vc, id cam, long long day);
 static void ja_rtc_viewDidAppear(id self, SEL _cmd);
 static void ja_rtc_viewDidDisappear(id self, SEL _cmd);
 static void JATimeLineSyncToSec(id sdVC, long long sec);
@@ -846,10 +848,6 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
             long long before = [JAVal(cam, @"sdTodayTimeStamp") longLongValue];
             JALog(@"cam sdTodayTimeStamp=%lld sdSelectionDayNotAdjust=%lld",
                   before, [JAVal(cam, @"sdSelectionDayNotAdjust") longLongValue]);
-            // v4.16.1：实测定案 —— 这个字段必须给"次日 0 点"（这一整天的结束边界）。
-            //   camToday=1794758400 → setupData tmax=1794844800 → 拉到 359 条（有颜色）
-            //   camToday=1794672000 → setupData tmax=1794758400 → 只回 21 条（时间轴空）
-            // v4.16.0 曾误改成"当天 0 点"，段数就掉回 21，这里恢复。
             long long want = d0 + 86400LL;
             BOOL ok = NO;
             if ([cam respondsToSelector:@selector(setSdTodayTimeStamp:)]) {
@@ -861,34 +859,6 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
             if (!ok) JASet(cam, @"sdTodayTimeStamp", @(want));
             JALog(@"set sdTodayTimeStamp want=%lld wrote=%d readback=%lld",
                   want, (int)ok, [JAVal(cam, @"sdTodayTimeStamp") longLongValue]);
-            // v4.17.1：真正决定段数的是这个字段。对照两次实测：
-            //   sdSelectionDayNotAdjust=1794672000 → 拉到 359 条（时间轴有颜色）
-            //   sdSelectionDayNotAdjust=0          → 只回 22 条（时间轴空、画面回实时）
-            // 今天一直只盯着 sdTodayTimeStamp，把它漏了。
-            BOOL ok2 = NO;
-            if ([cam respondsToSelector:@selector(setSdSelectionDayNotAdjust:)]) {
-                @try {
-                    ((void (*)(id, SEL, long long))objc_msgSend)(cam, @selector(setSdSelectionDayNotAdjust:), d0);
-                    ok2 = YES;
-                } @catch (NSException *e) {}
-            }
-            if (!ok2) JASet(cam, @"sdSelectionDayNotAdjust", @(d0));
-            JALog(@"set sdSelectionDayNotAdjust want=%lld wrote=%d readback=%lld",
-                  d0, (int)ok2, [JAVal(cam, @"sdSelectionDayNotAdjust") longLongValue]);
-            // v4.18.1：遗漏的那个开关。v4.18.0 的两次全量读数对比：
-            //   第1次 newReplay=0 → setupData 只拉回 22 条
-            //   第2次 newReplay=1 → 立刻 360 条（387 条那次的 vm 也是同一页）
-            // 之前所有版本都在调日期/tmax，从没设过它。不设就永远停在"事件列表"而不是"全天录像段"。
-            BOOL ok3 = NO;
-            if ([cam respondsToSelector:@selector(setIsNewReplay:)]) {
-                @try {
-                    ((void (*)(id, SEL, BOOL))objc_msgSend)(cam, @selector(setIsNewReplay:), YES);
-                    ok3 = YES;
-                } @catch (NSException *e) {}
-            }
-            if (!ok3) JASet(cam, @"isNewReplay", @YES);
-            JALog(@"set isNewReplay wrote=%d readback=%lld",
-                  (int)ok3, [JAVal(cam, @"isNewReplay") longLongValue]);
         }
         // v4.10：时间轴拉取上限。v4.9 把这段去掉了，结果官方一段都没拉到（段=0）——
         // 说明它必须给，且要给到"当天最后一秒"，否则官方只拉到进入那一刻。
@@ -911,6 +881,8 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
         g_rtcOfficialMode = YES;
         [nav pushViewController:vc animated:YES];
         JADiagAttach(vc, g_rtcTargetSec, cam, nil);
+        // v4.15 的自动实验块会把已拉好的列表冲成空，回退时去掉
+        // JAExpStart(vc, cam, d0);
         // RTC 版是官方完整播放器，官方链自己建流 → 不做任何状态强制
     } else {
         [UIApplication.sharedApplication.keyWindow.rootViewController presentViewController:vc animated:YES completion:nil];
@@ -978,88 +950,21 @@ static IMP g_orig_respSaved = NULL;
 static IMP g_orig_maxts = NULL;
 static IMP g_orig_switchday = NULL;
 
-// ===== v4.18 全量读数（只读，不改任何状态）=====
-// 目的：把相机 / 页面 / viewModel / 平台上的相关字段一次全打出来，官方页和格子页两条链
-// 各来一份，直接逐字段对比，找出到底哪一个不一样 —— 而不是再一版试一个字段。
-
-// 相机上所有 SD 相关数字字段
-static NSString *JADescCam(id cam) {
-    if (!cam) return @"cam=nil";
-    id evl = JAVal(cam, @"eventList");
-    unsigned long evn = [evl isKindOfClass:[NSArray class]] ? (unsigned long)[evl count] : 0UL;
-    return [NSString stringWithFormat:
-            @"cardStat=%lld day=%lld notAdj=%lld today=%lld supSD=%lld newReplay=%lld evList=%lu uid=%@",
-            [JAVal(cam, @"sdCardStatus") longLongValue],
-            [JAVal(cam, @"sdSelectiontDay") longLongValue],
-            [JAVal(cam, @"sdSelectionDayNotAdjust") longLongValue],
-            [JAVal(cam, @"sdTodayTimeStamp") longLongValue],
-            [JAVal(cam, @"isSupportSDReplay") longLongValue],
-            [JAVal(cam, @"isNewReplay") longLongValue],
-            evn,
-            JAVal(cam, @"uid") ?: @"-"];
-}
-
-// 页面自身字段
-static NSString *JADescVC(id vc) {
-    if (!vc) return @"vc=nil";
-    return [NSString stringWithFormat:
-            @"tmax=%.0f sdCardState=%lld cts=%.0f ce=%@ vm=%p arr=%@ timeLine=%p",
-            [JAVal(vc, @"todayMaxTimestamp") doubleValue],
-            [JAVal(vc, @"sdCardState") longLongValue],
-            [JAVal(vc, @"currentTimeStamp") doubleValue],
-            NSStringFromClass([JAVal(vc, @"currentEvent") class]) ?: @"-",
-            (__bridge void *)JAVal(vc, @"viewModel"),
-            JASDArrDesc(vc),
-            (__bridge void *)JAVal(vc, @"timeLineView")];
-}
-
-// viewModel 上的所有标量 ivar（直接按 ivar 名读，绕过不知道属性名的问题）
-static NSString *JADescVM(id vm) {
-    if (!vm) return @"vm=nil";
-    NSMutableString *ms = [NSMutableString stringWithCapacity:256];
-    unsigned int n = 0;
-    Ivar *ivs = class_copyIvarList(object_getClass(vm), &n);
-    for (unsigned int i = 0; i < n && i < 40; i++) {
-        const char *tn = ivar_getTypeEncoding(ivs[i]);
-        const char *nm = ivar_getName(ivs[i]);
-        if (!tn || !nm) continue;
-        char c = tn[0];
-        if (c != 'q' && c != 'Q' && c != 'i' && c != 'd' && c != 'f' && c != 'B' && c != 'c' && c != 's') continue;
-        NSString *key = [NSString stringWithUTF8String:nm];
-        if (![key hasPrefix:@"_"]) continue;
-        key = [key substringFromIndex:1];
-        id v = JAVal(vm, key);
-        if (v) [ms appendFormat:@"%@=%@ ", key, v];
-    }
-    if (ivs) free(ivs);
-    return ms.length ? ms : @"vm(no scalar)";
-}
-
-// 平台
-static NSString *JADescPlat(void) {
-    id p = JADevicePlatformShared();
-    if (!p) return @"plat=nil";
-    return [NSString stringWithFormat:@"pb=%lld isSD=%lld cam=%p ccur=%p",
-            [JAVal(p, @"playBackActionType") longLongValue],
-            [JAVal(p, @"isSDPlayer") longLongValue],
-            (__bridge void *)JAVal(p, @"myCamera"),
-            (__bridge void *)JAVal(p, @"currentCamera")];
-}
-
 // 官方页的核心装载入口：前后各看一次数组，就能知道到底是谁填的
 static void ja_rtc_setupData(id self, SEL _cmd) {
     id mc = JAVal(self, @"myCamera");
-    JALog(@"==== SD-DUMP-BEFORE ====");
-    JALog(@"VC  %@", JADescVC(self));
-    JALog(@"CAM %@", JADescCam(mc));
-    JALog(@"VM  %@", JADescVM(JAVal(self, @"viewModel")));
-    JALog(@"PLT %@", JADescPlat());
+    JALog(@"setupData> arr=%@ tmax=%.0f sdCard=%d myCam=%p camDay=%lld camToday=%lld cts=%.0f ce=%@",
+          JASDArrDesc(self), [JAVal(self, @"todayMaxTimestamp") doubleValue],
+          (int)[JAVal(self, @"sdCardState") integerValue], (__bridge void *)mc,
+          [JAVal(mc, @"sdSelectiontDay") longLongValue],
+          [JAVal(mc, @"sdTodayTimeStamp") longLongValue],
+          [JAVal(self, @"currentTimeStamp") doubleValue],
+          NSStringFromClass([JAVal(self, @"currentEvent") class]));
     if (g_orig_setupData) ((void (*)(id, SEL))g_orig_setupData)(self, _cmd);
-    JALog(@"==== SD-DUMP-AFTER ====");
-    JALog(@"VC  %@", JADescVC(self));
-    JALog(@"CAM %@", JADescCam(mc));
-    JALog(@"VM  %@", JADescVM(JAVal(self, @"viewModel")));
-    JALog(@"PLT %@", JADescPlat());
+    JALog(@"setupData< arr=%@ tmax=%.0f camDay=%lld camToday=%lld", JASDArrDesc(self),
+          [JAVal(self, @"todayMaxTimestamp") doubleValue],
+          [JAVal(mc, @"sdSelectiontDay") longLongValue],
+          [JAVal(mc, @"sdTodayTimeStamp") longLongValue]);
 }
 
 static void ja_rtc_redmark(id self, SEL _cmd) {
@@ -1104,6 +1009,98 @@ static void ja_load_record_day(id self, SEL _cmd, long long d) {
     g_lastLoadDay = d;
     JALog(@"loadRecordListWithSelectiontDay %lld arrBefore=%@", d, JASDArrDesc(self));
     if (g_orig_load_day) ((void (*)(id, SEL, long long))g_orig_load_day)(self, _cmd, d);
+}
+
+// ===== v4.15 自动实验：一次点击跑完所有候选拉列表入参 =====
+// 目的：不再让人一轮轮点。每步调用一个候选入口，3 秒后读取录像段条数并打印。
+static id g_expVC = nil;
+static id g_expCam = nil;
+static long long g_expDay = 0;
+static int g_expStep = 0;
+
+static void JACallSelLong(id obj, NSString *selName, long long v) {
+    SEL s = NSSelectorFromString(selName);
+    if (obj && [obj respondsToSelector:s]) {
+        @try {
+            ((void (*)(id, SEL, long long))objc_msgSend)(obj, s, v);
+        } @catch (NSException *e) {}
+    }
+}
+
+static void JACallSelLongStr(id obj, NSString *selName, long long v, id str) {
+    SEL s = NSSelectorFromString(selName);
+    if (obj && [obj respondsToSelector:s]) {
+        @try {
+            ((void (*)(id, SEL, long long, id))objc_msgSend)(obj, s, v, str);
+        } @catch (NSException *e) {}
+    }
+}
+
+static void JAExpRunStep(void);
+
+static void JAExpNext(void) {
+    if (!g_expVC) return;
+    JALog(@"EXP[%d] arr=%@ tmax=%.0f", g_expStep, JASDArrDesc(g_expVC),
+          [JAVal(g_expVC, @"todayMaxTimestamp") doubleValue]);
+    g_expStep++;
+    JAExpRunStep();
+}
+
+static void JAExpRunStep(void) {
+    id vc = g_expVC;
+    if (!vc || g_expStep > 5) {
+        JALog(@"EXP ALL DONE");
+        return;
+    }
+    @try {
+        switch (g_expStep) {
+            case 0:
+                JALog(@"EXP[0] baseline");
+                break;
+            case 1:
+                JALog(@"EXP[1] loadRecordListWithType:0");
+                JACallSelLong(vc, @"loadRecordListWithType:", 0LL);
+                break;
+            case 2:
+                JALog(@"EXP[2] loadRecordListWithType:1");
+                JACallSelLong(vc, @"loadRecordListWithType:", 1LL);
+                break;
+            case 3:
+                JALog(@"EXP[3] loadRecordListWithType:2");
+                JACallSelLong(vc, @"loadRecordListWithType:", 2LL);
+                break;
+            case 4:
+                JALog(@"EXP[4] loadRecordListWithType:3");
+                JACallSelLong(vc, @"loadRecordListWithType:", 3LL);
+                break;
+            case 5:
+                JALog(@"EXP[5] switchToSDDay day=%lld", g_expDay);
+                JACallSelLongStr(vc, @"switchToSDDay:dateString:", g_expDay, @"");
+                break;
+            default:
+                break;
+        }
+    } @catch (NSException *e) {
+        JALog(@"EXP[%d] threw %@", g_expStep, e.name);
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        JAExpNext();
+    });
+}
+
+static void JAExpStart(id vc, id cam, long long day) {
+    if (g_expVC) return;          // 只跑一次，避免官方链重复触发
+    if (!vc) return;
+    g_expVC = vc;
+    g_expCam = cam;
+    g_expDay = day;
+    g_expStep = 0;
+    JALog(@"EXP START day=%lld cam=%p", day, (__bridge void *)cam);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        JAExpRunStep();
+    });
 }
 
 static void JAHookRtcExtras(Class cls) {
@@ -1448,84 +1445,23 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     // 绝不能再 stopSDPlay / switchToSDDay / 重拉段：那套是给"自造页救段"用的，
     // 在官方页上做会把刚拉好的 269 段直接冲成十几条。
     if (g_rtcOfficialMode) {
-        // v4.16：起播必须等录像段真的到位。实测（v4.15.0 日志）页面 20:28:01 就 didAppear，
-        // 而 359 条段是 20:28:03 才由网络异步回来的。旧的"固定 1.2s 就起播"是在空列表上起播，
-        // 播放器于是停在实时位置 —— 界面表现就是"当前时间无录像"（时间轴能拖、颜色也有）。
-        // 这里改成轮询：列表非空（或超时 8s）才起播，起播后连拨两次时间轴。
-        __block void (^poll)(void);
-        __block int tries = 0;
-        poll = ^ {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-            tries++;
-            id arrObj = JAVal(self, @"sdRecordFileArr");
-            int n = [arrObj isKindOfClass:[NSArray class]] ? (int)[arrObj count] : -1;
-            // v4.19：实测三次连点 —— 同进程第 1 次只回 22 条，第 2/3 次回 360/367 条。
-            // 原因是第 1 次请求发出时设备连接还没真正打通，拿到的是残缺列表；后台连接
-            // 通了以后第二次进页面才正常。这里改成页面内自动重拉，不再靠人点第二次。
-            if (n > 0 && n < 150 && tries <= 6) {
-                id vm = JAVal(self, @"viewModel");
-                JALog(@"VDA re-setup arr=%d tries=%d sess=%lld", n, tries,
-                      [JAVal(vm, @"isSessionConnected") longLongValue]);
-                SEL sd = NSSelectorFromString(@"setupData");
-                if ([self respondsToSelector:sd]) {
-                    @try {
-                        ((void (*)(id, SEL))objc_msgSend)(self, sd);
-                    } @catch (NSException *e) {
-                        JALog(@"VDA re-setup threw %@", e.name);
-                    }
-                }
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    poll();
-                });
-                return;
-            }
-            if (n <= 0 && tries <= 16) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    poll();
-                });
-                return;
-            }
+            // v4.13.7：回归"只定位、绝不碰列表"。v4.13.6 那记 switchToSDDay 兜底把
+            // setupData 已经拉好的段清成了 0（段=0 首段=- 就是这么来的），这里全部撤掉。
+            // 官方页 tmax 实测是 日+86400（1794672000 → 1794758400）。
             long long d0x = JADayStartSec(@(sec));
             JASet(self, @"todayMaxTimestamp", @((double)(d0x + 86400LL)));
-            JASet(self, @"currentTimeStamp", @((double)sec));
-            // v4.17：起播前必须停掉 viewDidLoad 自动起的那路实时流。v1.21 的注释就写着
-            // "先停官方自动起的流（避免双流并存交替渲染），再建定位流"，但 v4.12 之后的
-            // 官方模式分支把这一步漏了 —— 表现为时间轴有颜色、能拖，画面却一直是实时。
-            SEL stp = NSSelectorFromString(@"stopSDPlay");
-            if ([self respondsToSelector:stp]) {
-                ((void (*)(id, SEL))objc_msgSend)(self, stp);
+            SEL sp = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
+            if ([self respondsToSelector:sp]) {
+                ((void (*)(id, SEL, long long))objc_msgSend)(self, sp, sec);
             }
-            // v4.17：起播入参改为"当天内的相对秒"。之前直接传绝对秒（1794741940），
-            // 若该接口按 0~86400 解释，就会落到范围外 → 判成"该时间点无录像"→ 回切实时。
-            long long rel = sec - d0x;
-            if (rel < 0) rel = 0;
-            if (rel > 86399) rel = 86399;
-            JALog(@"VDA start rel=%lld (sec=%lld day=%lld) tries=%d arr=%d", rel, sec, d0x, tries, n);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                SEL sp = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
-                if ([self respondsToSelector:sp]) {
-                    ((void (*)(id, SEL, long long))objc_msgSend)(self, sp, rel);
-                }
-                JALog(@"VDA start sent");
-            });
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
                 JATimeLineSyncToSec(self, sec);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                    JATimeLineSyncToSec(self, sec);
-                });
             });
-        };
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            poll();
         });
         return;
     }
