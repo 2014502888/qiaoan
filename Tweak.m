@@ -819,12 +819,14 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-        // v1.21：先停官方 viewDidLoad 自动起的流（避免双流并存交替渲染），再建定位流。
-        // 每次进入都"停旧→建新"，绕开复用流上 seekSDPlay 前置闸门导致的"第二次起偶发不生效"。
-        SEL st = NSSelectorFromString(@"stopSDPlay");
-        if ([self respondsToSelector:st]) {
-            ((void(*)(id, SEL))objc_msgSend)(self, st);
-        }
+        // v2.9.50：这里原来第一句是 stopSDPlay（v1.21 为"先停旧流再建新流"加的）。
+        // 现场证据表明它才是"一直停在实时、回不到选中时间点"的元凶：
+        //   - 官方 viewDidLoad/viewDidAppear 自己已经按 SD 模式启动了一次播放；
+        //   - 我们 3.0s 又 stop 一次 → 设备侧退回实时流、viewModel 的 startSDPlayFlag 状态被留在"已停"；
+        //   - 再 2.5s 调 startSDPlayWithSelectTimeStamp:，状态机已不认，流就一直是实时的。
+        // v1.21 当年加它是因为"第二次起偶发不生效"，但代价是把状态机打断 —— 现在整条链都建立在
+        // "停旧→建新"上，只要 stop 之后 start 没被接受，整页就再也回不到目标秒。
+        // 改成照官方：不 stop，只切天 + 定位，让官方自己那一次启动继续跑。
         // v2.9.39（时间轴整条读不到录像段的根因）：官方播放页有自己的「当前选中日」字段
         // _currentSelectedSDDay，该日的录像段列表存在 _sdRecordFileArr 里，时间轴上那些
         // 带颜色的段完全由这个列表画出来。我们以前只设了 myCamera.sdSelectiontDay（那是
