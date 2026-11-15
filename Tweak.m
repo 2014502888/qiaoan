@@ -875,6 +875,20 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
             if (!ok2) JASet(cam, @"sdSelectionDayNotAdjust", @(d0));
             JALog(@"set sdSelectionDayNotAdjust want=%lld wrote=%d readback=%lld",
                   d0, (int)ok2, [JAVal(cam, @"sdSelectionDayNotAdjust") longLongValue]);
+            // v4.18.1：遗漏的那个开关。v4.18.0 的两次全量读数对比：
+            //   第1次 newReplay=0 → setupData 只拉回 22 条
+            //   第2次 newReplay=1 → 立刻 360 条（387 条那次的 vm 也是同一页）
+            // 之前所有版本都在调日期/tmax，从没设过它。不设就永远停在"事件列表"而不是"全天录像段"。
+            BOOL ok3 = NO;
+            if ([cam respondsToSelector:@selector(setIsNewReplay:)]) {
+                @try {
+                    ((void (*)(id, SEL, BOOL))objc_msgSend)(cam, @selector(setIsNewReplay:), YES);
+                    ok3 = YES;
+                } @catch (NSException *e) {}
+            }
+            if (!ok3) JASet(cam, @"isNewReplay", @YES);
+            JALog(@"set isNewReplay wrote=%d readback=%lld",
+                  (int)ok3, [JAVal(cam, @"isNewReplay") longLongValue]);
         }
         // v4.10：时间轴拉取上限。v4.9 把这段去掉了，结果官方一段都没拉到（段=0）——
         // 说明它必须给，且要给到"当天最后一秒"，否则官方只拉到进入那一刻。
