@@ -266,8 +266,19 @@
 //     点击重新播放」→ 自动退回实时监控。用户看到的就是「点了不播，还自己跳回实时」。
 //   改法：先看该日录像段数（JAGridValidEventCount），**有录像才定位**；为空则等两轮复检
 //     （2s、再 3s），回来就定位，确实没有就弹「没有本地录像」并退回格子页。
-//   第 1 台：时间轴有颜色（有录像），只是**偶发**拉流超时 —— 这是设备上行/P2P 抖动，
-//     定位参数本身没问题（报警秒原值 + 双源校正），重试属于官方播放器内部行为，不硬干预。
+//   第 1 台：时间轴有颜色（有录像），当时判成「偶发拉流超时」——**v2.9.37 实测推翻**，
+//     真正原因是我们 3.0s 的 stopSDPlay 把官方状态机打坏了（见下）。
+// v2.9.37（点格子不播的真正根因）：用户给出的时序是关键证据 ——
+//   进页面 → 实时画面 → 跳到另一个时间段 → 时间条移到正确时间 → **不播放** → 一会儿自己跳回实时。
+//   v1.32 的注释里其实早就记过这个坑：提前 stop 官方自动流会让 isEnterSDPlay 停在 NO，
+//   之后带时间戳的 start 会走「无时间戳分支」→ 播实时、把目标秒丢掉。我们一直用的正是
+//   「3.0s stopSDPlay → 切日 → 2.5s start」这条链，等于每次都先把状态机踩坏再叫它定位。
+//   用户自己的判断就是正解：**不要在实时状态下停它，等它稳住后直接从实时跳到目标时刻。**
+//   改法：① 去掉 stopSDPlay；② 0.5s 只做 switchToSDDay 切日报（不动流）；
+//   ③ 从 2s 起轮询，读官方自己的 isEnterSDPlay —— 为真就调 seekSDPlayWithSelectTimeStamp:
+//   （从实时 seek 到报警秒），为假就再等（2.5s×2 轮），最后才退回带时间戳的 start 兜底。
+//   seek 的 selector 已在原版二进制里确认存在（1 处），官方本来就是按 isEnterSDPlay
+//   在 start / seek 之间二选一的。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -731,113 +742,93 @@ static IMP g_orig_handleJumpToOpenCloud = NULL;
 // isSeekingPlay，0.4s 时官方未就绪 → 预检查失败 → 定位不执行 → 播最新）。
 // v1.18：时间轴指示器唯一更新入口 = JATimeLineView changeCurrentTimeStamp:
 //（0x1000ff834），播放定位后主动拨动。
-// v1.32：移除 v1.29 0.5s 预停 / v1.30 viewDidLoad 0.3s 预停 / v1.31 startPlay 拦截
-// —— 官方 viewDidLoad 自动播（上次位置→实时）与 isEnterSDPlay 状态机耦合，提前
-// stop 或吞 startPlay 会打断官方播放状态（isEnterSDPlay 停在 NO → 定位调用走
-// startSDPlay 无时间戳分支 → 画面实时、忽略报警时间戳）。回退到 v1.28 验收链路：
-// 3.0s stopSDPlay（停官方自动流）→ switchToSDDay 切报警日 → 2.5s 定位 → 1.5s 时间轴。
-// 官方自动流的短暂显示（读取进度/实时）是官方 viewDidLoad 固有行为，定位成功后
-// 画面即切到报警时间；三段"乱跳"观感保留，换取定位 100% 可靠。
+// v2.9.37（第 1 台「偶发不播」重新定案：上一版判成"网络抖动"是错的）：
+// 用户实测时序：进页面 → 实时画面 → 跳到另一个时间段 → 时间条移到正确时间 →
+// **不播放** → 一会儿自己跳回实时。这正是 v1.32 注释里记过的那个坑：
+// 我们 3.0s 就 stopSDPlay 掉官方自动流，官方状态机 isEnterSDPlay 掉回 NO，
+// 之后 startSDPlayWithSelectTimeStamp: 走「无时间戳分支」→ 播实时、目标秒被丢掉。
+// 用户给的正解：**别停它，等它在实时状态稳住，直接从实时 seek 到目标时刻。**
+// 官方本来就有 seekSDPlayWithSelectTimeStamp:（二进制确认存在），而且它自己就是
+// 按 isEnterSDPlay 在 start / seek 之间二选一的 —— 我们照着它的状态机来。
+static void JAGridSeekOrStart(id vc, long long sec, unsigned long long gen, NSInteger round) {
+    if (vc != g_activeSDPlayer || gen != g_rtcVdaGen) return;
+
+    // 该日录像段还没到位：网络慢（稍等再来）或这天压根没有录像（交给无录像提示链）
+    if (JAGridValidEventCount(vc) <= 0) {
+        if (round >= 2) { JAGridAlertNoLocalRecord(vc); return; }
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ JAGridSeekOrStart(vc, sec, gen, round + 1); });
+        return;
+    }
+
+    // 官方是否已经进入 SD 播放态（这是它自己 start / seek 二选一的依据）
+    BOOL entered = NO;
+    @try {
+        id v = [vc valueForKey:@"isEnterSDPlay"];
+        if ([v respondsToSelector:@selector(boolValue)]) entered = [v boolValue];
+    } @catch (NSException *e) {}
+
+    if (entered) {
+        SEL seek = NSSelectorFromString(@"seekSDPlayWithSelectTimeStamp:");
+        if ([vc respondsToSelector:seek]) {
+            ((void(*)(id, SEL, long long))objc_msgSend)(vc, seek, sec);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (vc != g_activeSDPlayer || gen != g_rtcVdaGen) return;
+                JATimeLineSyncToSec(vc, sec);
+            });
+            return;
+        }
+    }
+
+    // 还没进 SD 态：再等一轮（官方建流要时间，别急着动手）
+    if (round < 2) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ JAGridSeekOrStart(vc, sec, gen, round + 1); });
+        return;
+    }
+
+    // 兜底（少见）：官方始终没进 SD 态 → 退回带时间戳的 start
+    SEL st = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
+    if ([vc respondsToSelector:st]) {
+        ((void(*)(id, SEL, long long))objc_msgSend)(vc, st, sec);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (vc != g_activeSDPlayer || gen != g_rtcVdaGen) return;
+            JATimeLineSyncToSec(vc, sec);
+        });
+    }
+}
+
 static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     if (g_orig_rtc_vda) ((void(*)(id, SEL))g_orig_rtc_vda)(self, _cmd);
     if (self != g_activeSDPlayer) return;
     long long sec = g_rtcTargetSec;
     if (sec < 1000000000LL) return;
-    // v1.20：世代去重 —— 官方可能多次触发 viewDidAppear，只保留最后一次生效
+    // 世代去重：官方可能多次触发 viewDidAppear，只保留最后一次生效
     unsigned long long myGen = ++g_rtcVdaGen;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+    // 报警日 0 点 + 日期串 —— 跨天必须切，否则官方默认停在「今日」，时间轴/相对秒全算错
+    long long dayStart = JADayStartSec(@(sec));
+    if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"yyyy-MM-dd";
+    NSString *ds = [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:sec]];
+
+    // t=0.5s：只切日期，**不动流**（不再 stopSDPlay）。切完让官方自己去拉该日事件列表。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-        // v1.21：先停官方 viewDidLoad 自动起的流（避免双流并存交替渲染），再建定位流。
-        // 每次进入都"停旧→建新"，绕开复用流上 seekSDPlay 前置闸门（0x103429ee0 bit0）
-        // 导致的"第二次起偶发定位不生效/播最新"。
-        SEL st = NSSelectorFromString(@"stopSDPlay");
-        if ([self respondsToSelector:st]) {
-            ((void(*)(id, SEL))objc_msgSend)(self, st);
-        }
-        // v1.25 定案（v1.24 运行时枚举 + 反汇编 0x100afb2e8）：官方"选日期"正规入口 =
-        // switchToSDDay:dateString:（x2=报警日0点秒 long long，x3=日期字符串）。
-        // 内部：算时间范围 → 设选中日/日期串/时间区间 → 经 viewModel 转发触发
-        // 加载该日事件 + 刷新时间轴 + 顶部日期显示（跨天修正：官方默认选中"今日"，
-        // 过了 12 点打开昨天报警会卡 00:00、看不到昨天进度条）。
-        long long dayStart = JADayStartSec(@(sec));
-        if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
-        NSDateFormatter *df = [[NSDateFormatter alloc] init];
-        df.dateFormat = @"yyyy-MM-dd";
-        NSString *ds = [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:sec]];
         SEL sw = NSSelectorFromString(@"switchToSDDay:dateString:");
         if ([self respondsToSelector:sw]) {
             ((void(*)(id, SEL, long long, id))objc_msgSend)(self, sw, dayStart, ds);
         }
-        // 官方 viewDidLoad 会把 myCamera.sdSelectiontDay 覆盖成"今日0点"（跨天场景 = 10-20），
-        // 时间轴/相对秒若读它就会算错。这里重设回报警日0点。
+        // 官方 viewDidLoad 会把 myCamera.sdSelectiontDay 覆盖成「今日 0 点」（跨天场景 = 10-20），
+        // 时间轴/相对秒若读它就会算错，这里重设回报警日 0 点。
         @try {
             [self setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"];
         } @catch (NSException *e) {}
-        // 事件列表加载是异步的（网络拉取），等 2.5s 后再建流定位。
-        // v1.28：1.5s→2.5s —— switchToSDDay 切日（尤其跨天场景 10-19）后官方要重新
-        // 网络拉取该日事件列表，网络稍慢时 1.5s 内列表未到 → startSDPlay 定位时官方
-        // 找不到该时间点录像 → 偶发"当前时间无录像"。
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-            // v2.5 定案：定位一律用报警秒原值（不用"最近一段"替换 —— 报警常落在
-            // 某段中间，替换会把画面挪到段起点）。v2.6 只保留"列表是否已回来"的判断：
-            // 列表为空时 2s 后补一次定位，避免该日事件网络拉取稍慢导致定位失败。
-            NSInteger evCount = JAGridValidEventCount(self);
-            if (evCount > 0) {
-                // 有录像段：正常定位（用报警秒原值，v2.5 定案不改写这个秒）
-                SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
-                if ([self respondsToSelector:s]) {
-                    ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
-                }
-                // v1.18：定位已发出，再等 1.5s 拨时间轴指示器到该时间点
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                    JATimeLineSyncToSec(self, sec);
-                });
-                return;
-            }
-            // v2.9.36：这一天的 SD 事件列表一条都没有 —— 要么网络还没拉回来，要么这台
-            // 设备/这天根本没有本地录像。**这一下不要调 startSDPlayWithSelectTimeStamp:**
-            // 实测：调了官方立刻去拉那个时刻，拉不到就弹「加载超时，点击重新播放」，
-            // 随后自动退回实时监控 —— 用户看到的就是「点了不播，还自己跳回实时」。
-            // 改成再等两轮复检：列表回来了就正常定位；确实没有就说明白并退回格子页。
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                if (JAGridValidEventCount(self) > 0) {
-                    SEL s2 = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
-                    if ([self respondsToSelector:s2]) {
-                        ((void(*)(id, SEL, long long))objc_msgSend)(self, s2, sec);
-                    }
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), ^{
-                        if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                        JATimeLineSyncToSec(self, sec);
-                    });
-                    return;
-                }
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                    if (JAGridValidEventCount(self) > 0) {
-                        SEL s3 = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
-                        if ([self respondsToSelector:s3]) {
-                            ((void(*)(id, SEL, long long))objc_msgSend)(self, s3, sec);
-                        }
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                                       dispatch_get_main_queue(), ^{
-                            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                            JATimeLineSyncToSec(self, sec);
-                        });
-                        return;
-                    }
-                    JAGridAlertNoLocalRecord(self);
-                });
-            });
-        });
+        // t≈2s 起轮询：该日有录像 + 官方进了 SD 播放态 → 从实时 seek 到目标秒
+        JAGridSeekOrStart(self, sec, myGen, 0);
     });
 }
 
