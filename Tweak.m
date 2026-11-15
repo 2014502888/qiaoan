@@ -380,9 +380,14 @@ static id JAFindCamera(UIViewController *detailVC, id warn, NSString **src) {
     }
 
     // c. JALiveManager 单例（最近直播/回放设备）
+    // v4.1：类方法不能用 KVC（原来写 JAVal(lmCls,...) 永远是 nil），必须 objc_msgSend
     Class lmCls = NSClassFromString(@"JALiveManager");
     if (lmCls) {
-        id lm = JAVal(lmCls, @"sharedInstance");
+        id lm = nil;
+        SEL sS = NSSelectorFromString(@"sharedInstance");
+        if ([lmCls respondsToSelector:sS]) {
+            @try { lm = ((id(*)(id, SEL))objc_msgSend)((id)lmCls, sS); } @catch (NSException *e) { lm = nil; }
+        }
         if (lm) {
             cam = JAVal(lm, @"myCamera");
             if (cam) {
@@ -872,7 +877,19 @@ static id JAPrepareSDPlatform(id cam) {
     // 我们以前从来没调用过它们，只有 JADevicePlatform 那条 connectCamera 在空转。
     if (cam) {
         Class lmCls = NSClassFromString(@"JALiveManager");
-        id lm = lmCls ? JAVal((id)lmCls, @"sharedInstance") : nil;
+        // v4.1：**不能用 KVC 读类方法**。JAVal 是 valueForKey:，对类对象读 sharedInstance
+        // 必然抛异常被吞掉 → 拿到 nil → v4.0 整段其实一次都没执行过。
+        // 类方法必须走 objc_msgSend(cls, sel)。
+        id lm = nil;
+        if (lmCls) {
+            for (NSString *n in @[@"sharedInstance", @"shared", @"defaultInstance", @"manager"]) {
+                SEL sS = NSSelectorFromString(n);
+                if ([lmCls respondsToSelector:sS]) {
+                    @try { lm = ((id(*)(id, SEL))objc_msgSend)((id)lmCls, sS); } @catch (NSException *e) { lm = nil; }
+                    if (lm) break;
+                }
+            }
+        }
         if (lm) {
             SEL s1 = NSSelectorFromString(@"delegateCamera:isSDCardPage:");
             SEL s2 = NSSelectorFromString(@"delegateCamera:");
@@ -880,6 +897,17 @@ static id JAPrepareSDPlatform(id cam) {
                 @try { ((void(*)(id, SEL, id, BOOL))objc_msgSend)(lm, s1, cam, YES); } @catch (NSException *e) {}
             } else if ([lm respondsToSelector:s2]) {
                 @try { ((void(*)(id, SEL, id))objc_msgSend)(lm, s2, cam); } @catch (NSException *e) {}
+            }
+            // v4.1：真正把 P2P 通道连到这台设备。dump 里这两个是"连设备"入口；
+            // connectionDevice 无参（走它自己记的当前设备）最安全，先调；
+            // connectionDeviceCamera: 单参版本也试一次（个别版本是单参签名）。
+            SEL sConn = NSSelectorFromString(@"connectionDevice");
+            if ([lm respondsToSelector:sConn]) {
+                @try { ((void(*)(id, SEL))objc_msgSend)(lm, sConn); } @catch (NSException *e) {}
+            }
+            SEL sConnCam = NSSelectorFromString(@"connectionDeviceCamera:");
+            if ([lm respondsToSelector:sConnCam]) {
+                @try { ((void(*)(id, SEL, id))objc_msgSend)(lm, sConnCam, cam); } @catch (NSException *e) {}
             }
         }
     }
