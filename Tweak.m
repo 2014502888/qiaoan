@@ -837,6 +837,26 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
             JALog(@"set sdSelectiontDay d0=%lld wrote=%d readback=%lld",
                   d0, (int)wrote, rb);
         }
+        // v4.14.4：决定性发现 —— todayMaxTimestamp 我们设成 1794758399 也回读成功，
+        // 但一进 setupData 就变回 86400。说明它不是最终数据源：setupData 用相机上的
+        // "今天时间戳"自己算，那个字段没初始化时就算出 86400（一天），于是按错误区间
+        // 请求，只回来 20 条。官方页是真实详情页建的，这个字段已被平台算成 1794758400。
+        if (d0 > 0 && cam) {
+            long long before = [JAVal(cam, @"sdTodayTimeStamp") longLongValue];
+            JALog(@"cam sdTodayTimeStamp=%lld sdSelectionDayNotAdjust=%lld",
+                  before, [JAVal(cam, @"sdSelectionDayNotAdjust") longLongValue]);
+            long long want = d0 + 86400LL;
+            BOOL ok = NO;
+            if ([cam respondsToSelector:@selector(setSdTodayTimeStamp:)]) {
+                @try {
+                    ((void (*)(id, SEL, long long))objc_msgSend)(cam, @selector(setSdTodayTimeStamp:), want);
+                    ok = YES;
+                } @catch (NSException *e) {}
+            }
+            if (!ok) JASet(cam, @"sdTodayTimeStamp", @(want));
+            JALog(@"set sdTodayTimeStamp want=%lld wrote=%d readback=%lld",
+                  want, (int)ok, [JAVal(cam, @"sdTodayTimeStamp") longLongValue]);
+        }
         // v4.10：时间轴拉取上限。v4.9 把这段去掉了，结果官方一段都没拉到（段=0）——
         // 说明它必须给，且要给到"当天最后一秒"，否则官方只拉到进入那一刻。
         if (d0 > 0) {
@@ -928,16 +948,18 @@ static IMP g_orig_switchday = NULL;
 // 官方页的核心装载入口：前后各看一次数组，就能知道到底是谁填的
 static void ja_rtc_setupData(id self, SEL _cmd) {
     id mc = JAVal(self, @"myCamera");
-    JALog(@"setupData> arr=%@ tmax=%.0f sdCard=%d myCam=%p camDay=%lld cts=%.0f ce=%@",
+    JALog(@"setupData> arr=%@ tmax=%.0f sdCard=%d myCam=%p camDay=%lld camToday=%lld cts=%.0f ce=%@",
           JASDArrDesc(self), [JAVal(self, @"todayMaxTimestamp") doubleValue],
           (int)[JAVal(self, @"sdCardState") integerValue], (__bridge void *)mc,
           [JAVal(mc, @"sdSelectiontDay") longLongValue],
+          [JAVal(mc, @"sdTodayTimeStamp") longLongValue],
           [JAVal(self, @"currentTimeStamp") doubleValue],
           NSStringFromClass([JAVal(self, @"currentEvent") class]));
     if (g_orig_setupData) ((void (*)(id, SEL))g_orig_setupData)(self, _cmd);
-    JALog(@"setupData< arr=%@ tmax=%.0f camDay=%lld", JASDArrDesc(self),
+    JALog(@"setupData< arr=%@ tmax=%.0f camDay=%lld camToday=%lld", JASDArrDesc(self),
           [JAVal(self, @"todayMaxTimestamp") doubleValue],
-          [JAVal(mc, @"sdSelectiontDay") longLongValue]);
+          [JAVal(mc, @"sdSelectiontDay") longLongValue],
+          [JAVal(mc, @"sdTodayTimeStamp") longLongValue]);
 }
 
 static void ja_rtc_redmark(id self, SEL _cmd) {
