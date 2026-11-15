@@ -846,9 +846,11 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
             long long before = [JAVal(cam, @"sdTodayTimeStamp") longLongValue];
             JALog(@"cam sdTodayTimeStamp=%lld sdSelectionDayNotAdjust=%lld",
                   before, [JAVal(cam, @"sdSelectionDayNotAdjust") longLongValue]);
-            // v4.16：这里必须给"当天 0 点"。setupData 内部是 tmax = 该字段 + 86400，
-            // v4.14.4 给成 d0+86400 就多算出一天（1794844800 = 11-17），范围整错一天。
-            long long want = d0;
+            // v4.16.1：实测定案 —— 这个字段必须给"次日 0 点"（这一整天的结束边界）。
+            //   camToday=1794758400 → setupData tmax=1794844800 → 拉到 359 条（有颜色）
+            //   camToday=1794672000 → setupData tmax=1794758400 → 只回 21 条（时间轴空）
+            // v4.16.0 曾误改成"当天 0 点"，段数就掉回 21，这里恢复。
+            long long want = d0 + 86400LL;
             BOOL ok = NO;
             if ([cam respondsToSelector:@selector(setSdTodayTimeStamp:)]) {
                 @try {
