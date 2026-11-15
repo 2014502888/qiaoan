@@ -706,17 +706,24 @@ static NSString *JADiagText(UIViewController *vc, id cam, long long sec, NSStrin
         }
     } @catch (NSException *e) { ceTxt = @"err"; }
 
+    // ⑥ todayMaxTimestamp（double）—— 时间轴/段列表的**拉取上限**。
+    // 正确页画到 16:20，格子页只画到 15:50 就截止，差别就在它。
+    double tmax = 0;
+    double cts = 0;
+    @try { tmax = [[vc valueForKey:@"todayMaxTimestamp"] doubleValue]; } @catch (NSException *e) {}
+    @try { cts = [[vc valueForKey:@"currentTimeStamp"] doubleValue]; } @catch (NSException *e) {}
+
     long long day = JADayStartSec(@(sec));
     long long rel = sec - day;
     // v4.5：把 cam 的**对象指针**打出来 —— 两页一比，就知道是不是同一个实例。
     // 段数 269 vs 17 而其余字段全同，最可能就是"两份等值但不同的 MyCamera"，
     // 其中官方那份缓存着全天段列表，我们那份只拿到一小段。
     id vcCam = JAVal(vc, @"myCamera");
-    return [NSString stringWithFormat:@"段=%lu 入SD=%@ ce=%@\npb=%lu platSD=%d 卡态=%d 待直播=%d 已检=%d %@\n日=%lld 目标=%lld rel=%lld\ncam=%p vcam=%p src=%@\n首段=%@",
+    return [NSString stringWithFormat:@"段=%lu 入SD=%@ ce=%@\npb=%lu platSD=%d 卡态=%d 待直播=%d 已检=%d %@\ntmax=%.0f cts=%.0f 日=%lld 目标=%lld rel=%lld\ncam=%p vcam=%p src=%@\n首段=%@",
             (unsigned long)segN, sdMode, ceTxt,
             (unsigned long)pbType, isSD ? 1 : 0,
             cardState, startLive ? 1 : 0, statusChecked ? 1 : 0, lmTxt,
-            day, sec, rel, (void *)cam, (void *)vcCam, src ? src : @"-", firstSeg];
+            tmax, cts, day, sec, rel, (void *)cam, (void *)vcCam, src ? src : @"-", firstSeg];
 }
 
 static void JADiagAttach(UIViewController *vc, long long sec, id cam, NSString *src) {
@@ -3678,6 +3685,11 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     // 不塞时，官方按 sdSelectiontDay 拉全天段（271 条），时间轴才有红蓝段。
     JASet(vc, @"currentEvent", nil);
     JASet(vc, @"currentTimeStamp", @(sec));
+    // v4.7：todayMaxTimestamp 是官方时间轴的**拉取上限**。不设时它按"进入时刻"封顶，
+    // 段列表就只拉到那一刻前后（18 条，时间轴画到 15:50 就断），目标秒之后全是空白 ——
+    // 看起来跟"没颜色、拖不动"一模一样。显式给到当天最后一秒，官方才会把整天拉满
+    //（正确页 271 条、时间轴画到 16:20 之后，就是这个值大）。
+    JASet(vc, @"todayMaxTimestamp", @((double)(JADayStartSec(@(sec)) + 86400LL - 1)));
     JASet(self.myCamera, @"sdSelectiontDay", @(JADayStartSec(@(sec))));
 
     // 复用 v1.28 定位链路：viewDidAppear 后 3.0s 自动定位到 g_rtcTargetSec
