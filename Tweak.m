@@ -259,6 +259,15 @@
 //   于是几小时前那条败仗一直留在底部。既然根因已定案修复，诊断整体撤掉：
 //   ① rebuildLayout 不再把 firstFailInfo 塞进底部提示条；
 //   ② 格子失败态从「失败 403 / 失败 e-1002 / 失败 qiaoan-th / 失败.jpg」收回成「无封面」。
+// v2.9.36（点格子不播 / 跳回实时）：实测两台监控是**两种不同**的毛病。
+//   第 2 台：官方 SD 回放页的时间轴整条空白、没有带颜色的录像段 —— 它的抓拍图是云存储的
+//     （华为云 OBS + _enc 加密），本地 SD 卡这天根本没有录像。旧逻辑在「列表为空」时照样
+//     先调 startSDPlayWithSelectTimeStamp: → 官方去拉一个不存在的时刻 → 弹「加载超时，
+//     点击重新播放」→ 自动退回实时监控。用户看到的就是「点了不播，还自己跳回实时」。
+//   改法：先看该日录像段数（JAGridValidEventCount），**有录像才定位**；为空则等两轮复检
+//     （2s、再 3s），回来就定位，确实没有就弹「没有本地录像」并退回格子页。
+//   第 1 台：时间轴有颜色（有录像），只是**偶发**拉流超时 —— 这是设备上行/P2P 抖动，
+//     定位参数本身没问题（报警秒原值 + 双源校正），重试属于官方播放器内部行为，不硬干预。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -603,6 +612,32 @@ static NSInteger JAGridValidEventCount(id vc) {
     return n;
 }
 
+// v2.9.36：这台设备/这一天 SD 卡里一条录像段都没有时，说明白并退回。
+// 第 2 台监控实测：时间轴整条是空的、没有带颜色的录像段 —— 抓拍图是云存储的，
+// 本地没录像。这种情况下官方只会「加载超时 → 点击重新播放 → 又跳回实时」，
+// 让人以为是我们定位错了。直接把话说明白，比看它瞎转强。
+static void JAGridAlertNoLocalRecord(id vc) {
+    if (![vc isKindOfClass:[UIViewController class]]) return;
+    UIViewController *p = (UIViewController *)vc;
+    if (p.presentedViewController) return;
+    NSString *msg = @"这台监控在这一天没有本地录像（SD 卡里没有录像段），只能查看云端抓拍图。";
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"没有本地录像"
+                                                               message:msg
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    __weak UIViewController *wp = p;
+    [ac addAction:[UIAlertAction actionWithTitle:@"返回"
+                                           style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) {
+        UIViewController *s = wp;
+        if (!s) return;
+        UINavigationController *nav = s.navigationController;
+        if (nav && nav.viewControllers.count > 1 && nav.topViewController == s) {
+            [nav popViewControllerAnimated:YES];
+        }
+    }]];
+    [p presentViewController:ac animated:YES completion:nil];
+}
+
 // v2.7：某天内的有效事件条数（采样比较用）
 static NSInteger JAGridDayEventCount(NSArray *evs, long long day) {
     NSInteger n = 0;
@@ -750,38 +785,58 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
             // 某段中间，替换会把画面挪到段起点）。v2.6 只保留"列表是否已回来"的判断：
             // 列表为空时 2s 后补一次定位，避免该日事件网络拉取稍慢导致定位失败。
             NSInteger evCount = JAGridValidEventCount(self);
-            SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
-            if ([self respondsToSelector:s]) {
-                ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
-            }
             if (evCount > 0) {
-                // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到定位时间点
+                // 有录像段：正常定位（用报警秒原值，v2.5 定案不改写这个秒）
+                SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
+                if ([self respondsToSelector:s]) {
+                    ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
+                }
+                // v1.18：定位已发出，再等 1.5s 拨时间轴指示器到该时间点
                 dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
                     if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
                     JATimeLineSyncToSec(self, sec);
                 });
-            } else {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                return;
+            }
+            // v2.9.36：这一天的 SD 事件列表一条都没有 —— 要么网络还没拉回来，要么这台
+            // 设备/这天根本没有本地录像。**这一下不要调 startSDPlayWithSelectTimeStamp:**
+            // 实测：调了官方立刻去拉那个时刻，拉不到就弹「加载超时，点击重新播放」，
+            // 随后自动退回实时监控 —— 用户看到的就是「点了不播，还自己跳回实时」。
+            // 改成再等两轮复检：列表回来了就正常定位；确实没有就说明白并退回格子页。
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                if (JAGridValidEventCount(self) > 0) {
+                    SEL s2 = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
+                    if ([self respondsToSelector:s2]) {
+                        ((void(*)(id, SEL, long long))objc_msgSend)(self, s2, sec);
+                    }
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                        JATimeLineSyncToSec(self, sec);
+                    });
+                    return;
+                }
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
                     if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                    NSInteger c2 = JAGridValidEventCount(self);
-                    if (c2 > 0) {
-                        SEL s2 = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
-                        if ([self respondsToSelector:s2]) {
-                            ((void(*)(id, SEL, long long))objc_msgSend)(self, s2, sec);
+                    if (JAGridValidEventCount(self) > 0) {
+                        SEL s3 = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
+                        if ([self respondsToSelector:s3]) {
+                            ((void(*)(id, SEL, long long))objc_msgSend)(self, s3, sec);
                         }
-                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                                     (int64_t)(1.5 * NSEC_PER_SEC)),
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                                        dispatch_get_main_queue(), ^{
                             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
                             JATimeLineSyncToSec(self, sec);
                         });
-                    } else {
-                        JATimeLineSyncToSec(self, sec);
+                        return;
                     }
+                    JAGridAlertNoLocalRecord(self);
                 });
-            }
+            });
         });
     });
 }
