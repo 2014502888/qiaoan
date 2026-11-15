@@ -693,14 +693,28 @@ static NSString *JADiagText(UIViewController *vc, id cam, long long sec, NSStrin
         }
     }
 
+    // ⑤ currentEvent —— 官方 setupData 靠它决定"只拉这条记录附近的段"还是"拉全天段"
+    NSString *ceTxt = @"-";
+    @try {
+        id ce = [vc valueForKey:@"currentEvent"];
+        if (!ce) {
+            ceTxt = @"nil";
+        } else {
+            NSString *eid = [JAVal(ce, @"eid") description];
+            if (eid.length > 12) eid = [eid substringToIndex:12];
+            ceTxt = [NSString stringWithFormat:@"%@/%@", NSStringFromClass([ce class]), eid ? eid : @"-"];
+        }
+    } @catch (NSException *e) { ceTxt = @"err"; }
+
     long long day = JADayStartSec(@(sec));
     long long rel = sec - day;
     // v4.5：把 cam 的**对象指针**打出来 —— 两页一比，就知道是不是同一个实例。
     // 段数 269 vs 17 而其余字段全同，最可能就是"两份等值但不同的 MyCamera"，
     // 其中官方那份缓存着全天段列表，我们那份只拿到一小段。
     id vcCam = JAVal(vc, @"myCamera");
-    return [NSString stringWithFormat:@"段=%lu 入SD=%@ pb=%lu platSD=%d\n卡态=%d 待直播=%d 已检=%d %@\n日=%lld 目标=%lld rel=%lld\ncam=%p vcam=%p\nsrc=%@\n首段=%@",
-            (unsigned long)segN, sdMode, (unsigned long)pbType, isSD ? 1 : 0,
+    return [NSString stringWithFormat:@"段=%lu 入SD=%@ ce=%@\npb=%lu platSD=%d 卡态=%d 待直播=%d 已检=%d %@\n日=%lld 目标=%lld rel=%lld\ncam=%p vcam=%p src=%@\n首段=%@",
+            (unsigned long)segN, sdMode, ceTxt,
+            (unsigned long)pbType, isSD ? 1 : 0,
             cardState, startLive ? 1 : 0, statusChecked ? 1 : 0, lmTxt,
             day, sec, rel, (void *)cam, (void *)vcCam, src ? src : @"-", firstSeg];
 }
@@ -3656,7 +3670,13 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     id cam2 = JAPrepareSDPlatform(self.myCamera);
     if (cam2) self.myCamera = cam2;
     @try { [vc setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
-    if (ev0) JASet(vc, @"currentEvent", ev0);
+    // v4.6：currentEvent 不塞了。实测两页 cam 是同一个对象（0x118a09c00），
+    // 唯一差别是段数：查看录像 271 段、格子只有 17 段 —— 17 条正好是"当天报警事件"的
+    // 量级，而不是全天录像段。官方 setupData 就是看 currentEvent 决定拉取范围：
+    // 给了具体一条记录，它只拉那几条 → 目标时间落在段之外 → startSDPlayWithSelectTimeStamp:
+    // 退回实时（画面实时、指示器却停在目标点，正是 v1.32 注释里那个故障模式）。
+    // 不塞时，官方按 sdSelectiontDay 拉全天段（271 条），时间轴才有红蓝段。
+    JASet(vc, @"currentEvent", nil);
     JASet(vc, @"currentTimeStamp", @(sec));
     JASet(self.myCamera, @"sdSelectiontDay", @(JADayStartSec(@(sec))));
 
