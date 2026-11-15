@@ -1231,9 +1231,17 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
             // tmax=86400 等于"今天只到零点"，服务端只回事件条数；入SD 是进 SD 播放模式的开关。
             long long d0x = JADayStartSec(@(sec));
             JASet(self, @"todayMaxTimestamp", @((double)(d0x + 86399LL)));
-            // 注意：JASet 是 setValue:forKey:，不吃点号路径，这里必须用 forKeyPath
+            // v4.13.6：点号 keyPath 上次没生效（诊断仍读到 入SD=0）。先取出 viewModel 对象
+            // 再单独置位，两条路都试；置上之后立刻让它按"当天 + 全天范围"重新拉一次段。
+            id vm = JAVal(self, @"viewModel");
+            if (![vm isKindOfClass:[NSObject class]]) vm = nil;
+            if (vm) {
+                JASet(vm, @"isEnterSDPlay", @YES);
+                JASet(vm, @"todayMaxTimestamp", @((double)(d0x + 86399LL)));
+            }
             @try { [self setValue:@YES forKeyPath:@"viewModel.isEnterSDPlay"]; }
             @catch (NSException *ex) {}
+            SEL sw = NSSelectorFromString(@"switchToSDDay:dateString:");
             SEL sp = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
             if ([self respondsToSelector:sp]) {
                 ((void(*)(id, SEL, long long))objc_msgSend)(self, sp, sec);
@@ -1242,6 +1250,17 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
                            dispatch_get_main_queue(), ^{
                 if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
                 JATimeLineSyncToSec(self, sec);
+                // v4.13.6：段数还是不够（官方能到 299，正常一天至少上百条）→ 说明 setupData
+                // 那次请求的范围不对。此时才用"按天 + 日期字符串"正式重拉一次兜底，
+                // 避免一进来就把已有列表清空。
+                NSInteger got = JAGridValidEventCount(self);
+                if (got < 50 && [self respondsToSelector:sw]) {
+                    NSDateFormatter *f = [[NSDateFormatter alloc] init];
+                    f.dateFormat = @"yyyy-MM-dd";
+                    NSString *ds = [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)sec]];
+                    @try { ((void (*)(id, SEL, long long, id))objc_msgSend)(self, sw, d0x, ds); }
+                    @catch (NSException *ex) {}
+                }
             });
         });
         return;
