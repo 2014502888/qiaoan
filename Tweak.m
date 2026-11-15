@@ -627,6 +627,9 @@ static unsigned long long g_rtcVdaGen = 0;
 // g_rtcOfficialMode：认领成功后置 YES —— 该页的段是官方自己拉满的，只补一刀定位
 static BOOL g_rtcOfficialPending = NO;
 static BOOL g_rtcOfficialMode = NO;
+// v4.13.3：官方页拉录像列表时传的真实入参（诊断条显示，学一次就知道该传什么）
+static long long g_lastLoadType = -1;
+static long long g_lastLoadDay = -1;
 
 // ---------- v4.3：诊断条（用户同意，用来定位"没段颜色"卡在哪一环） ----------
 // 只看三件事，别的都不看了：
@@ -734,8 +737,8 @@ static NSString *JADiagText(UIViewController *vc, id cam, long long sec, NSStrin
     // 段数 269 vs 17 而其余字段全同，最可能就是"两份等值但不同的 MyCamera"，
     // 其中官方那份缓存着全天段列表，我们那份只拿到一小段。
     id vcCam = JAVal(vc, @"myCamera");
-    return [NSString stringWithFormat:@"段=%lu 入SD=%@ ce=%@ ev=%lld\npb=%lu platSD=%d 卡态=%d 待直播=%d 已检=%d %@\ntmax=%.0f cts=%.0f 日=%lld 目标=%lld rel=%lld\ncam=%p vcam=%p src=%@\n首段=%@",
-            (unsigned long)segN, sdMode, ceTxt, evN,
+    return [NSString stringWithFormat:@"段=%lu 入SD=%@ ce=%@ ev=%lld 实参=%lld/%lld\npb=%lu platSD=%d 卡态=%d 待直播=%d 已检=%d %@\ntmax=%.0f cts=%.0f 日=%lld 目标=%lld rel=%lld\ncam=%p vcam=%p src=%@\n首段=%@",
+            (unsigned long)segN, sdMode, ceTxt, evN, g_lastLoadType, g_lastLoadDay,
             (unsigned long)pbType, isSD ? 1 : 0,
             cardState, startLive ? 1 : 0, statusChecked ? 1 : 0, lmTxt,
             tmax, cts, day, sec, rel, (void *)cam, (void *)vcCam, src ? src : @"-", firstSeg];
@@ -827,6 +830,10 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
     if (!nav) nav = JATopVC().navigationController;
     if (nav) {
         g_activeSDPlayer = vc;  // 登记当前活跃 RTC SD 播放器（viewDidAppear hook 守卫用）
+        // v4.13.4：自造页也走"轻量"分支 —— 进页后只做定位，不 stopSDPlay、不切天、不重拉。
+        // 官方 setupData 自己会拉当天全部录像段；我们以前"进来先停流再切天再重拉"
+        // 很可能把它刚拉好的列表冲成只剩事件条数（段=19/0、首段为空就是这么来的）。
+        g_rtcOfficialMode = YES;
         [nav pushViewController:vc animated:YES];
         JADiagAttach(vc, g_rtcTargetSec, cam, nil);
         // RTC 版是官方完整播放器，官方链自己建流 → 不做任何状态强制
@@ -873,6 +880,20 @@ static void ja_didEnterLive(id self, SEL _cmd) {
 // v3.2：SD 回放页 hook 的安装入口（幂等）
 // v3.9：恢复 4 个 hook。依据是实测对照 —— 官方「查看录像」那条链（JATryOpenSDReplay）
 // 一直能用，而它正是在这 4 个 hook 之下跑的；格子链要和它一致，就不能少。
+// v4.13.3：官方拉录像列表的真实入参（学一次，写盘）
+static IMP g_orig_load_type = NULL;
+static IMP g_orig_load_day = NULL;
+
+static void ja_load_record_type(id self, SEL _cmd, long long t) {
+    g_lastLoadType = t;
+    if (g_orig_load_type) ((void (*)(id, SEL, long long))g_orig_load_type)(self, _cmd, t);
+}
+
+static void ja_load_record_day(id self, SEL _cmd, long long d) {
+    g_lastLoadDay = d;
+    if (g_orig_load_day) ((void (*)(id, SEL, long long))g_orig_load_day)(self, _cmd, d);
+}
+
 static void JAHookRtcExtras(Class cls) {
     if (!cls) return;
     JASetImp(cls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
@@ -880,6 +901,12 @@ static void JAHookRtcExtras(Class cls) {
     JASetImp(cls, @selector(shouldBlockLiveUIBecauseSDUnavailable),
              (IMP)ja_shouldBlockLive, &g_orig_shouldBlockLive);
     JASetImp(cls, @selector(didEnterLive), (IMP)ja_didEnterLive, &g_orig_didEnterLive);
+    // v4.13.3：把"拉录像列表"这两个方法的真实入参记下来。官方页能拉满真段，
+    // 我们自造页只拉到事件条数，差别就在这个入参上。学一次就够，写盘保存。
+    JASetImp(cls, @selector(loadRecordListWithType:),
+             (IMP)ja_load_record_type, &g_orig_load_type);
+    JASetImp(cls, @selector(loadRecordListWithSelectiontDay:),
+             (IMP)ja_load_record_day, &g_orig_load_day);
     g_rtcHooked = YES;
 }
 
