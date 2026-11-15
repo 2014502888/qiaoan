@@ -1227,6 +1227,13 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+            // v4.13.5：官方页实测 入SD=1 / tmax=当天最后一秒；我们页 入SD=0 / tmax=86400。
+            // tmax=86400 等于"今天只到零点"，服务端只回事件条数；入SD 是进 SD 播放模式的开关。
+            long long d0x = JADayStartSec(@(sec));
+            JASet(self, @"todayMaxTimestamp", @((double)(d0x + 86399LL)));
+            // 注意：JASet 是 setValue:forKey:，不吃点号路径，这里必须用 forKeyPath
+            @try { [self setValue:@YES forKeyPath:@"viewModel.isEnterSDPlay"]; }
+            @catch (NSException *ex) {}
             SEL sp = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
             if ([self respondsToSelector:sp]) {
                 ((void(*)(id, SEL, long long))objc_msgSend)(self, sp, sec);
