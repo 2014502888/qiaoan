@@ -2356,13 +2356,23 @@ static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam
         [self refreshDash];
         y += 34;
     }
-    self.clockView.frame = CGRectMake(16, y + 3, 20, 20);
+    CGFloat iconY = y + 3;
+    self.clockView.frame = CGRectMake(16, iconY, 20, 20);
     // v2.8.1：没有时钟的「空天说明」从左边 16 起排，和日期标题左对齐
     CGFloat hx = self.clockView.hidden ? 16 : 42;
     CGFloat hy = y;
     CGFloat hh = MAX(26, self.bounds.size.height - hy - 4);
     // v2.9.32：多行说明给足整块高度，别按单行 26 裁掉下面的行
     if (self.hourLab.numberOfLines == 0) hh = MAX(26, self.bounds.size.height - hy);
+    // v2.9.43：小时标题和时钟图标垂直居中对齐。
+    // 原来小时行这块从 y 起撑满剩余高度，UILabel 垂直居中后落点比图标低 5~6pt
+    // （用户看到的就是"时间偏下、时钟图标偏上"）。这里把小时标题压成和图标同高同中心：
+    // 16pt 字在 22pt 高里居中，视觉中心 = iconY - 1 + 11 = iconY + 10 = 图标中心。
+    // 只有「有时钟」的小时行这样排；空天说明 / 已加载完毕这类居中灰字保持原逻辑。
+    if (!self.clockView.hidden) {
+        hy = iconY - 1;
+        hh = 22;
+    }
     self.hourLab.frame = CGRectMake(hx, hy, MAX(0, w - hx - 16), hh);
 }
 - (void)refreshDash {
