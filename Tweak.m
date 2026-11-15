@@ -575,7 +575,8 @@ static long long JASegSec(id msg);
 // shouldBlockLiveUIBecauseSDUnavailable / didEnterLive）
 static void JAHookRtcExtras(Class cls);
 // v3.3：进 SD 回放页前，按官方入口的做法把 JADevicePlatform 的回放状态摆好
-static void JAPrepareSDPlatform(id cam);
+// v3.7：返回规范化后的 camera（官方那份共享实例）
+static id JAPrepareSDPlatform(id cam);
 static NSArray *JAGridFindEvents(id vc);
 static NSNumber *JAGridTimestamp(id ev);
 
@@ -623,6 +624,10 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
         JAHookRtcExtras(cls);
     }
     id vc = [[cls alloc] init];
+    // v3.7：先把 camera 换成官方那份共享实例，并把官方回放时抓到的设备状态填回去。
+    // 必须放在最前面 —— 后面 myCamera / sdSelectiontDay 这些入参都要落在同一份对象上。
+    id ccam = JAPrepareSDPlatform(cam);
+    if (ccam) cam = ccam;
 
     // 1) myCamera 用 KVC（RTC 版无 setMyCamera: 公开方法）。
     // 官方 viewDidLoad 会自己读 self.myCamera → setMyCamera: 到 JADevicePlatform.sharedInstance
@@ -655,8 +660,6 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     }
 
     // 3) push
-    // v3.3：push 之前，照着官方入口把平台的回放状态摆好（playBackActionType / isSDPlayer）。
-    JAPrepareSDPlatform(cam);
     UINavigationController *nav = detailVC.navigationController;
     if (!nav) nav = JATopVC().navigationController;
     if (nav) {
@@ -765,12 +768,63 @@ static id JADevicePlatformShared(void) {
     return nil;
 }
 
-static void JAPrepareSDPlatform(id cam) {
+// v3.7：用 uid 走 JAGroupManager 拿官方那份共享 MyCamera。
+// 每台设备在 App 里只有一份 MyCamera（JAGroupManager 的 myCameraMap 里那份），
+// 官方「查看录像」用的就是它；官方查询 SD 卡状态/是否支持回放/当天时间戳，结果都
+// 写在这份实例上。格子页如果拿到的是别处来的等价对象，官方那次查询的成果就落在
+// 另一份实例上 —— 于是"点过查看录像后再点格子就能用"，正是实测现象。
+static id JACanonicalCamera(id cam) {
+    if (!cam) return nil;
+    NSString *uid = nil;
+    @try { id v = [cam valueForKey:@"uid"]; if ([v isKindOfClass:NSString.class]) uid = v; } @catch (NSException *e) {}
+    if (!uid.length) return cam;
+    id gm = JAGroupManagerShared();
+    if (!gm) return cam;
+    SEL s = NSSelectorFromString(@"getMyCameraWithUid:");
+    if (![gm respondsToSelector:s]) return cam;
+    id c = nil;
+    @try { c = ((id(*)(id, SEL, id))objc_msgSend)(gm, s, uid); } @catch (NSException *e) {}
+    return c ?: cam;
+}
+
+// v3.7：官方回放时设备身上那几个"能回放"的状态，抓下来存住，冷启动直接照填
+static NSArray *JACamSnapKeys(void) {
+    return @[@"sdCardStatus", @"sdTodayTimeStamp", @"isSupportSDReplay",
+             @"isDevOnline", @"sdSelectionDayNotAdjust"];
+}
+
+static void JASnapCameraState(id cam) {
+    if (!cam) return;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    for (NSString *k in JACamSnapKeys()) {
+        id v = nil;
+        @try { v = [cam valueForKey:k]; } @catch (NSException *e) {}
+        if ([v isKindOfClass:NSNumber.class]) {
+            [ud setObject:v forKey:[@"jasd_cam_" stringByAppendingString:k]];
+        }
+    }
+}
+
+static void JARestoreCameraState(id cam) {
+    if (!cam) return;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    for (NSString *k in JACamSnapKeys()) {
+        id v = [ud objectForKey:[@"jasd_cam_" stringByAppendingString:k]];
+        if (![v isKindOfClass:NSNumber.class]) continue;
+        @try { [cam setValue:v forKey:k]; } @catch (NSException *e) {}
+    }
+}
+
+static id JAPrepareSDPlatform(id cam) {
+    // v3.7：先换成官方那份共享实例，后面所有状态都落在同一份对象上
+    cam = JACanonicalCamera(cam);
     id plat = JADevicePlatformShared();
-    if (!plat) return;
+    if (!plat) return cam;
     if (cam) {
         @try { [plat setValue:cam forKey:@"myCamera"]; } @catch (NSException *e) {}
         @try { [plat setValue:cam forKey:@"currentCamera"]; } @catch (NSException *e) {}
+        // v3.7：把官方回放时抓到的设备状态填回去（SD 卡状态 / 支持回放 / 当天时间戳…）
+        JARestoreCameraState(cam);
     }
     // v3.4：重启后也能直接用 —— 先把本地存过的真值读回来
     JALoadPlayState();
@@ -792,6 +846,7 @@ static void JAPrepareSDPlatform(id cam) {
     } else if (cam && [plat respondsToSelector:selLive]) {
         ((void(*)(id, SEL))objc_msgSend)(plat, selLive);
     }
+    return cam;
 }
 
 // v1.15 核心：JANewRtcSDPlayViewController viewDidAppear（官方本地 SD 回放界面）
@@ -814,7 +869,29 @@ static void JAPrepareSDPlatform(id cam) {
 // 画面即切到报警时间；三段"乱跳"观感保留，换取定位 100% 可靠。
 static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     if (g_orig_rtc_vda) ((void(*)(id, SEL))g_orig_rtc_vda)(self, _cmd);
-    if (self != g_activeSDPlayer) return;
+    if (self != g_activeSDPlayer) {
+        // v3.7：这是官方入口打开的 SD 回放页 —— 此刻设备状态是齐全的（SD 卡状态、
+        // 是否支持回放、当天时间戳、平台的回放动作类型）。全部抓下来存住，
+        // 格子链冷启动时照这份值填，就不必先走一次官方入口了。
+        id c = nil;
+        @try { c = [self valueForKey:@"myCamera"]; } @catch (NSException *e) {}
+        JASnapCameraState(c);
+        id plat = JADevicePlatformShared();
+        if (plat) {
+            id v = nil;
+            @try { v = [plat valueForKey:@"playBackActionType"]; } @catch (NSException *e) {}
+            if ([v isKindOfClass:NSNumber.class]) {
+                NSUInteger t = [v unsignedIntegerValue];
+                if (t != 0) {
+                    g_lastPlayBackType = t;
+                    g_hasPlayBackType = YES;
+                    [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)t
+                                                              forKey:@"jasd_playBackType"];
+                }
+            }
+        }
+        return;
+    }
     long long sec = g_rtcTargetSec;
     if (sec < 1000000000LL) return;
     // v1.20：世代去重 —— 官方可能多次触发 viewDidAppear，只保留最后一次生效
@@ -3336,6 +3413,12 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     }
 
     id vc = [[rtc alloc] init];
+    // v3.7：先把 camera 换成官方那份共享实例，并把官方回放时抓到的设备状态填回去。
+    // 放在最前面，后面 myCamera / sdSelectiontDay 都落在同一份对象上 ——
+    // 官方"查看录像"查询到的 SD 卡状态/支持回放 也写在这份对象上，所以点过它之后
+    // 格子就能用；这样冷启动也不必先走官方入口。
+    id ccam = JAPrepareSDPlatform(self.myCamera);
+    if (ccam) self.myCamera = ccam;
     @try { [vc setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
     // v2.9.55：照搬「消息列表 → 查看录像」那条链 —— 它会把这条报警消息本身作为
     // currentEvent 挂到播放页上，官方 setupData 靠它确定"初始选中的就是这条记录/这个时刻"。
@@ -3360,8 +3443,6 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
 
     UINavigationController *nav = self.navigationController;
     if (!nav) return;
-    // v3.3：push 前把平台的回放状态摆成官方那套（否则页面进来了仍按"直播"跑）
-    JAPrepareSDPlatform(self.myCamera);
     [nav pushViewController:vc animated:YES];
 
     // v2.9.8：官方 SD 回放页自带的时间轴/拖动条不再隐藏（用户要能自己拖）。
