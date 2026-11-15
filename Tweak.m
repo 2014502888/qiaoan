@@ -577,6 +577,8 @@ static void JAHookRtcExtras(Class cls);
 // v3.3：进 SD 回放页前，按官方入口的做法把 JADevicePlatform 的回放状态摆好
 // v3.7：返回规范化后的 camera（官方那份共享实例）
 static id JAPrepareSDPlatform(id cam);
+// v3.9：按设备 ID 取 camera（JAGridDeviceId 定义在后，前置声明）
+static NSString *JAGridDeviceId(id cam);
 static NSArray *JAGridFindEvents(id vc);
 static NSNumber *JAGridTimestamp(id ev);
 
@@ -702,14 +704,15 @@ static void ja_didEnterLive(id self, SEL _cmd) {
 }
 
 // v3.2：SD 回放页 hook 的安装入口（幂等）
-// v3.8：只装 viewDidAppear/viewDidDisappear —— 与 v2.9.27 完全一致。
-// v3.2 曾额外拦 shouldBlockLiveUIBecauseSDUnavailable / didEnterLive 两个"退回实时"开关，
-// 但 v2.9.27（实测可用版）从来没拦过这两个，拦它们等于替官方改了状态机走向，
-// 反而逼出"必须先把 playBackActionType 摆对"的连锁依赖 —— 一并撤掉。
+// v3.9：恢复 4 个 hook。依据是实测对照 —— 官方「查看录像」那条链（JATryOpenSDReplay）
+// 一直能用，而它正是在这 4 个 hook 之下跑的；格子链要和它一致，就不能少。
 static void JAHookRtcExtras(Class cls) {
     if (!cls) return;
     JASetImp(cls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
     JASetImp(cls, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
+    JASetImp(cls, @selector(shouldBlockLiveUIBecauseSDUnavailable),
+             (IMP)ja_shouldBlockLive, &g_orig_shouldBlockLive);
+    JASetImp(cls, @selector(didEnterLive), (IMP)ja_didEnterLive, &g_orig_didEnterLive);
     g_rtcHooked = YES;
 }
 
@@ -769,23 +772,34 @@ static id JADevicePlatformShared(void) {
     return nil;
 }
 
-// v3.7：用 uid 走 JAGroupManager 拿官方那份共享 MyCamera。
+// v3.7：用设备 ID 走 JAGroupManager 拿官方那份共享 MyCamera。
 // 每台设备在 App 里只有一份 MyCamera（JAGroupManager 的 myCameraMap 里那份），
 // 官方「查看录像」用的就是它；官方查询 SD 卡状态/是否支持回放/当天时间戳，结果都
 // 写在这份实例上。格子页如果拿到的是别处来的等价对象，官方那次查询的成果就落在
 // 另一份实例上 —— 于是"点过查看录像后再点格子就能用"，正是实测现象。
+// v3.9：key 必须用 **设备 ID**。JAFindCameraFromGroupManager 里那条注释写得很清楚：
+//       `getMyCameraWithUid:` 实际是 myCameraMap[eid]，eid = 报警消息里的 deviceId。
+//       v3.7 传的是 uid（那串 WY5NT5B3AN…），map 里查不到 → 原样返回 → 等于没换。
 static id JACanonicalCamera(id cam) {
     if (!cam) return nil;
-    NSString *uid = nil;
-    @try { id v = [cam valueForKey:@"uid"]; if ([v isKindOfClass:NSString.class]) uid = v; } @catch (NSException *e) {}
-    if (!uid.length) return cam;
     id gm = JAGroupManagerShared();
-    if (!gm) return cam;
-    SEL s = NSSelectorFromString(@"getMyCameraWithUid:");
-    if (![gm respondsToSelector:s]) return cam;
-    id c = nil;
-    @try { c = ((id(*)(id, SEL, id))objc_msgSend)(gm, s, uid); } @catch (NSException *e) {}
-    return c ?: cam;
+    if (gm) {
+        SEL s = NSSelectorFromString(@"getMyCameraWithUid:");
+        if ([gm respondsToSelector:s]) {
+            NSMutableArray *keys = [NSMutableArray array];
+            NSString *did = JAGridDeviceId(cam);          // 设备 ID（map 的 key）
+            if (did.length) [keys addObject:did];
+            NSString *uid = nil;                           // 兜底：有的实现按 uid 索引
+            @try { id v = [cam valueForKey:@"uid"]; if ([v isKindOfClass:NSString.class]) uid = v; } @catch (NSException *e) {}
+            if (uid.length && ![uid isEqualToString:did]) [keys addObject:uid];
+            for (NSString *k in keys) {
+                id c = nil;
+                @try { c = ((id(*)(id, SEL, id))objc_msgSend)(gm, s, k); } @catch (NSException *e) {}
+                if (c) return c;
+            }
+        }
+    }
+    return cam;
 }
 
 // v3.7：官方回放时设备身上那几个"能回放"的状态，抓下来存住，冷启动直接照填
@@ -3397,13 +3411,18 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     }
 
     id vc = [[rtc alloc] init];
-    // v3.8：完全回到 v2.9.27 的进页面方式 —— 只给三个入参：myCamera / currentTimeStamp /
-    // sdSelectiontDay。不设 currentEvent，也不预先把 JADevicePlatform 的状态摆一遍。
-    // v2.9.27 是被实测证明"点格子直接就能看回放、时间轴有段时间颜色"的版本。
-    // v2.9.55 在这里加了 currentEvent（想"照搬查看录像"那条链），v3.3 起又加摆平台状态、
-    // 连设备通道、换共享实例 —— 每加一样，官方 setupData 就多一条初始化路径可选，
-    // 结果页面进来了却只按"直播"跑。少给入参，反而回到能用那版。
+    // v3.9：格子链逐步对齐官方「查看录像」那条链（JATryOpenSDReplay）—— 它是唯一被
+    // 实测证明"点进去就有录像段颜色、能精准对位"的路径，格子就和它走一样的四步：
+    //   ① camera 换成 JAGroupManager 里那份共享实例（按**设备 ID**取，不是 uid）
+    //   ② 摆好 JADevicePlatform 的回放状态（playBackActionType / isSDPlayer）+ 连通道
+    //   ③ 挂 currentEvent（官方 setupData 靠它确定"初始选中的就是这条记录"）
+    //   ④ 挂 currentTimeStamp + sdSelectiontDay
+    // 这四步就是"点格子时先按消息列表那条路把东西拿到手"的具体落地。
+    id ev0 = entry[@"ev"];
+    id cam2 = JAPrepareSDPlatform(self.myCamera);
+    if (cam2) self.myCamera = cam2;
     @try { [vc setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
+    if (ev0) JASet(vc, @"currentEvent", ev0);
     JASet(vc, @"currentTimeStamp", @(sec));
     JASet(self.myCamera, @"sdSelectiontDay", @(JADayStartSec(@(sec))));
 
