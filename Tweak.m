@@ -1474,6 +1474,27 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
                 ((void (*)(id, SEL, long long))objc_msgSend)(self, sp, sec);
             }
             JALog(@"VDA start sec=%lld arr=%d", sec, n);
+            // v4.20.2：实测 arr 从 1 次查到 41 次（20 秒）一直是 22，页面自己不会补数据。
+            // 但第 2 次进页面"一出生就有 360"，所以那份数据是建页时从别处读进来的，
+            // 而把它写进去的很可能是"起播"这个动作。这里盯住起播之后数组会不会变。
+            __block int tries3 = 0;
+            __block void (^poll3)(void);
+            poll3 = ^{
+                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                int n2 = JASDArrCount(self);
+                tries3++;
+                JALog(@"VDA post arr=%d t=%d", n2, tries3);
+                if (n2 >= 150) {
+                    JALog(@"VDA post filled -> resync timeline");
+                    JATimeLineSyncToSec(self, sec);
+                }
+                if (tries3 < 12) {
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), poll3);
+                }
+            };
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), poll3);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
