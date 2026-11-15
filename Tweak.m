@@ -630,6 +630,8 @@ static BOOL g_rtcOfficialMode = NO;
 // v4.13.3：官方页拉录像列表时传的真实入参（诊断条显示，学一次就知道该传什么）
 static long long g_lastLoadType = -1;
 static long long g_lastLoadDay = -1;
+// v4.13.7：SD 播放器被创建了几次 —— 用来判断官方那条链到底有没有走到"建页"这一步
+static NSInteger g_rtcVdlCount = 0;
 
 // ---------- v4.3：诊断条（用户同意，用来定位"没段颜色"卡在哪一环） ----------
 // 只看三件事，别的都不看了：
@@ -737,8 +739,8 @@ static NSString *JADiagText(UIViewController *vc, id cam, long long sec, NSStrin
     // 段数 269 vs 17 而其余字段全同，最可能就是"两份等值但不同的 MyCamera"，
     // 其中官方那份缓存着全天段列表，我们那份只拿到一小段。
     id vcCam = JAVal(vc, @"myCamera");
-    return [NSString stringWithFormat:@"段=%lu 入SD=%@ ce=%@ ev=%lld 实参=%lld/%lld\npb=%lu platSD=%d 卡态=%d 待直播=%d 已检=%d %@\ntmax=%.0f cts=%.0f 日=%lld 目标=%lld rel=%lld\ncam=%p vcam=%p src=%@\n首段=%@",
-            (unsigned long)segN, sdMode, ceTxt, evN, g_lastLoadType, g_lastLoadDay,
+    return [NSString stringWithFormat:@"段=%lu 入SD=%@ ce=%@ ev=%lld rtc=%ld 实参=%lld/%lld\npb=%lu platSD=%d 卡态=%d 待直播=%d 已检=%d %@\ntmax=%.0f cts=%.0f 日=%lld 目标=%lld rel=%lld\ncam=%p vcam=%p src=%@\n首段=%@",
+            (unsigned long)segN, sdMode, ceTxt, evN, (long)g_rtcVdlCount, g_lastLoadType, g_lastLoadDay,
             (unsigned long)pbType, isSD ? 1 : 0,
             cardState, startLive ? 1 : 0, statusChecked ? 1 : 0, lmTxt,
             tmax, cts, day, sec, rel, (void *)cam, (void *)vcCam, src ? src : @"-", firstSeg];
@@ -883,6 +885,12 @@ static void ja_didEnterLive(id self, SEL _cmd) {
 // v4.13.3：官方拉录像列表的真实入参（学一次，写盘）
 static IMP g_orig_load_type = NULL;
 static IMP g_orig_load_day = NULL;
+static IMP g_orig_rtc_vdl = NULL;
+
+static void ja_rtc_viewDidLoad(id self, SEL _cmd) {
+    g_rtcVdlCount++;
+    if (g_orig_rtc_vdl) ((void (*)(id, SEL))g_orig_rtc_vdl)(self, _cmd);
+}
 
 static void ja_load_record_type(id self, SEL _cmd, long long t) {
     g_lastLoadType = t;
@@ -896,6 +904,7 @@ static void ja_load_record_day(id self, SEL _cmd, long long d) {
 
 static void JAHookRtcExtras(Class cls) {
     if (!cls) return;
+    JASetImp(cls, @selector(viewDidLoad), (IMP)ja_rtc_viewDidLoad, &g_orig_rtc_vdl);
     JASetImp(cls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
     JASetImp(cls, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
     JASetImp(cls, @selector(shouldBlockLiveUIBecauseSDUnavailable),
@@ -1227,40 +1236,19 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-            // v4.13.5：官方页实测 入SD=1 / tmax=当天最后一秒；我们页 入SD=0 / tmax=86400。
-            // tmax=86400 等于"今天只到零点"，服务端只回事件条数；入SD 是进 SD 播放模式的开关。
+            // v4.13.7：回归"只定位、绝不碰列表"。v4.13.6 那记 switchToSDDay 兜底把
+            // setupData 已经拉好的段清成了 0（段=0 首段=- 就是这么来的），这里全部撤掉。
+            // 官方页 tmax 实测是 日+86400（1794672000 → 1794758400）。
             long long d0x = JADayStartSec(@(sec));
-            JASet(self, @"todayMaxTimestamp", @((double)(d0x + 86399LL)));
-            // v4.13.6：点号 keyPath 上次没生效（诊断仍读到 入SD=0）。先取出 viewModel 对象
-            // 再单独置位，两条路都试；置上之后立刻让它按"当天 + 全天范围"重新拉一次段。
-            id vm = JAVal(self, @"viewModel");
-            if (![vm isKindOfClass:[NSObject class]]) vm = nil;
-            if (vm) {
-                JASet(vm, @"isEnterSDPlay", @YES);
-                JASet(vm, @"todayMaxTimestamp", @((double)(d0x + 86399LL)));
-            }
-            @try { [self setValue:@YES forKeyPath:@"viewModel.isEnterSDPlay"]; }
-            @catch (NSException *ex) {}
-            SEL sw = NSSelectorFromString(@"switchToSDDay:dateString:");
+            JASet(self, @"todayMaxTimestamp", @((double)(d0x + 86400LL)));
             SEL sp = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
             if ([self respondsToSelector:sp]) {
-                ((void(*)(id, SEL, long long))objc_msgSend)(self, sp, sec);
+                ((void (*)(id, SEL, long long))objc_msgSend)(self, sp, sec);
             }
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
                 JATimeLineSyncToSec(self, sec);
-                // v4.13.6：段数还是不够（官方能到 299，正常一天至少上百条）→ 说明 setupData
-                // 那次请求的范围不对。此时才用"按天 + 日期字符串"正式重拉一次兜底，
-                // 避免一进来就把已有列表清空。
-                NSInteger got = JAGridValidEventCount(self);
-                if (got < 50 && [self respondsToSelector:sw]) {
-                    NSDateFormatter *f = [[NSDateFormatter alloc] init];
-                    f.dateFormat = @"yyyy-MM-dd";
-                    NSString *ds = [f stringFromDate:[NSDate dateWithTimeIntervalSince1970:(NSTimeInterval)sec]];
-                    @try { ((void (*)(id, SEL, long long, id))objc_msgSend)(self, sw, d0x, ds); }
-                    @catch (NSException *ex) {}
-                }
             });
         });
         return;
