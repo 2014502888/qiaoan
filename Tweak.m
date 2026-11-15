@@ -780,6 +780,18 @@ static void JAPrepareSDPlatform(id cam) {
     JASet(plat, @"playBackActionType", @(t));
     // isSDPlayer：我们这次就是进 SD 播放器，语义确定，直接置 YES
     JASet(plat, @"isSDPlayer", @YES);
+    // v3.5：把设备通道连上。官方那两个入口能用的真正原因在这里 ——
+    // 详情页/直播页进回放前 JADevicePlatform 已经连云着这台设备，SD 回放页
+    // 顺着已有通道就能取到该日录像段（时间轴才有颜色）；格子是从云回放页/首页
+    // 进来的，平台当时并没有连这台设备 → 取不到段 → 时间轴空白、只能播现在。
+    // 走一次官方回放后通道被连起来且保持，所以之后格子也正常 —— 正好对上实测。
+    SEL selConnect = NSSelectorFromString(@"connectCamera");
+    SEL selLive = NSSelectorFromString(@"live");
+    if (cam && [plat respondsToSelector:selConnect]) {
+        ((void(*)(id, SEL))objc_msgSend)(plat, selConnect);
+    } else if (cam && [plat respondsToSelector:selLive]) {
+        ((void(*)(id, SEL))objc_msgSend)(plat, selLive);
+    }
 }
 
 // v1.15 核心：JANewRtcSDPlayViewController viewDidAppear（官方本地 SD 回放界面）
