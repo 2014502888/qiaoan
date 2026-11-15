@@ -861,6 +861,28 @@ static id JAPrepareSDPlatform(id cam) {
     } else if (cam && [plat respondsToSelector:selLive]) {
         ((void(*)(id, SEL))objc_msgSend)(plat, selLive);
     }
+
+    // v4.0：把设备交给 JALiveManager —— 它才是「当前正连着哪台设备」的唯一持有者。
+    // 实测铁证：冷启动直接点格子不行；先点一次「查看录像」再回来，每一格都行。
+    // 说明那次操作让某个全局单例记住了"当前设备"，之后所有页面都沿用。
+    // dump JALiveManager（objc_dump17）拿到它对外交接设备的正规入口：
+    //     - delegateCamera:isSDCardPage:   ← 带"这是 SD 卡页"标记
+    //     - delegateCamera:
+    //     - connectionDeviceCamera:
+    // 我们以前从来没调用过它们，只有 JADevicePlatform 那条 connectCamera 在空转。
+    if (cam) {
+        Class lmCls = NSClassFromString(@"JALiveManager");
+        id lm = lmCls ? JAVal((id)lmCls, @"sharedInstance") : nil;
+        if (lm) {
+            SEL s1 = NSSelectorFromString(@"delegateCamera:isSDCardPage:");
+            SEL s2 = NSSelectorFromString(@"delegateCamera:");
+            if ([lm respondsToSelector:s1]) {
+                @try { ((void(*)(id, SEL, id, BOOL))objc_msgSend)(lm, s1, cam, YES); } @catch (NSException *e) {}
+            } else if ([lm respondsToSelector:s2]) {
+                @try { ((void(*)(id, SEL, id))objc_msgSend)(lm, s2, cam); } @catch (NSException *e) {}
+            }
+        }
+    }
     return cam;
 }
 
