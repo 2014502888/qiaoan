@@ -273,6 +273,10 @@
 
 // ---------- KVC 工具 ----------
 
+// v4.14：运行日志。走 NSLog → 系统日志，电脑端 USB 直接读，不用截图。
+// 必须放在文件靠前处 —— 后面的函数都要用；宏不会前向生效。
+#define JALog(fmt, ...) NSLog((@"[JASD] " fmt), ##__VA_ARGS__)
+
 static id JAVal(id obj, NSString *key) {
     if (!obj) return nil;
     @try { return [obj valueForKey:key]; }
@@ -902,8 +906,6 @@ static void ja_didEnterLive(id self, SEL _cmd) {
 static IMP g_orig_load_type = NULL;
 static IMP g_orig_load_day = NULL;
 static IMP g_orig_rtc_vdl = NULL;
-// v4.14：运行日志。走 NSLog → 系统日志，电脑端 USB 直接读，不用截图
-#define JALog(fmt, ...) NSLog((@"[JASD] " fmt), ##__VA_ARGS__)
 
 // 该页当前持有的录像段数组摘要（条数/首元素类名），用来判断"是谁把它填满的"
 static NSString *JASDArrDesc(id vc) {
