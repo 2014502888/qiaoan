@@ -737,11 +737,24 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
             if ([self respondsToSelector:s]) {
                 ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
             }
-            // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到定位时间点
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+            // v3.1：同参再调一次。
+            // 第一次调用时官方 _isEnterSDPlay 多半还是 NO（3.0s 那句 stopSDPlay 把它打成 NO，
+            // 而且此刻流正在重建 —— 就是界面上那个加载进度），于是官方走的是"startSDPlay
+            // 无时间戳分支"：流建起来就播最新，报警秒被忽略 → 时间轴对、画面不对。
+            // 等流建好，_isEnterSDPlay 会回到 YES，这时同参再调一次就走 seek 分支，真正落到段秒。
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                JATimeLineSyncToSec(self, sec);
+                SEL s2 = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
+                if ([self respondsToSelector:s2]) {
+                    ((void(*)(id, SEL, long long))objc_msgSend)(self, s2, sec);
+                }
+                // v1.18：定位已发出，再等 1.5s 拨时间轴指示器到定位时间点
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                    JATimeLineSyncToSec(self, sec);
+                });
             });
         });
     });
