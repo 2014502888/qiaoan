@@ -1914,7 +1914,7 @@ static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam
     rq.timeoutInterval = 12.0;
     NSURLSessionDataTask *t = [[NSURLSession sharedSession]
         dataTaskWithRequest:rq completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
-            UIImage *img = nil;
+            __block UIImage *img = nil;   // v2.9.53：下面解密在 dispatch_sync block 里赋值，必须 __block，否则编译失败
             if (data) { @autoreleasepool { img = [UIImage imageWithData:data]; } }
             // v2.9.52：这里原来是无条件在后台队列里直接调解密 —— 两个问题：
             // ① 乔安服务器（1345）的图本来就能直接解，却也会进这段，没必要；
@@ -1923,11 +1923,18 @@ static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam
             //    回放页正靠它绑设备，于是 1345 也被带歪。
             // 现在：只对华为云 OBS 的加密图解密，并且串行回主队列执行，一次一张，不并发。
             if (!img && data.length && JAIsEncryptedCoverURL(url)) {
-                dispatch_sync(dispatch_get_main_queue(), ^{
+                // v2.9.53：当前若已在主线程就直接调，不能再 dispatch_sync 到主队列（会死锁）。
+                if ([NSThread isMainThread]) {
                     @autoreleasepool {
                         img = JADecryptImageDataWithCamera(data, url, self.cam);
                     }
-                });
+                } else {
+                    dispatch_sync(dispatch_get_main_queue(), ^{
+                        @autoreleasepool {
+                            img = JADecryptImageDataWithCamera(data, url, self.cam);
+                        }
+                    });
+                }
             }
             if (!img) {
                 // v2.9.23：记 HTTP 状态码（403/404）
