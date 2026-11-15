@@ -632,6 +632,9 @@ static unsigned long long g_rtcVdaGen = 0;
 // g_rtcOfficialPending：点格子时置 YES，官方链把 SD 页 push 出来时由 hook 认领它
 // g_rtcOfficialMode：认领成功后置 YES —— 该页的段是官方自己拉满的，只补一刀定位
 static BOOL g_rtcOfficialPending = NO;
+// 点一次格子只允许自动重开一次：实测同一进程第 1 次进页只得 22 条事件，
+// 第 2 次进页一出生就有 360+ 条录像段，所以首次拿不满就自动重开一次。
+static BOOL g_rtcRetriedOnce = NO;
 static BOOL g_rtcOfficialMode = NO;
 // v4.13.3：官方页拉录像列表时传的真实入参（诊断条显示，学一次就知道该传什么）
 static long long g_lastLoadType = -1;
@@ -1451,22 +1454,30 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     // 绝不能再 stopSDPlay / switchToSDDay / 重拉段：那套是给"自造页救段"用的，
     // 在官方页上做会把刚拉好的 269 段直接冲成十几条。
     if (g_rtcOfficialMode) {
-        // v4.20.1：实测第 1 次进页面 1 秒后 arr=22，而第 2 次进页面"一出生就有 360 条"。
-        // 说明数据不是拿不到，是到得晚：原逻辑 1.2 秒就起播，等于拿 22 条去开播，
-        // 时间轴自然只剩零星几段、拖了也不回放。改成等段数到齐（≥150）再起播，最多等 20 秒。
-        __block int tries2 = 0;
-        __block void (^poll2)(void);
-        poll2 = ^{
+        // v4.21.0 定案（21:28 两轮实测）：
+        //   第 1 次进页 arr 从 1 次查到 41 次（20 秒）恒为 22，起播后(post)又盯 14 秒仍是 22
+        //   —— 这个页面自己永远不会把录像段补上来。
+        //   但 v4.18.0 同一进程第 2 次进页"一出生就有 360 条"，第 3 次 367 条。
+        // 所以解法不是"再等"，而是：首次拿不满就自动重开一次页面（同进程第二次必得满段），
+        // 用户只看到一次进入，重开无动画。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
             int n = JASDArrCount(self);
-            tries2++;
-            if (n < 150 && tries2 <= 40) {
-                if (tries2 == 1 || tries2 % 4 == 0) JALog(@"VDA wait arr=%d tries=%d", n, tries2);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), poll2);
+            JALog(@"VDA probe arr=%d retried=%d", n, (int)g_rtcRetriedOnce);
+            if (n < 150 && !g_rtcRetriedOnce) {
+                g_rtcRetriedOnce = YES;
+                id cam2 = JAVal(self, @"myCamera");
+                id selfVc = self;
+                JALog(@"VDA reopen once arr=%d cam=%p", n, (__bridge void *)cam2);
+                g_activeSDPlayer = nil;
+                [[(id)selfVc navigationController] popViewControllerAnimated:NO];
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    JATryOpenSDReplayAt(nil, nil, cam2, sec);
+                });
                 return;
             }
-            JALog(@"VDA data ready arr=%d tries=%d", n, tries2);
             long long d0x = JADayStartSec(@(sec));
             JASet(self, @"todayMaxTimestamp", @((double)(d0x + 86400LL)));
             SEL sp = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
@@ -1474,35 +1485,12 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
                 ((void (*)(id, SEL, long long))objc_msgSend)(self, sp, sec);
             }
             JALog(@"VDA start sec=%lld arr=%d", sec, n);
-            // v4.20.2：实测 arr 从 1 次查到 41 次（20 秒）一直是 22，页面自己不会补数据。
-            // 但第 2 次进页面"一出生就有 360"，所以那份数据是建页时从别处读进来的，
-            // 而把它写进去的很可能是"起播"这个动作。这里盯住起播之后数组会不会变。
-            __block int tries3 = 0;
-            __block void (^poll3)(void);
-            poll3 = ^{
-                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                int n2 = JASDArrCount(self);
-                tries3++;
-                JALog(@"VDA post arr=%d t=%d", n2, tries3);
-                if (n2 >= 150) {
-                    JALog(@"VDA post filled -> resync timeline");
-                    JATimeLineSyncToSec(self, sec);
-                }
-                if (tries3 < 12) {
-                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                                   dispatch_get_main_queue(), poll3);
-                }
-            };
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), poll3);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
                 JATimeLineSyncToSec(self, sec);
             });
-        };
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), poll2);
+        });
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
@@ -4225,6 +4213,7 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     g_rtcTargetSec = sec;
     g_rtcOfficialMode = NO;
     g_rtcOfficialPending = YES;
+    g_rtcRetriedOnce = NO;   // 每次点格子允许自动重开一次
     JALog(@"GRID CLICK sec=%lld day=%lld cam=%p devId=%@ warns=%lu ev0=%@",
           sec, JADayStartSec(@(sec)), (__bridge void *)self.myCamera,
           JAGridDeviceId(self.myCamera), (unsigned long)[warns count],
