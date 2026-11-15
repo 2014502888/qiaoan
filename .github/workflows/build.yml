@@ -33,6 +33,15 @@ jobs:
           name: build-log-v4.11.0
           path: build.log
 
+      - name: Annotate compile errors
+        if: always()
+        run: |
+          if [ -f build.log ]; then
+            grep "error:" build.log | head -20 | while IFS= read -r line; do
+              echo "::error::${line}"
+            done
+          fi
+
       - name: Upload dylib artifact
         if: success()
         uses: actions/upload-artifact@v4
