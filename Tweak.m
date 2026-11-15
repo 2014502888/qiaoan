@@ -621,8 +621,95 @@ static long long g_rtcTargetSec = 0; // 报警时间戳（秒），viewDidAppear
 // v1.20：viewDidAppear 世代去重（官方可能多次触发 → 只保留最后一次的 3.0s 定位）
 static unsigned long long g_rtcVdaGen = 0;
 
-static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
-    // 目标界面 = 官方本地 SD 回放 JANewRtcSDPlayViewController（RTC 完整播放器，
+// ---------- v4.3：诊断条（用户同意，用来定位"没段颜色"卡在哪一环） ----------
+// 只看三件事，别的都不看了：
+//   ① 官方 SD 页有没有拿到段列表（_sdRecordFileArr 条数）—— 时间轴上的红/黄/蓝段就是它渲染的
+//   ② 页内 ViewModel 的 isEnterSDPlay 是不是 YES —— 不是 YES 就说明整页按"直播"在跑
+//   ③ JALiveManager 的 回放态 / 无录像 两个全局开关，以及 cam 的 SD 支持字段
+static NSString *JADiagText(UIViewController *vc, id cam, long long sec) {
+    // ① 段列表条数
+    NSUInteger segN = 0;
+    @try {
+        id arr = [vc valueForKey:@"sdRecordFileArr"];
+        if ([arr respondsToSelector:@selector(count)]) segN = (NSUInteger)[arr performSelector:@selector(count)];
+    } @catch (NSException *e) {}
+
+    // ② 页内 ViewModel 的 isEnterSDPlay（注意：这个字段在 VM 上，不在 VC 上）
+    NSString *sdMode = @"?";
+    @try {
+        id vm = [vc valueForKey:@"viewModel"];
+        if (vm) {
+            id v = [vm valueForKey:@"isEnterSDPlay"];
+            sdMode = v ? ([v boolValue] ? @"1" : @"0") : @"nil";
+        } else {
+            sdMode = @"novm";
+        }
+    } @catch (NSException *e) { sdMode = @"err"; }
+
+    // ③ JALiveManager 全局开关
+    NSString *lmTxt = @"-";
+    Class lmCls = NSClassFromString(@"JALiveManager");
+    if (lmCls) {
+        id o = nil;
+        SEL s = NSSelectorFromString(@"sharedInstance");
+        if ([lmCls respondsToSelector:s]) {
+            @try { o = ((id(*)(id, SEL))objc_msgSend)((id)lmCls, s); } @catch (NSException *e) {}
+        }
+        if (o) {
+            BOOL eb = [JAVal(o, @"isEnterBackPlayer") boolValue];
+            BOOL nr = [JAVal(o, @"isSDNoRecord") boolValue];
+            lmTxt = [NSString stringWithFormat:@"回=%d 无录=%d", eb ? 1 : 0, nr ? 1 : 0];
+        }
+    }
+
+    // ④ cam 的 SD 字段（官方就是靠这些决定能不能回放）
+    NSString *camTxt = @"-";
+    if (cam) {
+        BOOL sup = [JAVal(cam, @"isSupportSDReplay") boolValue];
+        BOOL on = [JAVal(cam, @"isDevOnline") boolValue];
+        long long stat = [JAVal(cam, @"sdCardStatus") longLongValue];
+        long long today = [JAVal(cam, @"sdTodayTimeStamp") longLongValue];
+        long long selDay = [JAVal(cam, @"sdSelectiontDay") longLongValue];
+        camTxt = [NSString stringWithFormat:@"sup=%d on=%d stat=%lld today=%lld sel=%lld",
+                  sup ? 1 : 0, on ? 1 : 0, stat, today, selDay];
+    }
+
+    long long day = JADayStartSec(@(sec));
+    long long rel = sec - day;
+    return [NSString stringWithFormat:@"段=%lu 入SD=%@ %@\n日=%lld 目标=%lld rel=%lld\n%@",
+            (unsigned long)segN, sdMode, lmTxt, day, sec, rel, camTxt];
+}
+
+static void JADiagAttach(UIViewController *vc, long long sec, id cam) {
+    if (!vc) return;
+    NSArray *times = @[@1.2, @3.2, @5.2, @8.0];
+    for (NSNumber *tn in times) {
+        __weak UIViewController *wv = vc;
+        __weak id wc = cam;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(tn.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UIViewController *p = wv;
+            if (!p || !p.isViewLoaded) return;
+            UILabel *lab = (UILabel *)[p.view viewWithTag:0x1A66];
+            if (!lab) {
+                lab = [[UILabel alloc] initWithFrame:CGRectMake(8, 104, p.view.bounds.size.width - 16, 52)];
+                lab.tag = 0x1A66;
+                lab.numberOfLines = 0;
+                lab.font = [UIFont systemFontOfSize:11];
+                lab.textColor = [UIColor yellowColor];
+                lab.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.72];
+                lab.textAlignment = NSTextAlignmentLeft;
+                lab.layer.cornerRadius = 6;
+                lab.clipsToBounds = YES;
+                [p.view addSubview:lab];
+            }
+            lab.text = JADiagText(p, wc, sec);
+            [p.view bringSubviewToFront:lab];
+        });
+    }
+}
+
+static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {    // 目标界面 = 官方本地 SD 回放 JANewRtcSDPlayViewController（RTC 完整播放器，
     // 时间轴/日历/SD 卡检测/播放控制；用户手动进本地回放看到的就是它）。
     Class cls = NSClassFromString(@"JANewRtcSDPlayViewController");
     if (!cls) return;
@@ -672,6 +759,7 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     if (nav) {
         g_activeSDPlayer = vc;  // 登记当前活跃 RTC SD 播放器（viewDidAppear hook 守卫用）
         [nav pushViewController:vc animated:YES];
+        JADiagAttach(vc, g_rtcTargetSec, cam);
         // RTC 版是官方完整播放器，官方链自己建流 → 不做任何状态强制
     } else {
         [UIApplication.sharedApplication.keyWindow.rootViewController presentViewController:vc animated:YES completion:nil];
@@ -3553,6 +3641,7 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     UINavigationController *nav = self.navigationController;
     if (!nav) return;
     [nav pushViewController:vc animated:YES];
+    JADiagAttach(vc, sec, self.myCamera);
 
     // v2.9.8：官方 SD 回放页自带的时间轴/拖动条不再隐藏（用户要能自己拖）。
     // v2.8：画面右上角标出这一格的目标时间 —— 定位有没有生效靠这个角标和画面对照
