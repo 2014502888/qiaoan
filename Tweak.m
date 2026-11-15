@@ -1397,6 +1397,12 @@ static id JAOpenViaOfficialDetailUnsafe(UIViewController *host, id warn, id cam,
     // 只喂官方 click 分支真正会读的字段；不 push 它，所以不用管 UI 需要什么
     @try {
         JASet(dvc, @"warnInfoEntityModelEx", warn);
+        // v4.13 —— 关键：官方 click 会按 _playIndex 去 _warnInfoListArr 取"当前这一条"
+        // （该类的真实 ivar 是 _playIndex / _warnInfoListArr / _deviceId / _devicePwd）。
+        // v4.12 只塞了单条消息、没塞列表和索引 → 它取不到当前条 → 不建 SD 页。
+        // 这里只放当前这一条、索引固定 0，既保证取得到，也保证绝不会越界（v4.12.0 闪退就是越界）。
+        JASet(dvc, @"warnInfoListArr", @[warn]);
+        JASet(dvc, @"playIndex", @0);
         NSString *devId = JAGridDeviceId(cam);
         if (devId.length > 0) JASet(dvc, @"deviceId", devId);
         id pwd = JAVal(cam, @"viewPwd");
@@ -3864,10 +3870,12 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     g_rtcOfficialPending = YES;
     id vc = JATryOpenViaOfficialDetail(self, ev0, self.myCamera, sec, [warns copy]);
     if (!vc) {
-        // 官方链没建起来（极少见）→ 退回自造页，至少保证能进页面
+        // 官方链没建起来 → 退回自造页，至少保证能进页面
         g_rtcOfficialPending = NO;
         g_rtcOfficialMode = NO;
         vc = JATryOpenSDReplayAt(self, ev0, self.myCamera, sec);
+        // 诊断条 src 标成"官方链nil"，一眼能看出这次是官方链失败、走了兜底
+        if (vc) JADiagAttach(vc, sec, self.myCamera, @"官方链nil");
     }
     if (!vc) return;
 
