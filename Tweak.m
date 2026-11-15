@@ -635,6 +635,8 @@ static BOOL g_rtcOfficialPending = NO;
 // 点一次格子只允许自动重开一次：实测同一进程第 1 次进页只得 22 条事件，
 // 第 2 次进页一出生就有 360+ 条录像段，所以首次拿不满就自动重开一次。
 static BOOL g_rtcRetriedOnce = NO;
+// 点格子时的告警模型，重开页面时原样带上（实测第 2 次进页 currentEvent 是有值的）
+static id g_rtcLastWarn = nil;
 static BOOL g_rtcOfficialMode = NO;
 // v4.13.3：官方页拉录像列表时传的真实入参（诊断条显示，学一次就知道该传什么）
 static long long g_lastLoadType = -1;
@@ -1470,12 +1472,15 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
                 id cam2 = JAVal(self, @"myCamera");
                 id selfVc = self;
                 JALog(@"VDA reopen once arr=%d cam=%p", n, (__bridge void *)cam2);
-                g_activeSDPlayer = nil;
-                [[(id)selfVc navigationController] popViewControllerAnimated:NO];
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    JATryOpenSDReplayAt(nil, nil, cam2, sec);
-                });
+                // 顺序很关键：先把新页叠上去（沿用同一个 nav），再把旧页从栈里摘掉。
+                // 反过来先 pop 会露出下面的格子页/首页，用户看到的是"变成实时监控"。
+                UINavigationController *nav2 = [(id)selfVc navigationController];
+                JATryOpenSDReplayAt((UIViewController *)selfVc, g_rtcLastWarn, cam2, sec);
+                if (nav2) {
+                    NSMutableArray *st = [nav2.viewControllers mutableCopy];
+                    [st removeObject:selfVc];
+                    [nav2 setViewControllers:st animated:NO];
+                }
                 return;
             }
             long long d0x = JADayStartSec(@(sec));
@@ -4214,6 +4219,7 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     g_rtcOfficialMode = NO;
     g_rtcOfficialPending = YES;
     g_rtcRetriedOnce = NO;   // 每次点格子允许自动重开一次
+    g_rtcLastWarn = ev0;
     JALog(@"GRID CLICK sec=%lld day=%lld cam=%p devId=%@ warns=%lu ev0=%@",
           sec, JADayStartSec(@(sec)), (__bridge void *)self.myCamera,
           JAGridDeviceId(self.myCamera), (unsigned long)[warns count],
