@@ -1206,7 +1206,8 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
             NSInteger n0 = [segArr0 isKindOfClass:[NSArray class]]
                            ? (NSInteger)[(NSArray *)segArr0 count] : 0;
             if (n0 <= 0 && !g_rtcWarmedOnce) {
-                UINavigationController *nav0 = self.navigationController;
+                // 注意：这里的 self 是 C 函数里的 id，点语法取属性会编译报错，必须用消息
+                UINavigationController *nav0 = [self navigationController];
                 if (nav0 && nav0.viewControllers.count >= 2) {
                     g_rtcWarmedOnce = YES;
                     [nav0 popViewControllerAnimated:NO];
