@@ -584,6 +584,8 @@ static void JAHookRtcExtras(Class cls);
 static id JAPrepareSDPlatform(id cam);
 // v3.9：按设备 ID 取 camera（JAGridDeviceId 定义在后，前置声明）
 static NSString *JAGridDeviceId(id cam);
+// v4.4：诊断条要读 JADevicePlatform 上的回放状态（定义在后）
+static id JADevicePlatformShared(void);
 static NSArray *JAGridFindEvents(id vc);
 static NSNumber *JAGridTimestamp(id ev);
 
@@ -627,14 +629,23 @@ static unsigned long long g_rtcVdaGen = 0;
 //   ② 页内 ViewModel 的 isEnterSDPlay 是不是 YES —— 不是 YES 就说明整页按"直播"在跑
 //   ③ JALiveManager 的 回放态 / 无录像 两个全局开关，以及 cam 的 SD 支持字段
 static NSString *JADiagText(UIViewController *vc, id cam, long long sec) {
-    // ① 段列表条数
+    // ① 段列表条数 + 第一条长什么样（判断是"录像段"还是"告警事件"）
     NSUInteger segN = 0;
+    NSString *firstSeg = @"-";
     @try {
         id arr = [vc valueForKey:@"sdRecordFileArr"];
-        if ([arr respondsToSelector:@selector(count)]) segN = (NSUInteger)[arr performSelector:@selector(count)];
+        if ([arr respondsToSelector:@selector(count)]) {
+            segN = (NSUInteger)[arr performSelector:@selector(count)];
+            if (segN > 0) {
+                id f = [arr performSelector:@selector(objectAtIndex:) withObject:@(0)];
+                NSString *d = [f description];
+                if (d.length > 96) d = [d substringToIndex:96];
+                firstSeg = d;
+            }
+        }
     } @catch (NSException *e) {}
 
-    // ② 页内 ViewModel 的 isEnterSDPlay（注意：这个字段在 VM 上，不在 VC 上）
+    // ② 页内 ViewModel 的 isEnterSDPlay
     NSString *sdMode = @"?";
     @try {
         id vm = [vc valueForKey:@"viewModel"];
@@ -646,7 +657,24 @@ static NSString *JADiagText(UIViewController *vc, id cam, long long sec) {
         }
     } @catch (NSException *e) { sdMode = @"err"; }
 
-    // ③ JALiveManager 全局开关
+    // ③ 官方 SD 页自己的两个关键布尔（决定它要不要退回实时）
+    BOOL cardState = 0, startLive = 0, statusChecked = 0;
+    @try {
+        cardState = [[vc valueForKey:@"sdCardState"] intValue];
+        startLive = [[vc valueForKey:@"shouldStartLiveAfterSDCheck"] boolValue];
+        statusChecked = [[vc valueForKey:@"sdStatusChecked"] boolValue];
+    } @catch (NSException *e) {}
+
+    // ④ JADevicePlatform 上那两个回放状态（v3.3 学的那对，正确/错误页一对比就知道真值）
+    NSUInteger pbType = 0;
+    BOOL isSD = NO;
+    id plat = JADevicePlatformShared();
+    if (plat) {
+        pbType = (NSUInteger)[[JAVal(plat, @"playBackActionType") unsignedIntegerValue] unsignedLongLongValue];
+        isSD = [JAVal(plat, @"isSDPlayer") boolValue];
+    }
+
+    // ⑤ JALiveManager 全局开关
     NSString *lmTxt = @"-";
     Class lmCls = NSClassFromString(@"JALiveManager");
     if (lmCls) {
@@ -658,26 +686,17 @@ static NSString *JADiagText(UIViewController *vc, id cam, long long sec) {
         if (o) {
             BOOL eb = [JAVal(o, @"isEnterBackPlayer") boolValue];
             BOOL nr = [JAVal(o, @"isSDNoRecord") boolValue];
-            lmTxt = [NSString stringWithFormat:@"回=%d 无录=%d", eb ? 1 : 0, nr ? 1 : 0];
+            NSInteger dt = [[JAVal(o, @"detectType") description] integerValue];
+            lmTxt = [NSString stringWithFormat:@"回=%d 无录=%d 侦=%ld", eb ? 1 : 0, nr ? 1 : 0, (long)dt];
         }
-    }
-
-    // ④ cam 的 SD 字段（官方就是靠这些决定能不能回放）
-    NSString *camTxt = @"-";
-    if (cam) {
-        BOOL sup = [JAVal(cam, @"isSupportSDReplay") boolValue];
-        BOOL on = [JAVal(cam, @"isDevOnline") boolValue];
-        long long stat = [JAVal(cam, @"sdCardStatus") longLongValue];
-        long long today = [JAVal(cam, @"sdTodayTimeStamp") longLongValue];
-        long long selDay = [JAVal(cam, @"sdSelectiontDay") longLongValue];
-        camTxt = [NSString stringWithFormat:@"sup=%d on=%d stat=%lld today=%lld sel=%lld",
-                  sup ? 1 : 0, on ? 1 : 0, stat, today, selDay];
     }
 
     long long day = JADayStartSec(@(sec));
     long long rel = sec - day;
-    return [NSString stringWithFormat:@"段=%lu 入SD=%@ %@\n日=%lld 目标=%lld rel=%lld\n%@",
-            (unsigned long)segN, sdMode, lmTxt, day, sec, rel, camTxt];
+    return [NSString stringWithFormat:@"段=%lu 入SD=%@ pb=%lu platSD=%d\n卡态=%d 待直播=%d 已检=%d %@\n日=%lld 目标=%lld rel=%lld\n首段=%@",
+            (unsigned long)segN, sdMode, (unsigned long)pbType, isSD ? 1 : 0,
+            cardState ? 1 : 0, startLive ? 1 : 0, statusChecked ? 1 : 0, lmTxt,
+            day, sec, rel, firstSeg];
 }
 
 static void JADiagAttach(UIViewController *vc, long long sec, id cam) {
@@ -692,7 +711,7 @@ static void JADiagAttach(UIViewController *vc, long long sec, id cam) {
             if (!p || !p.isViewLoaded) return;
             UILabel *lab = (UILabel *)[p.view viewWithTag:0x1A66];
             if (!lab) {
-                lab = [[UILabel alloc] initWithFrame:CGRectMake(8, 104, p.view.bounds.size.width - 16, 52)];
+                lab = [[UILabel alloc] initWithFrame:CGRectMake(8, 100, p.view.bounds.size.width - 16, 76)];
                 lab.tag = 0x1A66;
                 lab.numberOfLines = 0;
                 lab.font = [UIFont systemFontOfSize:11];
