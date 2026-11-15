@@ -304,6 +304,16 @@
 //   早把这台设备设进 JADevicePlatform 了；我们自己写的格子页是从没碰过它的 —— 官方进去
 //   连的是上一次的设备或空 → 拉不到段 → 时间轴整条空白。修法：格子页 push 之前，
 //   把 myCamera 通过 setCurrentCamera: / setMyCamera: 设进 JADevicePlatform.sharedInstance。
+//   —— 实测 v2.9.41 仍无颜色。不再"照着补参数"，改为直接复用那条验证过的链 ——> v2.9.42。
+// v2.9.42（正确做法：格子页不再自己拼 push，直接复用「消息列表 → 看录像」同一条链）：
+//   「看录像」入口点的是详情页 clickCloudRecordAction:，我们 hook 成 JATryOpenSDReplay ——
+//   这条链**用户实测时间轴有颜色**，且它内部已经把该做的全做了（myCamera / currentEvent /
+//   currentTimeStamp 双源校正秒 / myCamera.sdSelectiontDay=报警日 / g_rtcTargetSec /
+//   g_activeSDPlayer / RTC hook 补装 / push）。格子页却另写了一套 openPlayerAtIndex 去"照着补"，
+//   v2.9.39/40/41 三版补参数都没成 —— 两套代码再像也不是同一套。
+//   改法：openPlayerAtIndex 里直接调 JATryOpenSDReplay(self, ev, myCamera)（ev 就是
+//   entry[@"ev"] 那个原始报警模型），之后只把 g_rtcTargetSec 校正成格子显示的秒。
+//   JADevicePlatform 的设备上下文仍补一次（格子页是自定义 VC，官方详情页早就设好了）。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -3333,26 +3343,25 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     if (index < 0 || index >= (NSInteger)self.flat.count) return;
     NSDictionary *entry = self.flat[index];
     long long sec = [(NSNumber *)entry[@"sec"] longLongValue];
+    if (sec <= 0) return;
+    id ev = (id)entry[@"ev"];
+    self.playIndex = index;
 
-    Class rtc = NSClassFromString(@"JANewRtcSDPlayViewController");
-    if (!rtc) return;
+    NSIndexPath *ip = [self indexPathForFlat:index];
+    if (ip) [self.cv scrollToItemAtIndexPath:ip
+                           atScrollPosition:UICollectionViewScrollPositionCenteredVertically
+                                   animated:NO];
 
-    // v2.8：RTC hooks 补装（和详情页链路一致）—— 少了这个，viewDidAppear 不会
-    // 触发定位，进去就只剩官方自动播的最新实时画面
-    if (!g_rtcHooked) {
-        JASetImp(rtc, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
-        JASetImp(rtc, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
-        g_rtcHooked = YES;
-    }
-
-    id vc = [[rtc alloc] init];
-
-    // v2.9.41（换方向：问题不在播放页参数，在"进入前的全局设备上下文"）：
-    // 官方 SD 播放页是拿 JADevicePlatform.sharedInstance 里的设备上下文去建 P2P 连接、
-    // 再拉该日录像段的（该类有 setMyCamera: / setCurrentCamera: / connectCamera / setIsSDPlayer:）。
-    // 「消息列表 → 查看录像」之所以有时间轴颜色，是因为详情页早就把这台设备设进去了；
-    // 而我们自己写的格子页从头到尾没碰过它 —— 官方进去连的是上一次的设备或空，
-    // 拉不到段 → sdRecordFileArr 空 → 时间轴整条空白。这里 push 前补设一次。
+    // v2.9.42（换做法：不再照着「看录像」补参数，而是**直接用同一条链**）：
+    // 前面 v2.9.39/40/41 一直在给格子页"补"消息链有而它没有的东西（currentSelectedSDDay、
+    // currentEvent、JADevicePlatform 上下文），三版都没成。问题在于格子页自己拼了一套 push，
+    // 而「消息列表 → 看录像」走的是 JATryOpenSDReplay —— 那条是用户实测**时间轴有颜色**的
+    // 完整实现，里面已经把该做的全做了：myCamera、currentEvent、currentTimeStamp（双源校正后
+    // 的秒）、myCamera.sdSelectiontDay = 报警日、g_rtcTargetSec、g_activeSDPlayer、
+    // RTC hook 补装、push。两套代码再像也不是同一套，所以直接复用，行为必然一致。
+    //
+    // 全局设备上下文仍要补一次：详情页进 SD 回放前，官方早已把这台设备设进 JADevicePlatform
+    // （官方播放页靠它建 P2P 连接、拉该日录像段）；格子页是自定义 VC，从没设过。
     Class dpc = NSClassFromString(@"JADevicePlatform");
     if (dpc && self.myCamera) {
         id shared = nil;
@@ -3374,34 +3383,16 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
         }
     }
 
-    @try { [vc setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
-    // v2.9.40（时间轴整条没颜色的真凶）：和「消息列表 → 查看录像」对齐 —— 那条链路
-    // 比格子多传了一样东西：currentEvent（原始报警模型）。官方 setupData 会读它来决定
-    // 要装载哪一天、哪一段录像；没有它就直接退回「今日」，而今日往往没录像 →
-    // sdRecordFileArr 为空 → 时间轴整条空白（一点颜色都没有），后面 start 定位自然也播不出。
-    // 用户实测：「消息里的查看录像就有颜色，格子回放没有」——差别就在这一行。
-    id ev = (id)entry[@"ev"];
-    if (ev) JASet(vc, @"currentEvent", ev);
-    JASet(vc, @"currentTimeStamp", @(sec));
-    JASet(self.myCamera, @"sdSelectiontDay", @(JADayStartSec(@(sec))));
-
-    // 复用 v1.28 定位链路：viewDidAppear 后 3.0s 自动定位到 g_rtcTargetSec
+    // 复用「消息列表 → 看录像」同一条链路（ev 为 nil 时只有缓存条目，仍然能进页面）
+    JATryOpenSDReplay(self, ev, self.myCamera);
+    id vc = g_activeSDPlayer;
+    if (!vc) return;
+    // 以格子显示的这个秒为准 —— 用户点的就是这一格，播的也必须是这一格
     g_rtcTargetSec = sec;
-    g_activeSDPlayer = vc;
-    self.playIndex = index;
+    if (ev) JASet(vc, @"currentTimeStamp", @(sec));
     self.playingVC = vc;
 
-    NSIndexPath *ip = [self indexPathForFlat:index];
-    if (ip) [self.cv scrollToItemAtIndexPath:ip
-                           atScrollPosition:UICollectionViewScrollPositionCenteredVertically
-                                   animated:NO];
-
-    UINavigationController *nav = self.navigationController;
-    if (!nav) return;
-    [nav pushViewController:vc animated:YES];
-
-    // v2.9.8：官方 SD 回放页自带的时间轴/拖动条不再隐藏（用户要能自己拖）。
-    // v2.8：画面右上角标出这一格的目标时间 —— 定位有没有生效靠这个角标和画面对照
+    // v2.8：画面右上角标出这一格的目标时间（定位有没有生效靠角标和画面对照）
     __weak id wvc2 = vc;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -3422,8 +3413,7 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
         [p.view addSubview:lab];
     });
 
-    // v2.9.9：自动连播（35 秒自动跳下一格）已按用户要求去掉 —— 拖动条回来了，
-    // 播放完全由用户自己控制。
+    // v2.9.9：自动连播（35 秒自动跳下一格）已按用户要求去掉。
 }
 
 // ---------- v2.8：右上角日期选择器（月历 + 有录像日期红点） ----------
