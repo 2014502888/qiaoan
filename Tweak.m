@@ -3114,6 +3114,13 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
 
     id vc = [[rtc alloc] init];
     @try { [vc setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
+    // v2.9.55：照搬「消息列表 → 查看录像」那条链 —— 它会把这条报警消息本身作为
+    // currentEvent 挂到播放页上，官方 setupData 靠它确定"初始选中的就是这条记录/这个时刻"。
+    // 格子链从 v1.x 起一直没传这个，官方拿不到当前事件，只能按默认（今日/最新）来，
+    // 于是进页面播的是实时，后面 startSDPlayWithSelectTimeStamp: 也定位不到那条段。
+    // 这是两条链唯一实质差异（详情链 JATryOpenSDReplay 里就有这一句），补上对齐。
+    id ev = entry[@"ev"];
+    if (ev) JASet(vc, @"currentEvent", ev);
     JASet(vc, @"currentTimeStamp", @(sec));
     JASet(self.myCamera, @"sdSelectiontDay", @(JADayStartSec(@(sec))));
 
