@@ -622,6 +622,12 @@ static IMP g_orig_rtc_vdd = NULL;    // 原 viewDidDisappear: IMP（v1.30 返回
 static long long g_rtcTargetSec = 0; // 报警时间戳（秒），viewDidAppear 后自动定位播放
 // v1.20：viewDidAppear 世代去重（官方可能多次触发 → 只保留最后一次的 3.0s 定位）
 static unsigned long long g_rtcVdaGen = 0;
+// v4.11：冷启动自愈重进的参数备份（点格子时存，检测到"一段都没拉到"就用它再进一次）
+static id g_rtcReopenDetailVC = nil;
+static id g_rtcReopenWarn = nil;
+static id g_rtcReopenCam = nil;
+static long long g_rtcReopenSec = 0;
+static BOOL g_rtcWarmedOnce = NO;   // 每次点格子允许自愈一次，防无限重进
 
 // ---------- v4.3：诊断条（用户同意，用来定位"没段颜色"卡在哪一环） ----------
 // 只看三件事，别的都不看了：
@@ -820,6 +826,11 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
     // 3) push
     UINavigationController *nav = detailVC.navigationController;
     if (!nav) nav = JATopVC().navigationController;
+    // v4.11：备份进去的参数，供"冷启动自愈重进"用
+    g_rtcReopenDetailVC = detailVC;
+    g_rtcReopenWarn = warn;
+    g_rtcReopenCam = cam;
+    g_rtcReopenSec = forceSec > 0 ? forceSec : g_rtcTargetSec;
     if (nav) {
         g_activeSDPlayer = vc;  // 登记当前活跃 RTC SD 播放器（viewDidAppear hook 守卫用）
         [nav pushViewController:vc animated:YES];
@@ -1184,6 +1195,30 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+        // v4.11 —— 冷启动自愈。
+        // 实测三分表：冷启动直接点格子 = 段 0（不能回放）；消息详情→查看录像 = 段 271（能回放）；
+        // 看完录像再点格子 = 满屏红段且精准定位。差别只有一件：官方在**第一次进入**时会把
+        // 该设备当天的录像段在进程里初始化一遍，第二次进入直接复用。
+        // 所以这里一旦发现"一段都没拉到"，就自动退出去、隔 1 秒用同一套参数重进一次 ——
+        // 第二次就是"已经走过一次"的状态，和用户手点查看录像再回来完全等价。
+        @try {
+            id segArr0 = [self valueForKey:@"sdRecordFileArr"];
+            NSInteger n0 = [segArr0 isKindOfClass:[NSArray class]]
+                           ? (NSInteger)[(NSArray *)segArr0 count] : 0;
+            if (n0 <= 0 && !g_rtcWarmedOnce) {
+                UINavigationController *nav0 = self.navigationController;
+                if (nav0 && nav0.viewControllers.count >= 2) {
+                    g_rtcWarmedOnce = YES;
+                    [nav0 popViewControllerAnimated:NO];
+                    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                                   dispatch_get_main_queue(), ^{
+                        JATryOpenSDReplayAt(g_rtcReopenDetailVC, g_rtcReopenWarn,
+                                            g_rtcReopenCam, g_rtcReopenSec);
+                    });
+                    return;
+                }
+            }
+        } @catch (NSException *e) {}
         // v1.21：先停官方 viewDidLoad 自动起的流（避免双流并存交替渲染），再建定位流。
         // 每次进入都"停旧→建新"，绕开复用流上 seekSDPlay 前置闸门（0x103429ee0 bit0）
         // 导致的"第二次起偶发定位不生效/播最新"。
@@ -3696,6 +3731,8 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     }
 
     id ev0 = entry[@"ev"];
+    // v4.11：每次点格子都允许"冷启动自愈重进"一次
+    g_rtcWarmedOnce = NO;
     // v4.9 —— 按用户要求：**点格子就直接模拟一次「查看录像」**。
     // 不再自己 [[rtc alloc] init] 后往 VC 上一个个塞 ivar（currentEvent / currentTimeStamp /
     // todayMaxTimestamp / sdSelectiontDay 这一串），那条自造链实测段数只有 18 条、
