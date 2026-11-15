@@ -725,13 +725,31 @@ static IMP g_orig_setIsSDPlayer = NULL;
 static void ja_setPlayBackActionType(id self, SEL _cmd, NSUInteger t) {
     g_lastPlayBackType = t;
     g_hasPlayBackType = YES;
+    [[NSUserDefaults standardUserDefaults] setInteger:(NSInteger)t forKey:@"jasd_playBackType"];
     if (g_orig_setPlayBackType) ((void(*)(id, SEL, NSUInteger))g_orig_setPlayBackType)(self, _cmd, t);
 }
 
 static void ja_setIsSDPlayer(id self, SEL _cmd, BOOL v) {
     g_lastIsSDPlayer = v;
     g_hasIsSDPlayer = YES;
+    [[NSUserDefaults standardUserDefaults] setBool:v forKey:@"jasd_isSDPlayer"];
     if (g_orig_setIsSDPlayer) ((void(*)(id, SEL, BOOL))g_orig_setIsSDPlayer)(self, _cmd, v);
+}
+
+// v3.4：把学过的那套回放状态从本地存回来 —— 这样重启 App 后不必先走官方入口。
+static void JALoadPlayState(void) {
+    static BOOL loaded = NO;
+    if (loaded) return;
+    loaded = YES;
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    if ([ud objectForKey:@"jasd_playBackType"]) {
+        g_lastPlayBackType = (NSUInteger)[ud integerForKey:@"jasd_playBackType"];
+        g_hasPlayBackType = YES;
+    }
+    if ([ud objectForKey:@"jasd_isSDPlayer"]) {
+        g_lastIsSDPlayer = [ud boolForKey:@"jasd_isSDPlayer"];
+        g_hasIsSDPlayer = YES;
+    }
 }
 
 static id JADevicePlatformShared(void) {
@@ -754,8 +772,14 @@ static void JAPrepareSDPlatform(id cam) {
         @try { [plat setValue:cam forKey:@"myCamera"]; } @catch (NSException *e) {}
         @try { [plat setValue:cam forKey:@"currentCamera"]; } @catch (NSException *e) {}
     }
-    if (g_hasPlayBackType) JASet(plat, @"playBackActionType", @(g_lastPlayBackType));
-    if (g_hasIsSDPlayer)   JASet(plat, @"isSDPlayer", @(g_lastIsSDPlayer));
+    // v3.4：重启后也能直接用 —— 先把本地存过的真值读回来
+    JALoadPlayState();
+    // playBackActionType：学到过就用学到的真值；从没走过官方入口时用一个非零值兜底
+    // （0 = 直播/未知，正是"进来还按直播跑"的那个值，所以兜底不能是 0）
+    NSUInteger t = (g_hasPlayBackType && g_lastPlayBackType != 0) ? g_lastPlayBackType : 1;
+    JASet(plat, @"playBackActionType", @(t));
+    // isSDPlayer：我们这次就是进 SD 播放器，语义确定，直接置 YES
+    JASet(plat, @"isSDPlayer", @YES);
 }
 
 // v1.15 核心：JANewRtcSDPlayViewController viewDidAppear（官方本地 SD 回放界面）
