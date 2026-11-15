@@ -238,82 +238,13 @@
 //     （已有 %XX 原样保留，不会二次编码）。
 //   · 格子上失败文字细化：`失败 403`=被拒、`失败 e-1022`=被 ATS 拦、`失败 e-1001`=超时、
 //     `失败 e-1004`=连不上、`失败 e-1003`=DNS 不通、`失败 地址`=URL 非法没发出去。
-// v2.9.28：ProxyPin 抓到官方 UA 是 `Joolink/26101509371 CFNetwork/1312 Darwin/21.0.0`，
-//   我们上一版是自己拼的浏览器式 UA，差的远 —— 已改成照抄官方值，Accept 也改回 `*/*`。
-// v2.9.29：抓包对图片不敏感（三份 HAR 全是启动流量），改成「失败时让格子自己报域名」。
-// v2.9.30~32：底部诊断条逐步改成三行短文本（状态码|字节数 / 路径尾段 / 签名参数缩写 AK/Exp/Sg），
-//   标签 numberOfLines=0 换行、section 高度 92；发送前把 query 里的 '+' 转成 %2B
-//   （OBS 预签名 URL 的 Signature 是 base64，'+' 在 query 里会被当空格解码）。
-// v2.9.33：诊断再加「返回数据前 8 字节」—— 能不能出图，看这 16 个十六进制字符就知道。
-// v2.9.34（封面根因定案 + 修复）：第 2 台监控的抓拍图存在华为云 OBS
-//   qiaoan-thn.obs.cn-east-3.myhuaweicloud.com，文件名带 `_enc`。实测：
-//   HTTP 200、body 20982 字节，但头是 E8 2A 2D C4 F8 6C DA 93 —— 不是 JPEG 魔数
-//   FF D8 FF，是加密数据。所以跟地址、签名、UA、Referer、解码器统统无关。
-//   官方有 JADecryptionTool：+jaDecryptImagewithURL:withData:withCameraUID:withCameraPwd:，
-//   密钥由「设备 uid + 摄像头查看密码」在本地推出来（日志里的「AES Key: %@」就是这个），
-//   不需要联网取 key。本版直接从 MyCamera 取 uid/viewPwd（空则退 dev_pwd）调官方解密。
-//   **实测已出图**（第 2 台监控的格子回放显示真实抓拍画面）。
-// v2.9.35（撤掉排查期诊断）：图片出来了，但底部还挂着「封面失败 [403|382] 头=3C3F786D6C207665」
-//   —— 3C 3F 78 6D 6C = `<?xml`，这是 OBS 的 XML 错误体；Exp=1794680488 换算成时间是
-//   当天 02:21，请求时 URL 早已过期 → 403。而 firstFailInfo 只记第一次、不随后续成功清除，
-//   于是几小时前那条败仗一直留在底部。既然根因已定案修复，诊断整体撤掉：
-//   ① rebuildLayout 不再把 firstFailInfo 塞进底部提示条；
-//   ② 格子失败态从「失败 403 / 失败 e-1002 / 失败 qiaoan-th / 失败.jpg」收回成「无封面」。
-// v2.9.36（点格子不播 / 跳回实时）：实测两台监控是**两种不同**的毛病。
-//   第 2 台：官方 SD 回放页的时间轴整条空白、没有带颜色的录像段 —— 它的抓拍图是云存储的
-//     （华为云 OBS + _enc 加密），本地 SD 卡这天根本没有录像。旧逻辑在「列表为空」时照样
-//     先调 startSDPlayWithSelectTimeStamp: → 官方去拉一个不存在的时刻 → 弹「加载超时，
-//     点击重新播放」→ 自动退回实时监控。用户看到的就是「点了不播，还自己跳回实时」。
-//   改法：先看该日录像段数（JAGridValidEventCount），**有录像才定位**；为空则等两轮复检
-//     （2s、再 3s），回来就定位，确实没有就弹「没有本地录像」并退回格子页。
-//   第 1 台：时间轴有颜色（有录像），当时判成「偶发拉流超时」；v2.9.37 试过改 seek，但把 1345 一起拖坏。
-// v2.9.37（一次失败的尝试，已由 v2.9.38 整段回滚）：曾按用户观察改成「不停流 + 读 isEnterSDPlay
-//   后 seekSDPlayWithSelectTimeStamp: 从实时跳目标时刻」。实测结果：**第 1 台连时间轴带颜色的
-//   日子也不能播了**。结论：1345 那套「stop → 建新流」虽然偶发不稳，但它就是能播的那条路，
-//   不能为了第 2 台去动它。seek 的 selector 确实存在（二进制 1 处），但在这条链上不适用。
-// v2.9.38（回滚 + 隔离）：定位链路整段恢复 v1.28 原样（3.0s stopSDPlay → switchToSDDay 切日报
-//   → 2.5s **无条件** startSDPlayWithSelectTimeStamp: → 1.5s 拨时间轴）。特别强调：**start 必须无条件发**，
-//   v2.9.36 加的「evCount==0 就不 start」门禁是错的 —— JAGridValidEventCount 靠运行时找事件数组，
-//   列表未到/找不到时恒为 0，1345 被误判成没录像 → 不定位 → 不能播，这正是 35/36/37 退化的原因。
-//   第 2 台的说明改为**纯附加旁路**：仅当 MyCamera.isSupportSDReplay 明确为 NO 时，start 之后额外
-//   弹一次「没有本地 SD 录像」，不改变任何控制流（判断错也只是多说一句话，start 照发）。
-// v2.9.39（时间轴整条"没有带颜色"的根因，用户回溯 v2.9.35 就已经这样）：官方播放页
-//   JANewRtcSDPlayViewController 有**自己**的当前选中日字段 _currentSelectedSDDay（q），
-//   该日录像段列表是 _sdRecordFileArr（NSArray），时间轴上带颜色的段完全由这个列表画出；
-//   另有 loadRecordListWithSelectiontDay:（官方拉段入口）。我们以前只设 myCamera.sdSelectiontDay
-//   （跨天算相对秒用），**VC 自己的 _currentSelectedSDDay 一次都没设过** → 官方可能停在
-//   「今日/上次位置」，今日没录像 → 段列表空 → 时间轴整条空白（没有颜色）→ start 定位到那天也播不出。
-//   改法：切日时显式设 currentSelectedSDDay=报警日0点；2s 后检查 sdRecordFileArr，仍为空则
-//   补调 loadRecordListWithSelectiontDay:（只补一次，已有列表不动）。不改变 start/时间轴原链路。
-//   —— 实测 v2.9.39 这样还不够（仍无颜色）。真正缺的那一样见 v2.9.40。
-// v2.9.40（时间轴无颜色的真凶，用户对照实测得出）：同一个 App、同一天、同一段录像，
-//   「消息列表 → 查看录像」进页面时间轴有颜色，格子回放进去却没有 —— 差别只可能在"怎么进页面"。
-//   逐行对比两条链，格子比消息少传的就一样：**currentEvent（原始 JAEMWarnInfoEntityModel）**。
-//   消息链：setValue myCamera → setValue currentEvent → setValue currentTimeStamp → 设 sdSelectiontDay
-//   格子链：setValue myCamera →                        setValue currentTimeStamp → 设 sdSelectiontDay
-//   官方 setupData 会读 currentEvent 来决定「载入哪一天/哪一段」；没有它就退回「今日」，
-//   今日通常没有录像 → sdRecordFileArr 空 → 时间轴整条空白 → start 定位到那天也播不出。
-//   改法：openPlayerAtIndex 里把 entry[@"ev"]（JAGridEntryFromMessage 一直在存的原始模型）
-//   通过 currentEvent 传给播放页，与消息链完全对齐。缓存命中的条目暂时没有 ev（缓存只存 sec/img），
-//   等网络数据回来覆盖后就有 —— 不影响正常流程。
-//   —— 实测 v2.9.40 这样仍然没颜色。仿 "查看录像" 的完整入口会设 JADevicePlatform ——> v2.9.41。
-// v2.9.41（问题不在播放页参数，在"进入前的全局设备上下文"）：JADevicePlatform（单例）持有
-//   myCamera / currentCamera / connectCamera / isSDPlayer，官方 SD 播放页就是拿这份上下文去建
-//   P2P 连接、再拉该日录像段（拉到了才有 sdRecordFileArr，时间轴才画出带颜色的段）。
-//   「消息列表 → 查看录像」进得去有颜色，是因为详情页（JABasicViewController 有 _myCamera）
-//   早把这台设备设进 JADevicePlatform 了；我们自己写的格子页是从没碰过它的 —— 官方进去
-//   连的是上一次的设备或空 → 拉不到段 → 时间轴整条空白。修法：格子页 push 之前，
-//   把 myCamera 通过 setCurrentCamera: / setMyCamera: 设进 JADevicePlatform.sharedInstance。
-//   —— 实测 v2.9.41 仍无颜色。不再"照着补参数"，改为直接复用那条验证过的链 ——> v2.9.42。
-// v2.9.42（正确做法：格子页不再自己拼 push，直接复用「消息列表 → 看录像」同一条链）：
-//   「看录像」入口点的是详情页 clickCloudRecordAction:，我们 hook 成 JATryOpenSDReplay ——
-//   这条链**用户实测时间轴有颜色**，且它内部已经把该做的全做了（myCamera / currentEvent /
-//   currentTimeStamp 双源校正秒 / myCamera.sdSelectiontDay=报警日 / g_rtcTargetSec /
-//   g_activeSDPlayer / RTC hook 补装 / push）。格子页却另写了一套 openPlayerAtIndex 去"照着补"，
-//   v2.9.39/40/41 三版补参数都没成 —— 两套代码再像也不是同一套。
-//   改法：openPlayerAtIndex 里直接调 JATryOpenSDReplay(self, ev, myCamera)（ev 就是
-//   entry[@"ev"] 那个原始报警模型），之后只把 g_rtcTargetSec 校正成格子显示的秒。
-//   JADevicePlatform 的设备上下文仍补一次（格子页是自定义 VC，官方详情页早就设好了）。
+// v2.9.51（本版基线 = v2.9.27）：v2.9.27 时格子回放能精准定位到选中时间点的录像，
+//   之后的版本为了修封面/时间轴颜色一路改播放链路，反而把"能不能回到选中时间点"弄坏了。
+//   所以这里把源码整体回到 v2.9.27，只把 v2.9.34 那套"能把第二台封面解出来"的东西加回来：
+//   ① 请求头照官方 UA（Joolink/26101509371 CFNetwork/1312 Darwin/21.0.0）、Accept 用 */*、不发 Referer；
+//   ② 图片直接解不出来时，调官方 JADecryptionTool 解密（uid + 摄像头查看密码，本地推密钥，不联网）；
+//   ③ 格子页 viewWillAppear 把当前 MyCamera 交给图片缓存，供解密取 uid/viewPwd。
+//   播放链路（stopSDPlay / switchToSDDay / startSDPlayWithSelectTimeStamp: / 时间轴同步）保持 v2.9.27 原样，一行没动。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -343,7 +274,6 @@
 //   v1.26：清理（本版）。
 
 #import <UIKit/UIKit.h>
-#import <ImageIO/ImageIO.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <stdarg.h>
@@ -644,9 +574,6 @@ static long long JAGridDayFromMessage(id msg);
 static long long JAGridSecForMessage(id msg, long long day);
 static NSArray *JAGridFindEvents(id vc);
 static NSNumber *JAGridTimestamp(id ev);
-// v2.9.45：v2.9.44 的诊断块要在 viewDidAppear（第 899 行附近）里用 JAGridTimeText，
-// 而它实现在 1057 行 —— 缺前置声明时 Clang 按 C99 报「隐式函数声明」直接编译失败。
-static NSString *JAGridTimeText(long long sec);
 
 // v2.6：统计该 VC 当前拿到的有效 SD 录像段条数（只用于判断列表是否已拉回来）
 static NSInteger JAGridValidEventCount(id vc) {
@@ -659,32 +586,6 @@ static NSInteger JAGridValidEventCount(id vc) {
         if (s >= 1000000000LL && s < 10000000000LL) n++;
     }
     return n;
-}
-
-// v2.9.36：这台设备/这一天 SD 卡里一条录像段都没有时，说明白并退回。
-// 第 2 台监控实测：时间轴整条是空的、没有带颜色的录像段 —— 抓拍图是云存储的，
-// 本地没录像。这种情况下官方只会「加载超时 → 点击重新播放 → 又跳回实时」，
-// 让人以为是我们定位错了。直接把话说明白，比看它瞎转强。
-static void JAGridAlertNoLocalRecord(id vc) {
-    if (![vc isKindOfClass:[UIViewController class]]) return;
-    UIViewController *p = (UIViewController *)vc;
-    if (p.presentedViewController) return;
-    NSString *msg = @"这台监控在这一天没有本地录像（SD 卡里没有录像段），只能查看云端抓拍图。";
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"没有本地录像"
-                                                               message:msg
-                                                        preferredStyle:UIAlertControllerStyleAlert];
-    __weak UIViewController *wp = p;
-    [ac addAction:[UIAlertAction actionWithTitle:@"返回"
-                                           style:UIAlertActionStyleDefault
-                                         handler:^(UIAlertAction *a) {
-        UIViewController *s = wp;
-        if (!s) return;
-        UINavigationController *nav = s.navigationController;
-        if (nav && nav.viewControllers.count > 1 && nav.topViewController == s) {
-            [nav popViewControllerAnimated:YES];
-        }
-    }]];
-    [p presentViewController:ac animated:YES completion:nil];
 }
 
 // v2.7：某天内的有效事件条数（采样比较用）
@@ -701,9 +602,6 @@ static NSInteger JAGridDayEventCount(NSArray *evs, long long day) {
 
 // v1.15：当前活跃 RTC SD 播放器指针（纯 C 比较守卫，不向对象发消息）
 static id g_activeSDPlayer = nil;
-// v2.9.46：格子链由我们设过 JADevicePlatform 的 isSDPlayer 时置 YES ——
-// 离开播放页必须还原成 NO，否则主界面实时预览会被留在 SD 通道上。
-static BOOL g_forceSDPlayer = NO;
 static BOOL g_rtcHooked = NO;        // JANewRtcSDPlayViewController hook 已装
 static IMP g_orig_rtc_vda = NULL;    // 原 viewDidAppear: IMP
 static IMP g_orig_rtc_vdd = NULL;    // 原 viewDidDisappear: IMP（v1.30 返回停流）
@@ -783,60 +681,40 @@ static IMP g_orig_handleJumpToOpenCloud = NULL;
 // isSeekingPlay，0.4s 时官方未就绪 → 预检查失败 → 定位不执行 → 播最新）。
 // v1.18：时间轴指示器唯一更新入口 = JATimeLineView changeCurrentTimeStamp:
 //（0x1000ff834），播放定位后主动拨动。
-// v2.9.38（回滚 v2.9.37 的 seek 改写 —— 它把 1345 也一起拖坏了）：
-// 用户实测：v2.9.35/36/37 之后，第 1 台连「时间轴带颜色」的日子也不能播了。
-// 1345 本来就是「偶发不稳定但能播」，不该被动；真正有问题的只有第 2 台（没有本地录像）。
-// 所以这一版把定位链路**整段回滚到 v1.28 原样**：
-//   3.0s stopSDPlay → switchToSDDay 切报警日 → 2.5s **无条件** startSDPlayWithSelectTimeStamp: → 1.5s 拨时间轴
-// 关键：**start 必须无条件发出**。v2.9.36 的错误就是加了「evCount==0 就不 start」的门禁，
-// 而 JAGridValidEventCount 靠运行时在 VC 里找事件数组，经常列表还没到/找不到 —— 1345 被
-// 误判成没录像 → 不定位 → 不能播。这个门禁必须去掉。
-// 第 2 台的说明做成**纯附加旁路**：仅当 MyCamera.isSupportSDReplay 明确为 NO 时，start 之后
-// 额外弹一次「没有本地 SD 录像」，不改变任何控制流 —— 即使判断错，start 照发，1345 不受影响。
+// v1.32：移除 v1.29 0.5s 预停 / v1.30 viewDidLoad 0.3s 预停 / v1.31 startPlay 拦截
+// —— 官方 viewDidLoad 自动播（上次位置→实时）与 isEnterSDPlay 状态机耦合，提前
+// stop 或吞 startPlay 会打断官方播放状态（isEnterSDPlay 停在 NO → 定位调用走
+// startSDPlay 无时间戳分支 → 画面实时、忽略报警时间戳）。回退到 v1.28 验收链路：
+// 3.0s stopSDPlay（停官方自动流）→ switchToSDDay 切报警日 → 2.5s 定位 → 1.5s 时间轴。
+// 官方自动流的短暂显示（读取进度/实时）是官方 viewDidLoad 固有行为，定位成功后
+// 画面即切到报警时间；三段"乱跳"观感保留，换取定位 100% 可靠。
 static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     if (g_orig_rtc_vda) ((void(*)(id, SEL))g_orig_rtc_vda)(self, _cmd);
     if (self != g_activeSDPlayer) return;
     long long sec = g_rtcTargetSec;
     if (sec < 1000000000LL) return;
-    // 世代去重：官方可能多次触发 viewDidAppear，只保留最后一次生效
+    // v1.20：世代去重 —— 官方可能多次触发 viewDidAppear，只保留最后一次生效
     unsigned long long myGen = ++g_rtcVdaGen;
-
-    // 旁路判据（只用于"多说一句话"，不参与定位决策）
-    BOOL noSD = NO;
-    @try {
-        id cam = [self valueForKey:@"myCamera"];
-        id v = [cam valueForKey:@"isSupportSDReplay"];
-        if ([v respondsToSelector:@selector(boolValue)]) noSD = ![v boolValue];
-    } @catch (NSException *e) {}
-
-    // 报警日 0 点 + 日期串（跨天必须切，否则官方默认停在"今日"，时间轴/相对秒全算错）
-    long long dayStart = JADayStartSec(@(sec));
-    if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
-    NSDateFormatter *df = [[NSDateFormatter alloc] init];
-    df.dateFormat = @"yyyy-MM-dd";
-    NSString *ds = [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:sec]];
-
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-        // v2.9.50：这里原来第一句是 stopSDPlay（v1.21 为"先停旧流再建新流"加的）。
-        // 现场证据表明它才是"一直停在实时、回不到选中时间点"的元凶：
-        //   - 官方 viewDidLoad/viewDidAppear 自己已经按 SD 模式启动了一次播放；
-        //   - 我们 3.0s 又 stop 一次 → 设备侧退回实时流、viewModel 的 startSDPlayFlag 状态被留在"已停"；
-        //   - 再 2.5s 调 startSDPlayWithSelectTimeStamp:，状态机已不认，流就一直是实时的。
-        // v1.21 当年加它是因为"第二次起偶发不生效"，但代价是把状态机打断 —— 现在整条链都建立在
-        // "停旧→建新"上，只要 stop 之后 start 没被接受，整页就再也回不到目标秒。
-        // 改成照官方：不 stop，只切天 + 定位，让官方自己那一次启动继续跑。
-        // v2.9.39（时间轴整条读不到录像段的根因）：官方播放页有自己的「当前选中日」字段
-        // _currentSelectedSDDay，该日的录像段列表存在 _sdRecordFileArr 里，时间轴上那些
-        // 带颜色的段完全由这个列表画出来。我们以前只设了 myCamera.sdSelectiontDay（那是
-        // 跨天算相对秒用的），**VC 自己的 _currentSelectedSDDay 一次都没设过** —— 于是官方
-        // 可能还停在「今日 / 上次的位置」，而今日没有录像 → sdRecordFileArr 空 → 时间轴
-        // 整条没有颜色，后面 startSDPlay 定位到那天也自然播不出来。
-        @try {
-            [self setValue:@(dayStart) forKey:@"currentSelectedSDDay"];
-        } @catch (NSException *e) {}
-        // 切报警日：官方要重新网络拉该日事件列表，否则定位到的是"今日"
+        // v1.21：先停官方 viewDidLoad 自动起的流（避免双流并存交替渲染），再建定位流。
+        // 每次进入都"停旧→建新"，绕开复用流上 seekSDPlay 前置闸门（0x103429ee0 bit0）
+        // 导致的"第二次起偶发定位不生效/播最新"。
+        SEL st = NSSelectorFromString(@"stopSDPlay");
+        if ([self respondsToSelector:st]) {
+            ((void(*)(id, SEL))objc_msgSend)(self, st);
+        }
+        // v1.25 定案（v1.24 运行时枚举 + 反汇编 0x100afb2e8）：官方"选日期"正规入口 =
+        // switchToSDDay:dateString:（x2=报警日0点秒 long long，x3=日期字符串）。
+        // 内部：算时间范围 → 设选中日/日期串/时间区间 → 经 viewModel 转发触发
+        // 加载该日事件 + 刷新时间轴 + 顶部日期显示（跨天修正：官方默认选中"今日"，
+        // 过了 12 点打开昨天报警会卡 00:00、看不到昨天进度条）。
+        long long dayStart = JADayStartSec(@(sec));
+        if (dayStart < 1000000000LL) dayStart = sec - ((sec + 28800LL) % 86400LL);
+        NSDateFormatter *df = [[NSDateFormatter alloc] init];
+        df.dateFormat = @"yyyy-MM-dd";
+        NSString *ds = [df stringFromDate:[NSDate dateWithTimeIntervalSince1970:sec]];
         SEL sw = NSSelectorFromString(@"switchToSDDay:dateString:");
         if ([self respondsToSelector:sw]) {
             ((void(*)(id, SEL, long long, id))objc_msgSend)(self, sw, dayStart, ds);
@@ -846,150 +724,47 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         @try {
             [self setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"];
         } @catch (NSException *e) {}
-        // v2.9.49：这里原来有个"列表已经有段就不拉"的判断，正是它把官方那条事件处理链跳过了。
-        // 官方进页面是无条件走一次 loadRecordListWithSelectiontDay: → 内部完成回调 _handleAllEventResult:，
-        // 由它填充 viewModel 的 detectRedArray / detectPersonArray 等检测数组并算出红标。
-        // 我们靠 switchToSDDay: 拿到的 14 条只是"录像段"，事件/检测数据一个都没有
-        // （现场：段=14、会话=1、入SD=1，但 红串长=1、红数=0、人数=0）。
-        // 所以这里改成照官方那样无条件拉一遍，不再看列表是否为空。
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-            SEL lr = NSSelectorFromString(@"loadRecordListWithSelectiontDay:");
-            if ([self respondsToSelector:lr]) {
-                ((void(*)(id, SEL, long long))objc_msgSend)(self, lr, dayStart);
-            }
-        });
-        // v2.9.49：官方 reloadLatestEventList 是"重新加载最新事件列表"的完整刷新入口，
-        // 消息列表那条链进页面后官方自己会调。我们补一次，让事件/检测数据真正到位。
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
-            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-            SEL rl = NSSelectorFromString(@"reloadLatestEventList");
-            if ([self respondsToSelector:rl]) {
-                ((void(*)(id, SEL))objc_msgSend)(self, rl);
-            }
-        });
-        // 等 2.5s 让该日事件列表拉回来，然后**无条件**定位（v1.28 原链路，不做 evCount 门禁）
+        // 事件列表加载是异步的（网络拉取），等 2.5s 后再建流定位。
+        // v1.28：1.5s→2.5s —— switchToSDDay 切日（尤其跨天场景 10-19）后官方要重新
+        // 网络拉取该日事件列表，网络稍慢时 1.5s 内列表未到 → startSDPlay 定位时官方
+        // 找不到该时间点录像 → 偶发"当前时间无录像"。
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-            // 定位一律用报警秒原值（v2.5 定案：不用"最近一段"替换 —— 报警常落在段中间）
+            // v2.5 定案：定位一律用报警秒原值（不用"最近一段"替换 —— 报警常落在
+            // 某段中间，替换会把画面挪到段起点）。v2.6 只保留"列表是否已回来"的判断：
+            // 列表为空时 2s 后补一次定位，避免该日事件网络拉取稍慢导致定位失败。
+            NSInteger evCount = JAGridValidEventCount(self);
             SEL s = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
             if ([self respondsToSelector:s]) {
                 ((void(*)(id, SEL, long long))objc_msgSend)(self, s, sec);
             }
-            // v2.9.48：红色录像段（用户说的"带颜色"）的真凶找到了。
-            // -getRecordRedMarkData 就是官方「把已拉到的录像段列表算出红标、写回 _recordRedMark、
-            // 再画到时间轴」的唯一入口（反汇编确认：它遍历录像段数组逐段取时间字段拼串）。
-            // 我们从自己的格子页 push 进来，官方那条初始化路径没走到这一步 ——
-            // 所以现场是 段=14（段拉到了）、会话=1、VM入SD=1，但 红串长=1 / 红数=0，时间轴上没有红块。
-            // 这里在录像段已到位后主动补调两次（第二次兜住晚到的段），不加任何门禁判断。
-            for (int ri = 0; ri < 2; ri++) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                             (int64_t)((1.0 + ri * 1.5) * NSEC_PER_SEC)),
+            if (evCount > 0) {
+                // v1.18：播放定位已发出，再等 1.5s 拨时间轴指示器到定位时间点
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
                     if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                    SEL r = NSSelectorFromString(@"getRecordRedMarkData");
-                    if ([self respondsToSelector:r]) {
-                        ((void(*)(id, SEL))objc_msgSend)(self, r);
-                    }
+                    JATimeLineSyncToSec(self, sec);
                 });
-            }
-            // v1.18：定位已发出，再等 1.5s 拨时间轴指示器到该时间点
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{
-                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                JATimeLineSyncToSec(self, sec);
-            });
-            // v2.9.44：现场诊断（临时）。时间轴到底有没有录像段，看这几个数就知道 ——
-            //   段   = _sdRecordFileArr.count（0 就是一条段都没拉到 → 时间轴整条空白）
-            //   VC日 = 播放页自己的 _currentSelectedSDDay（应该等于报警日 0 点）
-            //   摄像日 = myCamera.sdSelectiontDay（跨天算相对秒用）
-            //   入SD = isEnterSDPlay（官方播放状态机有没有进 SD 分支）
-            //   UID  = 这台设备到底是谁（和用户点的那台对不上的话，就是设备上下文错了）
-            // 每秒刷一次、共 6 次，用户截一张图就够定位。
-            for (int di = 0; di < 6; di++) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
-                                             (int64_t)((3.5 + di * 1.0) * NSEC_PER_SEC)),
+            } else {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                                dispatch_get_main_queue(), ^{
                     if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                    UIViewController *pv = (UIViewController *)self;
-                    if (!pv.isViewLoaded) return;
-                    UIView *old = [pv.view viewWithTag:0x1A66];
-                    if (old) [old removeFromSuperview];
-                    NSArray *arr = nil;
-                    id vcd = nil, cam = nil, camd = nil, uid = nil, ent = nil;
-                    @try { arr = [self valueForKey:@"sdRecordFileArr"]; } @catch (NSException *e) {}
-                    @try { vcd = [self valueForKey:@"currentSelectedSDDay"]; } @catch (NSException *e) {}
-                    @try { cam = [self valueForKey:@"myCamera"]; } @catch (NSException *e) {}
-                    if (cam) {
-                        @try { camd = [cam valueForKey:@"sdSelectiontDay"]; } @catch (NSException *e) {}
-                        @try { uid = [cam valueForKey:@"uid"]; } @catch (NSException *e) {}
-                    }
-                    // v2.9.47：红色段（用户说的"带颜色"）的真正来源找到了 ——
-                    // 它不在 VC 上，而在 _viewModel（JANewRtcSDPlayViewModel）里：
-                    //   _recordRedMark : NSString          ← 红标记串
-                    //   _detectRedArray / _detectPersonArray / _detectVehicleArray ... : NSMutableArray
-                    //   _isEnterSDPlay : BOOL               ← 真正在 SD 回放模式（VC 上没有这个字段）
-                    //   _isSessionConnected : BOOL          ← P2P 会话是否连上（没连上就拉不到这些数据）
-                    // 所以以前读 VC 的 isEnterSDPlay 永远是 null，判断全部失效。
-                    id vm = nil;
-                    @try { vm = [self valueForKey:@"viewModel"]; } @catch (NSException *e) {}
-                    id vEnt = nil, vSess = nil, vRed = nil, vDRed = nil, vDPer = nil;
-                    if (vm) {
-                        @try { vEnt = [vm valueForKey:@"isEnterSDPlay"]; } @catch (NSException *e) {}
-                        @try { vSess = [vm valueForKey:@"isSessionConnected"]; } @catch (NSException *e) {}
-                        @try { vRed = [vm valueForKey:@"recordRedMark"]; } @catch (NSException *e) {}
-                        @try { vDRed = [vm valueForKey:@"detectRedArray"]; } @catch (NSException *e) {}
-                        @try { vDPer = [vm valueForKey:@"detectPersonArray"]; } @catch (NSException *e) {}
-                    }
-                    NSUInteger redLen = ([vRed respondsToSelector:@selector(length)] ? [vRed length] : 0);
-                    NSUInteger nDRed = ([vDRed isKindOfClass:[NSArray class]] ? [(NSArray *)vDRed count] : 0);
-                    NSUInteger nDPer = ([vDPer isKindOfClass:[NSArray class]] ? [(NSArray *)vDPer count] : 0);
-                    // v2.9.46：v2.9.45 诊断证明 isEnterSDPlay 不是这个 VC 的字段（取到 null），
-                    // 改成读 JADevicePlatform 的 isSDPlayer —— 那才是决定走实时还是走 SD 回放的开关。
-                    Class dp3 = NSClassFromString(@"JADevicePlatform");
-                    if (dp3) {
-                        id sh3 = nil;
-                        SEL si3 = NSSelectorFromString(@"sharedInstance");
-                        if ([(id)dp3 respondsToSelector:si3]) {
-                            @try {
-                                sh3 = ((id(*)(id, SEL))objc_msgSend)((id)dp3, si3);
-                            } @catch (NSException *e) {}
+                    NSInteger c2 = JAGridValidEventCount(self);
+                    if (c2 > 0) {
+                        SEL s2 = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
+                        if ([self respondsToSelector:s2]) {
+                            ((void(*)(id, SEL, long long))objc_msgSend)(self, s2, sec);
                         }
-                        if (sh3) {
-                            @try { ent = [sh3 valueForKey:@"isSDPlayer"]; } @catch (NSException *e) {}
-                        }
+                        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                                     (int64_t)(1.5 * NSEC_PER_SEC)),
+                                       dispatch_get_main_queue(), ^{
+                            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                            JATimeLineSyncToSec(self, sec);
+                        });
+                    } else {
+                        JATimeLineSyncToSec(self, sec);
                     }
-                    NSInteger n = -1;
-                    if ([arr isKindOfClass:[NSArray class]]) n = (NSInteger)arr.count;
-                    NSString *txt = [NSString stringWithFormat:
-                        @"段=%ld  VC日=%@\n摄像日=%@\nUID=%@\n平台SD=%@\nVM入SD=%@ 会话=%@\n红串长=%lu 红数=%lu 人数=%lu\n目标=%@",
-                        (long)n, vcd, camd, uid, ent,
-                        vEnt, vSess, (unsigned long)redLen, (unsigned long)nDRed, (unsigned long)nDPer,
-                        JAGridTimeText(sec)];
-                    UILabel *lab = [[UILabel alloc] initWithFrame:CGRectZero];
-                    lab.tag = 0x1A66;
-                    lab.numberOfLines = 0;
-                    lab.font = [UIFont systemFontOfSize:11];
-                    lab.textColor = [UIColor blackColor];
-                    lab.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.85];
-                    lab.layer.cornerRadius = 6;
-                    lab.clipsToBounds = YES;
-                    lab.text = txt;
-                    CGFloat w2 = pv.view.bounds.size.width;
-                    CGSize fs = [lab sizeThatFits:CGSizeMake(w2 - 48, CGFLOAT_MAX)];
-                    lab.frame = CGRectMake(14, 104, MIN(w2 - 28, fs.width + 16), fs.height + 12);
-                    [pv.view addSubview:lab];
-                });
-            }
-            // 纯附加旁路：这台设备官方明确说自己不支持 SD 回放 → 说白一句，不干预上面的定位
-            if (noSD) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-                    JAGridAlertNoLocalRecord(self);
                 });
             }
         });
@@ -1091,27 +866,6 @@ static void ja_rtc_viewDidDisappear(id self, SEL _cmd) {
     if (g_orig_rtc_vdd) ((void(*)(id, SEL))g_orig_rtc_vdd)(self, _cmd);
     if (self != g_activeSDPlayer) return;
     g_activeSDPlayer = nil;  // 先清标记：后续 viewDidAppear/定位闭包不再执行
-    // v2.9.46：格子链进页面时是我们把 JADevicePlatform.isSDPlayer 置 YES 的，
-    // 离开必须还原成 NO，不然主界面的实时预览会被一直留在 SD 通道（画面会出问题）。
-    if (g_forceSDPlayer) {
-        g_forceSDPlayer = NO;
-        Class dpc2 = NSClassFromString(@"JADevicePlatform");
-        if (dpc2) {
-            id shared2 = nil;
-            SEL si2 = NSSelectorFromString(@"sharedInstance");
-            if ([(id)dpc2 respondsToSelector:si2]) {
-                @try {
-                    shared2 = ((id(*)(id, SEL))objc_msgSend)((id)dpc2, si2);
-                } @catch (NSException *e) {}
-            }
-            if (shared2) {
-                SEL sdp2 = NSSelectorFromString(@"setIsSDPlayer:");
-                if ([shared2 respondsToSelector:sdp2]) {
-                    ((void(*)(id, SEL, BOOL))objc_msgSend)(shared2, sdp2, NO);
-                }
-            }
-        }
-    }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         SEL st = NSSelectorFromString(@"stopSDPlay");
@@ -1982,11 +1736,10 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     return [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%08x.img", h]];
 }
 
-// v2.9.34：华为云 OBS 上的抓拍图是**加密**的（文件名带 _enc，返回体头不是 JPEG 魔数
-// FF D8 FF，实测拿到的是 E8 2A 2D C4… 这种随机值，20982 字节）。
-// 官方 App 用 JADecryptionTool 在本地解 —— 密钥由「设备 UID + 摄像头密码」推出来，
-// 不联网也能解。这里直接调用官方这个类方法，不自己实现 AES：
-//   + jaDecryptImagewithURL:withData:withCameraUID:withCameraPwd:  → 返回 UIImage / NSData / 路径字符串
+// v2.9.34：华为云 OBS 上的抓拍图是加密的（文件名带 _enc，返回体头不是 JPEG 魔数 FF D8 FF，
+// 实测是 E8 2A 2D C4… 这种数据）。官方 App 用 JADecryptionTool 在本地解 ——
+// 密钥由「设备 UID + 摄像头查看密码」推出来，不联网也能解。这里直接调官方类方法，不自己实现 AES：
+//   + jaDecryptImagewithURL:withData:withCameraUID:withCameraPwd:   → UIImage / NSData / 文件路径
 static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam) {
     if (!data.length || !url.length || !cam) return nil;
     Class cls = NSClassFromString(@"JADecryptionTool");
@@ -2006,7 +1759,7 @@ static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam
     } @catch (NSException *e) { r = nil; }
     if ([r isKindOfClass:[UIImage class]]) return (UIImage *)r;
 
-    // 结果可能是 NSData，也可能是「已解密好的本地文件路径」
+    // 返回可能是 NSData，也可能是已解密好的本地文件路径
     NSData *out = nil;
     if ([r isKindOfClass:[NSData class]]) out = (NSData *)r;
     else if ([r isKindOfClass:[NSString class]] && [(NSString *)r length]) {
@@ -2024,14 +1777,14 @@ static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam
     return img;
 }
 
-@interface JAGridImageCache : NSObject@property (nonatomic, strong) NSCache *mem;
+@interface JAGridImageCache : NSObject
+@property (nonatomic, strong) NSCache *mem;
 @property (nonatomic, strong) NSMutableDictionary *inflight;   // v2.9.14：同 URL 去重
 @property (nonatomic, strong) NSMutableDictionary *fails;      // v2.9.23：同一 URL 连续失败次数
 @property (nonatomic, strong) NSMutableDictionary *codes;      // v2.9.23：失败时的 HTTP 状态码
 @property (nonatomic, strong) NSMutableArray *queue;           // v2.9.15：限并发排队
 @property (nonatomic, assign) NSInteger active;                // 当前在跑的下载数
-@property (nonatomic, strong) NSString *firstFailInfo;         // v2.9.30：第一个失败样本的现场（排查用）
-@property (nonatomic, weak) id cam;                            // v2.9.34：当前设备的 MyCamera（解密加密封面要用 uid+pwd）
+@property (nonatomic, weak) id cam;                             // v2.9.34：当前设备 MyCamera（解密要 uid + 查看密码）
 + (instancetype)shared;
 - (UIImage *)imageForKey:(NSString *)key;
 - (void)loadURL:(NSString *)url completion:(void (^)(UIImage *img, NSString *key))cb;
@@ -2106,12 +1859,7 @@ static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         __strong typeof(ws) s = ws;
-        if (s && s.inflight[key]) {
-            // v2.9.28：8 秒一条回调都没有时，记一个自定义码，格子上会显示「失败 e-9000」。
-            // 之前这种情况下 codes 是空的，只能显示「失败.jpg」，看不出是超时还是根本没发出去。
-            if (!s.codes[key]) s.codes[key] = @(-9000);
-            [s jaFinish:key image:nil];
-        }
+        if (s && s.inflight[key]) [s jaFinish:key image:nil];
     });
 }
 
@@ -2134,18 +1882,7 @@ static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam
 }
 
 - (void)jaFetch:(NSString *)url retry:(NSInteger)retry {
-    // v2.9.32：华为云 OBS 预签名 URL（qiaoan-thn.obs.cn-east-3.myhuaweicloud.com）的
-    // Signature 是 base64，可能含未编码的 '+'。query 里的 '+' 会被服务端当成空格解码，
-    // 签名立刻对不上 —— 表现就是「地址对、签名参数都在，但一直被拒」。这里统一转成 %2B。
-    NSString *sendURL = url;
-    NSRange qr = [url rangeOfString:@"?"];
-    if (qr.location != NSNotFound) {
-        NSString *base = [url substringToIndex:qr.location];
-        NSString *query = [url substringFromIndex:qr.location];
-        sendURL = [base stringByAppendingString:
-                   [query stringByReplacingOccurrencesOfString:@"+" withString:@"%2B"]];
-    }
-    NSURL *u = [NSURL URLWithString:sendURL];
+    NSURL *u = [NSURL URLWithString:url];
     // v2.9.27：地址里只要有一个没编码的字符（空格、中文、{|} 之类），
     // URLWithString 就直接返回 nil —— 请求根本发不出去，格子上却只显示「失败.jpg」，
     // 看起来像被服务端拒了。这里补一次穷举式百分号编码：只保留 URL 结构里合法的字符，
@@ -2159,88 +1896,29 @@ static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam
     if (!u) { [self jaFinish:url image:nil]; return; }
     // v2.9.23：带上 App 的 User-Agent 跟常规图片请求头。第二台设备那张抓拍图 jpg 地址是对的，
     // 但裸 session 请求图片 CDN 会被判成非 App 流量直接拒（格子上一直是「失败.jpg」）。
-    // v2.9.28：UA 照抄官方实测值 —— 2026-11-15 用 ProxyPin 抓到的官方请求头就是
-    //   Joolink/26101509371 CFNetwork/1312 Darwin/21.0.0
-    // 上一版是我自己拼的浏览器式 UA（... Joolink/4.79），跟官方差很远，
-    // 如果 CDN 按 UA 做白名单，正好会被挡掉。
     NSMutableURLRequest *rq = [NSMutableURLRequest requestWithURL:u];
+    // v2.9.28：UA 照抄官方（ProxyPin 抓到的真值），自拼的浏览器式 UA 会让 CDN 判成非 App 流量。
     [rq setValue:@"Joolink/26101509371 CFNetwork/1312 Darwin/21.0.0"
         forHTTPHeaderField:@"User-Agent"];
     [rq setValue:@"*/*" forHTTPHeaderField:@"Accept"];
-    // v2.9.31：第一次带 Referer；重试就不带了。
-    // 第二台设备的图在华为云 OBS（qiaoan-thn.obs.cn-east-3.myhuaweicloud.com），
-    // OBS 桶可以配防盗链：如果白名单只允许空 Referer，我们主动加的这条反而会被拒。
-    if (retry == 0) {
-        [rq setValue:@"https://www.jooancloud.com/" forHTTPHeaderField:@"Referer"];
-    }
+    // v2.9.31：OBS 预签名地址带 Referer 会被防盗链拒（403 返回 XML），这里不发 Referer。
     rq.timeoutInterval = 12.0;
     NSURLSessionDataTask *t = [[NSURLSession sharedSession]
         dataTaskWithRequest:rq completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
             UIImage *img = nil;
-            if (data) {
-                @autoreleasepool {
-                    img = [UIImage imageWithData:data];
-                    // v2.9.33：UIImage imageWithData 对某些 JPEG 变体（progressive / 特殊 EXIF /
-                    // 尺寸异常）会返回 nil，但数据本身是好的。换 ImageIO 再解一次，它宽容得多。
-                    if (!img && data.length > 8) {
-                        CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)data, NULL);
-                        if (src) {
-                            CGImageRef cg = CGImageSourceCreateImageAtIndex(src, 0, NULL);
-                            if (cg) {
-                                img = [UIImage imageWithCGImage:cg];
-                                CGImageRelease(cg);
-                            }
-                            CFRelease(src);
-                        }
-                    }
-                    // v2.9.34：还是解不出来 —— 这台设备的抓拍图是加密存的（_enc.jpg），
-                    // 交给官方的 JADecryptionTool 解（密钥来自 uid + 摄像头密码，本地就能解）。
-                    if (!img) img = JADecryptImageDataWithCamera(data, url, self.cam);
-                }
-            }
+            if (data) { @autoreleasepool { img = [UIImage imageWithData:data]; } }
+            // v2.9.34：直接解不出来 —— 这台设备的抓拍图是加密存的（_enc.jpg），
+            // 交给官方 JADecryptionTool（uid + 摄像头查看密码，本地推密钥）。
+            if (!img && data.length) { @autoreleasepool { img = JADecryptImageDataWithCamera(data, url, self.cam); } }
             if (!img) {
                 // v2.9.23：记 HTTP 状态码（403/404）
-                NSInteger st = 0;
                 if ([resp isKindOfClass:NSHTTPURLResponse.class]) {
-                    st = ((NSHTTPURLResponse *)resp).statusCode;
+                    NSInteger st = ((NSHTTPURLResponse *)resp).statusCode;
                     if (st > 0) self.codes[url] = @(st);
                 } else if (err) {
                     // v2.9.27：连响应都没有 —— 记网络错误码（负数），格子上显示「失败 e-1022」之类，
                     // 才能分清是超时(-1001)、DNS(-1003)、连不上(-1004)、被 ATS 拦(-1022) 还是别的。
-                    st = -(err.code);
-                    self.codes[url] = @(st);
-                }
-                // v2.9.30：留一个失败样本现场 —— 状态码 + 返回字节数 + 地址关键片段。
-                // v2.9.32：改成三行短文本（签名参数缩写），底部那行是多行标签，不会再被截断。
-                if (!self.firstFailInfo) {
-                    NSRange qr2 = [url rangeOfString:@"?"];
-                    NSString *pth = qr2.location != NSNotFound ? [url substringToIndex:qr2.location] : url;
-                    NSString *qry = qr2.location != NSNotFound ? [url substringFromIndex:qr2.location + 1] : @"";
-                    if (pth.length > 34) pth = [@"…" stringByAppendingString:[pth substringFromIndex:pth.length - 34]];
-                    NSMutableArray *kvArr = [NSMutableArray array];
-                    for (NSString *kv in [qry componentsSeparatedByString:@"&"]) {
-                        NSRange eq = [kv rangeOfString:@"="];
-                        if (eq.location == NSNotFound) continue;
-                        NSString *k = [kv substringToIndex:eq.location];
-                        NSString *v = [kv substringFromIndex:eq.location + 1];
-                        NSString *ks = k;
-                        if ([k rangeOfString:@"ccessKey"].location != NSNotFound) ks = @"AK";
-                        else if ([k rangeOfString:@"xpires"].location != NSNotFound) ks = @"Exp";
-                        else if ([k rangeOfString:@"ignature"].location != NSNotFound) ks = @"Sg";
-                        if (v.length > 22) v = [[v substringToIndex:22] stringByAppendingString:@"…"];
-                        [kvArr addObject:[NSString stringWithFormat:@"%@=%@", ks, v]];
-                    }
-                    NSString *kvLine = kvArr.count ? [kvArr componentsJoinedByString:@" "] : @"(无签名字段)";
-                    // v2.9.33：把返回数据的前 8 字节打出来 —— 这是最后一块拼图。
-                    // FFD8FFxx = 真 JPEG（那问题在解码这一层）；89504E47 = PNG；
-                    // 其它随机值 = 文件是加密的（OBS 上的文件名带 _enc 就是这个意思）。
-                    NSMutableString *hx = [NSMutableString string];
-                    NSUInteger hn = MIN(data.length, (NSUInteger)8);
-                    const uint8_t *bp = (const uint8_t *)data.bytes;
-                    for (NSUInteger i = 0; i < hn; i++) [hx appendFormat:@"%02X", bp[i]];
-                    self.firstFailInfo = [NSString stringWithFormat:@"封面失败 [%ld|%lu] 头=%@\n%@\n%@",
-                                          (long)st, (unsigned long)(data.length),
-                                          hx.length ? hx : @"空", pth, kvLine];
+                    self.codes[url] = @(-(err.code));
                 }
             }
             if (img) {
@@ -2359,10 +2037,19 @@ static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam
         if (!key || ![s.imgURL isEqualToString:key]) return;
         if (img) { s.thumb.image = img; s.noneLab.hidden = YES; }
         else {
-            // v2.9.35：解密链路已经打通（华为云 OBS 上的 _enc 加密图交给官方
-            // JADecryptionTool 解），失败已经是极少数（多为预签名 URL 过期后 403）。
-            // 排查期的状态码/域名/后缀全撤掉，格子恢复干净的两态：无封面 / 载入中。
-            s.noneLab.text = @"无封面";
+            // v2.9.21：把后缀带出来 —— 显示「失败.mp4」就说明拿到的根本不是图。
+            // v2.9.23：有 HTTP 状态码时优先显示码 —— 「失败 403」是被拒，「失败 404」是地址错。
+            // v2.9.27：负数是网络错误码 —— 「失败 e-1022」是被 ATS 拦、e-1001 超时、
+            // e-1004 连不上、e-1003 DNS 解析不出来；「失败 地址」是 URL 本身非法，请求没发出去。
+            NSInteger st = [[JAGridImageCache shared] statusForURL:key];
+            if (st >= 400) s.noneLab.text = [NSString stringWithFormat:@"失败 %ld", (long)st];
+            else if (st < 0) s.noneLab.text = [NSString stringWithFormat:@"失败 e%ld", (long)st];
+            else if (![NSURL URLWithString:key]) s.noneLab.text = @"失败 地址";
+            else {
+                NSString *ext = [[NSURL URLWithString:key] pathExtension].lowercaseString;
+                s.noneLab.text = ext.length ? [NSString stringWithFormat:@"失败.%@", ext]
+                                            : @"加载失败";
+            }
             s.noneLab.hidden = NO;
         }
     }];
@@ -2474,9 +2161,6 @@ static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam
     self.hourLab.font = [UIFont systemFontOfSize:13];
     self.hourLab.textColor = [UIColor colorWithWhite:0.55 alpha:1.0];
     self.hourLab.textAlignment = NSTextAlignmentCenter;
-    // v2.9.32：多行说明（排查期的封面失败现场），允许换行，不再被单行截断。
-    self.hourLab.numberOfLines = [note rangeOfString:@"\n"].location != NSNotFound ? 0 : 1;
-    self.hourLab.lineBreakMode = NSLineBreakByCharWrapping;
     [self setNeedsLayout];
 }
 - (void)layoutSubviews {
@@ -2495,24 +2179,10 @@ static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam
         [self refreshDash];
         y += 34;
     }
-    CGFloat iconY = y + 3;
-    self.clockView.frame = CGRectMake(16, iconY, 20, 20);
+    self.clockView.frame = CGRectMake(16, y + 3, 20, 20);
     // v2.8.1：没有时钟的「空天说明」从左边 16 起排，和日期标题左对齐
     CGFloat hx = self.clockView.hidden ? 16 : 42;
-    CGFloat hy = y;
-    CGFloat hh = MAX(26, self.bounds.size.height - hy - 4);
-    // v2.9.32：多行说明给足整块高度，别按单行 26 裁掉下面的行
-    if (self.hourLab.numberOfLines == 0) hh = MAX(26, self.bounds.size.height - hy);
-    // v2.9.43：小时标题和时钟图标垂直居中对齐。
-    // 原来小时行这块从 y 起撑满剩余高度，UILabel 垂直居中后落点比图标低 5~6pt
-    // （用户看到的就是"时间偏下、时钟图标偏上"）。这里把小时标题压成和图标同高同中心：
-    // 16pt 字在 22pt 高里居中，视觉中心 = iconY - 1 + 11 = iconY + 10 = 图标中心。
-    // 只有「有时钟」的小时行这样排；空天说明 / 已加载完毕这类居中灰字保持原逻辑。
-    if (!self.clockView.hidden) {
-        hy = iconY - 1;
-        hh = 22;
-    }
-    self.hourLab.frame = CGRectMake(hx, hy, MAX(0, w - hx - 16), hh);
+    self.hourLab.frame = CGRectMake(hx, y, MAX(0, w - hx - 16), 26);
 }
 - (void)refreshDash {
     self.dashLine.layer.sublayers = nil;
@@ -2749,7 +2419,7 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     // v2.9.20：先藏掉官方播放器残留的「回放倍数选择」浮层，它正好压在日期抬头上面，
     // 而且带模态遮罩，会把返回按钮也一起挡掉。
     g_jaGridHostView = self.view;
-    // v2.9.34：把当前设备交给图片缓存 —— 加密抓拍图要拿它的 uid + 查看密码去解。
+    // v2.9.34：把当前设备交给图片缓存 —— 加密抓拍图要用它的 uid + 查看密码来解。
     [JAGridImageCache shared].cam = self.myCamera;
     JAGridToggleSpeedPanel(YES);
 }
@@ -3226,8 +2896,6 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
                           @"items": @[],
                           @"note": @"当日已全部加载完毕，选择日期重新加载"}];
     }
-    // v2.9.35：排查期的「封面失败 [码|字节] 头=…」已经完成任务、问题也定案修复了
-    // （加密图交给官方 JADecryptionTool 解），这里整段撤掉 —— 不再往底部提示条塞诊断文本。
     self.secs = secs;
     self.flat = flat;
     // v2.9.14：正在拖 / 惯性滑动时不重建 —— 否则每页都刷新一次，会打断滑动、位置被拉回，
@@ -3431,11 +3099,6 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     if (section < 0 || section >= (NSInteger)self.secs.count) return CGSizeZero;
     NSDictionary *secDict = (NSDictionary *)self.secs[section];
     BOOL hasDay = [(NSString *)secDict[@"dayTitle"] length] > 0;
-    // v2.9.32：多行说明（封面失败现场）要给够高度，否则底部那几行被裁掉
-    NSString *note = secDict[@"note"];
-    if ([note rangeOfString:@"\n"].location != NSNotFound) {
-        return CGSizeMake(self.cv.bounds.size.width, 92);
-    }
     return CGSizeMake(self.cv.bounds.size.width, hasDay ? 78 : 42);
 }
 
@@ -3492,69 +3155,40 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     if (index < 0 || index >= (NSInteger)self.flat.count) return;
     NSDictionary *entry = self.flat[index];
     long long sec = [(NSNumber *)entry[@"sec"] longLongValue];
-    if (sec <= 0) return;
-    id ev = (id)entry[@"ev"];
+
+    Class rtc = NSClassFromString(@"JANewRtcSDPlayViewController");
+    if (!rtc) return;
+
+    // v2.8：RTC hooks 补装（和详情页链路一致）—— 少了这个，viewDidAppear 不会
+    // 触发定位，进去就只剩官方自动播的最新实时画面
+    if (!g_rtcHooked) {
+        JASetImp(rtc, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
+        JASetImp(rtc, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
+        g_rtcHooked = YES;
+    }
+
+    id vc = [[rtc alloc] init];
+    @try { [vc setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
+    JASet(vc, @"currentTimeStamp", @(sec));
+    JASet(self.myCamera, @"sdSelectiontDay", @(JADayStartSec(@(sec))));
+
+    // 复用 v1.28 定位链路：viewDidAppear 后 3.0s 自动定位到 g_rtcTargetSec
+    g_rtcTargetSec = sec;
+    g_activeSDPlayer = vc;
     self.playIndex = index;
+    self.playingVC = vc;
 
     NSIndexPath *ip = [self indexPathForFlat:index];
     if (ip) [self.cv scrollToItemAtIndexPath:ip
                            atScrollPosition:UICollectionViewScrollPositionCenteredVertically
                                    animated:NO];
 
-    // v2.9.42（换做法：不再照着「看录像」补参数，而是**直接用同一条链**）：
-    // 前面 v2.9.39/40/41 一直在给格子页"补"消息链有而它没有的东西（currentSelectedSDDay、
-    // currentEvent、JADevicePlatform 上下文），三版都没成。问题在于格子页自己拼了一套 push，
-    // 而「消息列表 → 看录像」走的是 JATryOpenSDReplay —— 那条是用户实测**时间轴有颜色**的
-    // 完整实现，里面已经把该做的全做了：myCamera、currentEvent、currentTimeStamp（双源校正后
-    // 的秒）、myCamera.sdSelectiontDay = 报警日、g_rtcTargetSec、g_activeSDPlayer、
-    // RTC hook 补装、push。两套代码再像也不是同一套，所以直接复用，行为必然一致。
-    //
-    // 全局设备上下文仍要补一次：详情页进 SD 回放前，官方早已把这台设备设进 JADevicePlatform
-    // （官方播放页靠它建 P2P 连接、拉该日录像段）；格子页是自定义 VC，从没设过。
-    Class dpc = NSClassFromString(@"JADevicePlatform");
-    if (dpc && self.myCamera) {
-        id shared = nil;
-        SEL si = NSSelectorFromString(@"sharedInstance");
-        if ([(id)dpc respondsToSelector:si]) {
-            @try {
-                shared = ((id(*)(id, SEL))objc_msgSend)((id)dpc, si);
-            } @catch (NSException *e) {}
-        }
-        if (shared) {
-            SEL sc = NSSelectorFromString(@"setCurrentCamera:");
-            if ([shared respondsToSelector:sc]) {
-                ((void(*)(id, SEL, id))objc_msgSend)(shared, sc, self.myCamera);
-            }
-            SEL sm = NSSelectorFromString(@"setMyCamera:");
-            if ([shared respondsToSelector:sm]) {
-                ((void(*)(id, SEL, id))objc_msgSend)(shared, sm, self.myCamera);
-            }
-            // v2.9.46：真正缺的那一环 —— isSDPlayer。
-            // v2.9.45 的现场诊断给出：sdRecordFileArr 段=14（录像段拉到了，时间轴也画出颜色了），
-            // 但四个画面还是今日 13:03/13:06 的实时流，时间轴指示器停在 12:44:46 也不动。
-            // 官方播放页自己就有 didEnterLive（进入实时）这个分支 —— 说明它走到了「实时」而不是
-            // 「SD 回放」。设备上下文里决定走哪条流的就是这个 isSDPlayer 开关（JADevicePlatform
-            // 有 setIsSDPlayer: / setIsEnterDeviceList: / setIsBackground: 一组状态位）。
-            // 消息详情页进 SD 回放前官方已经把它置位了，我们自己写的格子页没置过 —— 于是设备
-            // 一直喂实时流。这里补一次，并在离开播放页时还原（见 ja_rtc_viewDidDisappear）。
-            SEL sdp = NSSelectorFromString(@"setIsSDPlayer:");
-            if ([shared respondsToSelector:sdp]) {
-                ((void(*)(id, SEL, BOOL))objc_msgSend)(shared, sdp, YES);
-                g_forceSDPlayer = YES;
-            }
-        }
-    }
+    UINavigationController *nav = self.navigationController;
+    if (!nav) return;
+    [nav pushViewController:vc animated:YES];
 
-    // 复用「消息列表 → 看录像」同一条链路（ev 为 nil 时只有缓存条目，仍然能进页面）
-    JATryOpenSDReplay(self, ev, self.myCamera);
-    id vc = g_activeSDPlayer;
-    if (!vc) return;
-    // 以格子显示的这个秒为准 —— 用户点的就是这一格，播的也必须是这一格
-    g_rtcTargetSec = sec;
-    if (ev) JASet(vc, @"currentTimeStamp", @(sec));
-    self.playingVC = vc;
-
-    // v2.8：画面右上角标出这一格的目标时间（定位有没有生效靠角标和画面对照）
+    // v2.9.8：官方 SD 回放页自带的时间轴/拖动条不再隐藏（用户要能自己拖）。
+    // v2.8：画面右上角标出这一格的目标时间 —— 定位有没有生效靠这个角标和画面对照
     __weak id wvc2 = vc;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.4 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -3575,7 +3209,8 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
         [p.view addSubview:lab];
     });
 
-    // v2.9.9：自动连播（35 秒自动跳下一格）已按用户要求去掉。
+    // v2.9.9：自动连播（35 秒自动跳下一格）已按用户要求去掉 —— 拖动条回来了，
+    // 播放完全由用户自己控制。
 }
 
 // ---------- v2.8：右上角日期选择器（月历 + 有录像日期红点） ----------
@@ -3755,7 +3390,6 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     self.didFirstLoad = YES;
     self.loading = NO;
     [self.days removeAllObjects];
-    [JAGridImageCache shared].firstFailInfo = nil;   // v2.9.30：换天重新采一次失败样本
     self.needsScrollTop = YES;      // v2.9.27：换天必须回到顶部，否则看到的是旧位置
     self.nextDay = day;
     [self rebuildLayout];
