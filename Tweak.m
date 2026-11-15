@@ -277,6 +277,14 @@
 //   列表未到/找不到时恒为 0，1345 被误判成没录像 → 不定位 → 不能播，这正是 35/36/37 退化的原因。
 //   第 2 台的说明改为**纯附加旁路**：仅当 MyCamera.isSupportSDReplay 明确为 NO 时，start 之后额外
 //   弹一次「没有本地 SD 录像」，不改变任何控制流（判断错也只是多说一句话，start 照发）。
+// v2.9.39（时间轴整条"没有带颜色"的根因，用户回溯 v2.9.35 就已经这样）：官方播放页
+//   JANewRtcSDPlayViewController 有**自己**的当前选中日字段 _currentSelectedSDDay（q），
+//   该日录像段列表是 _sdRecordFileArr（NSArray），时间轴上带颜色的段完全由这个列表画出；
+//   另有 loadRecordListWithSelectiontDay:（官方拉段入口）。我们以前只设 myCamera.sdSelectiontDay
+//   （跨天算相对秒用），**VC 自己的 _currentSelectedSDDay 一次都没设过** → 官方可能停在
+//   「今日/上次位置」，今日没录像 → 段列表空 → 时间轴整条空白（没有颜色）→ start 定位到那天也播不出。
+//   改法：切日时显式设 currentSelectedSDDay=报警日0点；2s 后检查 sdRecordFileArr，仍为空则
+//   补调 loadRecordListWithSelectiontDay:（只补一次，已有列表不动）。不改变 start/时间轴原链路。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -782,6 +790,15 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         if ([self respondsToSelector:st]) {
             ((void(*)(id, SEL))objc_msgSend)(self, st);
         }
+        // v2.9.39（时间轴整条读不到录像段的根因）：官方播放页有自己的「当前选中日」字段
+        // _currentSelectedSDDay，该日的录像段列表存在 _sdRecordFileArr 里，时间轴上那些
+        // 带颜色的段完全由这个列表画出来。我们以前只设了 myCamera.sdSelectiontDay（那是
+        // 跨天算相对秒用的），**VC 自己的 _currentSelectedSDDay 一次都没设过** —— 于是官方
+        // 可能还停在「今日 / 上次的位置」，而今日没有录像 → sdRecordFileArr 空 → 时间轴
+        // 整条没有颜色，后面 startSDPlay 定位到那天也自然播不出来。
+        @try {
+            [self setValue:@(dayStart) forKey:@"currentSelectedSDDay"];
+        } @catch (NSException *e) {}
         // 切报警日：官方要重新网络拉该日事件列表，否则定位到的是"今日"
         SEL sw = NSSelectorFromString(@"switchToSDDay:dateString:");
         if ([self respondsToSelector:sw]) {
@@ -792,6 +809,19 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
         @try {
             [self setValue:@(dayStart) forKeyPath:@"myCamera.sdSelectiontDay"];
         } @catch (NSException *e) {}
+        // v2.9.39 兜底补拉：switchToSDDay 没生效时 _sdRecordFileArr 仍是空的，时间轴就没颜色。
+        // 这里主动补一次官方自己的拉段入口（只补、不覆盖，已有列表就不动）。
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+            NSArray *arr = nil;
+            @try { arr = [self valueForKey:@"sdRecordFileArr"]; } @catch (NSException *e) {}
+            if ([arr isKindOfClass:[NSArray class]] && arr.count > 0) return;
+            SEL lr = NSSelectorFromString(@"loadRecordListWithSelectiontDay:");
+            if ([self respondsToSelector:lr]) {
+                ((void(*)(id, SEL, long long))objc_msgSend)(self, lr, dayStart);
+            }
+        });
         // 等 2.5s 让该日事件列表拉回来，然后**无条件**定位（v1.28 原链路，不做 evCount 门禁）
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
