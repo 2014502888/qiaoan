@@ -285,6 +285,17 @@
 //   「今日/上次位置」，今日没录像 → 段列表空 → 时间轴整条空白（没有颜色）→ start 定位到那天也播不出。
 //   改法：切日时显式设 currentSelectedSDDay=报警日0点；2s 后检查 sdRecordFileArr，仍为空则
 //   补调 loadRecordListWithSelectiontDay:（只补一次，已有列表不动）。不改变 start/时间轴原链路。
+//   —— 实测 v2.9.39 这样还不够（仍无颜色）。真正缺的那一样见 v2.9.40。
+// v2.9.40（时间轴无颜色的真凶，用户对照实测得出）：同一个 App、同一天、同一段录像，
+//   「消息列表 → 查看录像」进页面时间轴有颜色，格子回放进去却没有 —— 差别只可能在"怎么进页面"。
+//   逐行对比两条链，格子比消息少传的就一样：**currentEvent（原始 JAEMWarnInfoEntityModel）**。
+//   消息链：setValue myCamera → setValue currentEvent → setValue currentTimeStamp → 设 sdSelectiontDay
+//   格子链：setValue myCamera →                        setValue currentTimeStamp → 设 sdSelectiontDay
+//   官方 setupData 会读 currentEvent 来决定「载入哪一天/哪一段」；没有它就退回「今日」，
+//   今日通常没有录像 → sdRecordFileArr 空 → 时间轴整条空白 → start 定位到那天也播不出。
+//   改法：openPlayerAtIndex 里把 entry[@"ev"]（JAGridEntryFromMessage 一直在存的原始模型）
+//   通过 currentEvent 传给播放页，与消息链完全对齐。缓存命中的条目暂时没有 ev（缓存只存 sec/img），
+//   等网络数据回来覆盖后就有 —— 不影响正常流程。
 // 保留完整功能链路（v1.15~v1.25 全部修复）：
 //   点「看录像」→ 不再弹云存储 → push JANewRtcSDPlayViewController（官方本地 SD 回放）
 //   → viewDidAppear 后 3.0s：stopSDPlay（停官方自动流，单流）+
@@ -3328,6 +3339,13 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
 
     id vc = [[rtc alloc] init];
     @try { [vc setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
+    // v2.9.40（时间轴整条没颜色的真凶）：和「消息列表 → 查看录像」对齐 —— 那条链路
+    // 比格子多传了一样东西：currentEvent（原始报警模型）。官方 setupData 会读它来决定
+    // 要装载哪一天、哪一段录像；没有它就直接退回「今日」，而今日往往没录像 →
+    // sdRecordFileArr 为空 → 时间轴整条空白（一点颜色都没有），后面 start 定位自然也播不出。
+    // 用户实测：「消息里的查看录像就有颜色，格子回放没有」——差别就在这一行。
+    id ev = (id)entry[@"ev"];
+    if (ev) JASet(vc, @"currentEvent", ev);
     JASet(vc, @"currentTimeStamp", @(sec));
     JASet(self.myCamera, @"sdSelectiontDay", @(JADayStartSec(@(sec))));
 

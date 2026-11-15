@@ -21,12 +21,12 @@ jobs:
             -miphoneos-version-min=13.0 \
             -isysroot "$SDK" \
             -framework UIKit -framework Foundation -framework CoreGraphics -framework QuartzCore -framework ImageIO \
-            Tweak.m -o JoolinkSDReplay-v2.9.39.dylib
-          ls -la JoolinkSDReplay-v2.9.39.dylib
-          file JoolinkSDReplay-v2.9.39.dylib
+            Tweak.m -o JoolinkSDReplay-v2.9.40.dylib
+          ls -la JoolinkSDReplay-v2.9.40.dylib
+          file JoolinkSDReplay-v2.9.40.dylib
 
       - name: Upload dylib artifact
         uses: actions/upload-artifact@v4
         with:
-          name: JoolinkSDReplay-v2.9.39
-          path: JoolinkSDReplay-v2.9.39.dylib
+          name: JoolinkSDReplay-v2.9.40
+          path: JoolinkSDReplay-v2.9.40.dylib
