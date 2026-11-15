@@ -1736,6 +1736,15 @@ static NSString *JAGridDiskPathForKey(NSString *key) {
     return [dir stringByAppendingPathComponent:[NSString stringWithFormat:@"%08x.img", h]];
 }
 
+// v2.9.52：按服务器做物理划分 —— 只有华为云 OBS 那批（文件名带 _enc 的加密图）才走官方解密；
+// 乔安服务器（1345 那几台）的图一律不进这段代码，连函数都不会被调用。
+static BOOL JAIsEncryptedCoverURL(NSString *url) {
+    if (!url.length) return NO;
+    if ([url rangeOfString:@"myhuaweicloud.com"].location != NSNotFound) return YES;
+    if ([url rangeOfString:@"_enc."].location != NSNotFound) return YES;
+    return NO;
+}
+
 // v2.9.34：华为云 OBS 上的抓拍图是加密的（文件名带 _enc，返回体头不是 JPEG 魔数 FF D8 FF，
 // 实测是 E8 2A 2D C4… 这种数据）。官方 App 用 JADecryptionTool 在本地解 ——
 // 密钥由「设备 UID + 摄像头查看密码」推出来，不联网也能解。这里直接调官方类方法，不自己实现 AES：
@@ -1907,9 +1916,19 @@ static UIImage *JADecryptImageDataWithCamera(NSData *data, NSString *url, id cam
         dataTaskWithRequest:rq completionHandler:^(NSData *data, NSURLResponse *resp, NSError *err) {
             UIImage *img = nil;
             if (data) { @autoreleasepool { img = [UIImage imageWithData:data]; } }
-            // v2.9.34：直接解不出来 —— 这台设备的抓拍图是加密存的（_enc.jpg），
-            // 交给官方 JADecryptionTool（uid + 摄像头查看密码，本地推密钥）。
-            if (!img && data.length) { @autoreleasepool { img = JADecryptImageDataWithCamera(data, url, self.cam); } }
+            // v2.9.52：这里原来是无条件在后台队列里直接调解密 —— 两个问题：
+            // ① 乔安服务器（1345）的图本来就能直接解，却也会进这段，没必要；
+            // ② 官方 JADecryptionTool 是 App 内部工具，会碰全局设备/会话状态，而格子页
+            //    同时下 6 张图 → 6 次解密在后台并发执行，把全局设备上下文改乱，
+            //    回放页正靠它绑设备，于是 1345 也被带歪。
+            // 现在：只对华为云 OBS 的加密图解密，并且串行回主队列执行，一次一张，不并发。
+            if (!img && data.length && JAIsEncryptedCoverURL(url)) {
+                dispatch_sync(dispatch_get_main_queue(), ^{
+                    @autoreleasepool {
+                        img = JADecryptImageDataWithCamera(data, url, self.cam);
+                    }
+                });
+            }
             if (!img) {
                 // v2.9.23：记 HTTP 状态码（403/404）
                 if ([resp isKindOfClass:NSHTTPURLResponse.class]) {
