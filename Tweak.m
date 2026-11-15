@@ -571,6 +571,9 @@ static long long JAGridSecForMessage(id msg, long long day);
 // v3.0：定位用的「段秒」—— 一律取服务器写进 event_file_url 文件名里的那个 10 位秒
 //（就是那一段录像的真实起点，v1.32「查看录像」能精准定位全靠它）。解析不出来才退回双源校正。
 static long long JASegSec(id msg);
+// v3.2：SD 播放页 4 个 hook 统一安装入口（viewDidAppear / viewDidDisappear /
+// shouldBlockLiveUIBecauseSDUnavailable / didEnterLive）
+static void JAHookRtcExtras(Class cls);
 static NSArray *JAGridFindEvents(id vc);
 static NSNumber *JAGridTimestamp(id ev);
 
@@ -615,9 +618,7 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
     if (!cls) return;
     // RTC hooks 补装（类晚加载/轮询错过场景兜底）
     if (!g_rtcHooked) {
-        JASetImp(cls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
-        JASetImp(cls, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
-        g_rtcHooked = YES;
+        JAHookRtcExtras(cls);
     }
     id vc = [[cls alloc] init];
 
@@ -667,6 +668,42 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
 
 static IMP g_orig_clickCloudRecordAction = NULL;
 static IMP g_orig_handleJumpToOpenCloud = NULL;
+// v3.2：官方自带的两个"退回实时"开关
+static IMP g_orig_shouldBlockLive = NULL;   // - shouldBlockLiveUIBecauseSDUnavailable
+static IMP g_orig_didEnterLive = NULL;      // - didEnterLive
+
+// v3.2：官方 SD 回放页在两种情况下会自己切到"实时监控"：
+//   ① -shouldBlockLiveUIBecauseSDUnavailable 返回 YES（SD 检测没过，认为不能回放）；
+//   ② -didEnterLive 被调（正式进入实时模式）。
+// 这两条一旦走通，界面就变成"进度条能拉、但没有任何录像段颜色、画面一直是现在"——
+// 正是用户看到的现象。我们主动打开的回放页要的是 SD 模式，所以对 g_activeSDPlayer：
+//   ① 一律返回 NO（不拦），② 吞掉不让它进实时。
+// 只对我们自己 push 的那个实例生效，官方其它入口照原样走。
+static BOOL ja_shouldBlockLive(id self, SEL _cmd) {
+    if (self == g_activeSDPlayer) return NO;
+    if (g_orig_shouldBlockLive) {
+        return ((BOOL(*)(id, SEL))g_orig_shouldBlockLive)(self, _cmd);
+    }
+    return NO;
+}
+
+static void ja_didEnterLive(id self, SEL _cmd) {
+    if (self == g_activeSDPlayer) return;   // 我们主动开的那一页不进实时
+    if (g_orig_didEnterLive) {
+        ((void(*)(id, SEL))g_orig_didEnterLive)(self, _cmd);
+    }
+}
+
+// v3.2：SD 回放页 4 个 hook 的安装入口（幂等）
+static void JAHookRtcExtras(Class cls) {
+    if (!cls) return;
+    JASetImp(cls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
+    JASetImp(cls, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
+    JASetImp(cls, @selector(shouldBlockLiveUIBecauseSDUnavailable),
+             (IMP)ja_shouldBlockLive, &g_orig_shouldBlockLive);
+    JASetImp(cls, @selector(didEnterLive), (IMP)ja_didEnterLive, &g_orig_didEnterLive);
+    g_rtcHooked = YES;
+}
 
 // v1.15 核心：JANewRtcSDPlayViewController viewDidAppear（官方本地 SD 回放界面）
 // 官方 viewDidLoad/setupData 已自动：setMyCamera 到 sharedInstance、setIsSDPlayer:YES、
@@ -3120,9 +3157,7 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     // v2.8：RTC hooks 补装（和详情页链路一致）—— 少了这个，viewDidAppear 不会
     // 触发定位，进去就只剩官方自动播的最新实时画面
     if (!g_rtcHooked) {
-        JASetImp(rtc, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
-        JASetImp(rtc, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
-        g_rtcHooked = YES;
+        JAHookRtcExtras(rtc);
     }
 
     id vc = [[rtc alloc] init];
@@ -3903,8 +3938,7 @@ static void JAHook(void) {
     if (!g_rtcHooked) {
         Class rtcCls = NSClassFromString(@"JANewRtcSDPlayViewController");
         if (rtcCls) {
-            JASetImp(rtcCls, @selector(viewDidAppear:), (IMP)ja_rtc_viewDidAppear, &g_orig_rtc_vda);
-            JASetImp(rtcCls, @selector(viewDidDisappear:), (IMP)ja_rtc_viewDidDisappear, &g_orig_rtc_vdd);
+            JAHookRtcExtras(rtcCls);
             // v2.0：入口 —— 给官方回放页加「格子」按钮（viewWillAppear 可能继承自
             // UIViewController，所以用 class_addMethod 只挂在本类，避免污染全局）
             if (!g_orig_rtc_vwa) {
@@ -3916,7 +3950,6 @@ static void JAHook(void) {
                 JASetImp(rtcCls, @selector(viewWillAppear:), (IMP)ja_rtc_viewWillAppear, &g_orig_rtc_vwa);
             }
             class_addMethod(rtcCls, @selector(ja_openGrid:), (IMP)ja_openGrid, "v@:@");
-            g_rtcHooked = YES;
         }
     }
     // v2.2：首页卡片入口（定时扫可见视图，插在「云存储 / AI分析」中间）
