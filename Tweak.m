@@ -756,10 +756,12 @@ static void JADiagAttach(UIViewController *vc, long long sec, id cam, NSString *
     }
 }
 
-static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {    // 目标界面 = 官方本地 SD 回放 JANewRtcSDPlayViewController（RTC 完整播放器，
+// v4.9：forceSec > 0 时用调用方给的目标秒，否则按 warn 自己解析。
+// 返回 push 出去的 VC（格子链要用它设 playIndex/角标）；失败返回 nil。
+static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long long forceSec) {    // 目标界面 = 官方本地 SD 回放 JANewRtcSDPlayViewController（RTC 完整播放器，
     // 时间轴/日历/SD 卡检测/播放控制；用户手动进本地回放看到的就是它）。
     Class cls = NSClassFromString(@"JANewRtcSDPlayViewController");
-    if (!cls) return;
+    if (!cls) return nil;
     // RTC hooks 补装（类晚加载/轮询错过场景兜底）
     if (!g_rtcHooked) {
         JAHookRtcExtras(cls);
@@ -778,13 +780,13 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {    
     } @catch (NSException *e) {}
 
     // 2) 事件与时间戳
-    if (warn) {
-        JASet(vc, @"currentEvent", warn);
-        NSNumber *ts = JABuildTimestamp(warn);
+    if (warn || forceSec > 0) {
+        if (warn) JASet(vc, @"currentEvent", warn);
+        NSNumber *ts = warn ? JABuildTimestamp(warn) : nil;
         // v3.0：目标秒和格子页同一来源 —— 服务器段秒优先（v1.32 那条能用的链）。
-        long long d0 = JAGridDayFromMessage(warn);
+        long long d0 = forceSec > 0 ? JADayStartSec(@(forceSec)) : JAGridDayFromMessage(warn);
         if (d0 <= 0) d0 = JADayStartSec(ts);
-        long long fixed = JASegSec(warn);
+        long long fixed = forceSec > 0 ? forceSec : JASegSec(warn);
         if (fixed > 0) {
             JASet(vc, @"currentTimeStamp", @(fixed));
             g_rtcTargetSec = fixed;
@@ -811,6 +813,11 @@ static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {    
     } else {
         [UIApplication.sharedApplication.keyWindow.rootViewController presentViewController:vc animated:YES completion:nil];
     }
+    return vc;
+}
+
+static void JATryOpenSDReplay(UIViewController *detailVC, id warn, id cam) {
+    JATryOpenSDReplayAt(detailVC, warn, cam, 0);
 }
 
 // ---------- hook 实现（C IMP，无类依赖） ----------
@@ -3673,43 +3680,21 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
         JAHookRtcExtras(rtc);
     }
 
-    id vc = [[rtc alloc] init];
-    // v3.9：格子链逐步对齐官方「查看录像」那条链（JATryOpenSDReplay）—— 它是唯一被
-    // 实测证明"点进去就有录像段颜色、能精准对位"的路径，格子就和它走一样的四步：
-    //   ① camera 换成 JAGroupManager 里那份共享实例（按**设备 ID**取，不是 uid）
-    //   ② 摆好 JADevicePlatform 的回放状态（playBackActionType / isSDPlayer）+ 连通道
-    //   ③ 挂 currentEvent（官方 setupData 靠它确定"初始选中的就是这条记录"）
-    //   ④ 挂 currentTimeStamp + sdSelectiontDay
-    // 这四步就是"点格子时先按消息列表那条路把东西拿到手"的具体落地。
     id ev0 = entry[@"ev"];
-    // v4.5：cam 换成 JAGroupManager 的 myCameraMap 里**那一个对象** —— 官方所有入口
-    // （详情页「查看录像」、卡回放）用的都是它，当天完整的录像段列表缓存在它身上。
-    // 格子以前用的 self.myCamera 是等值但不同的实例，字段一模一样，段却只拉回 17 条
-    //（官方那页是 269 条）。这就是"其余全同、只有段数不同"的来源。
+    // v4.9 —— 按用户要求：**点格子就直接模拟一次「查看录像」**。
+    // 不再自己 [[rtc alloc] init] 后往 VC 上一个个塞 ivar（currentEvent / currentTimeStamp /
+    // todayMaxTimestamp / sdSelectiontDay 这一串），那条自造链实测段数只有 18 条、
+    // 时间轴画到 15:50 就断、画面停在实时 —— 而「查看录像」同一条界面是 271 条、能回放。
+    // 现在格子直接调 JATryOpenSDReplayAt —— 它就是 hook 官方「查看录像」
+    // (clickCloudRecordAction:) 之后走的那个函数，一字不差，只是多给一个目标秒。
+    // cam 依旧先换到 JAGroupManager.myCameraMap 里那一个对象（官方所有入口共用的那份）。
     NSString *camSrc = nil;
     id gmCam = JAFindCameraFromGroupManager(ev0, &camSrc);
     if (gmCam) self.myCamera = gmCam;
-    id cam2 = JAPrepareSDPlatform(self.myCamera);
-    if (cam2) self.myCamera = cam2;
-    @try { [vc setValue:self.myCamera forKey:@"myCamera"]; } @catch (NSException *e) {}
-    // v4.6：currentEvent 不塞了。实测两页 cam 是同一个对象（0x118a09c00），
-    // 唯一差别是段数：查看录像 271 段、格子只有 17 段 —— 17 条正好是"当天报警事件"的
-    // 量级，而不是全天录像段。官方 setupData 就是看 currentEvent 决定拉取范围：
-    // 给了具体一条记录，它只拉那几条 → 目标时间落在段之外 → startSDPlayWithSelectTimeStamp:
-    // 退回实时（画面实时、指示器却停在目标点，正是 v1.32 注释里那个故障模式）。
-    // 不塞时，官方按 sdSelectiontDay 拉全天段（271 条），时间轴才有红蓝段。
-    JASet(vc, @"currentEvent", nil);
-    JASet(vc, @"currentTimeStamp", @(sec));
-    // v4.7：todayMaxTimestamp 是官方时间轴的**拉取上限**。不设时它按"进入时刻"封顶，
-    // 段列表就只拉到那一刻前后（18 条，时间轴画到 15:50 就断），目标秒之后全是空白 ——
-    // 看起来跟"没颜色、拖不动"一模一样。显式给到当天最后一秒，官方才会把整天拉满
-    //（正确页 271 条、时间轴画到 16:20 之后，就是这个值大）。
-    JASet(vc, @"todayMaxTimestamp", @((double)(JADayStartSec(@(sec)) + 86400LL - 1)));
-    JASet(self.myCamera, @"sdSelectiontDay", @(JADayStartSec(@(sec))));
 
-    // 复用 v1.28 定位链路：viewDidAppear 后 3.0s 自动定位到 g_rtcTargetSec
-    g_rtcTargetSec = sec;
-    g_activeSDPlayer = vc;
+    id vc = JATryOpenSDReplayAt(self, ev0, self.myCamera, sec);
+    if (!vc) return;
+
     self.playIndex = index;
     self.playingVC = vc;
 
@@ -3717,11 +3702,6 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     if (ip) [self.cv scrollToItemAtIndexPath:ip
                            atScrollPosition:UICollectionViewScrollPositionCenteredVertically
                                    animated:NO];
-
-    UINavigationController *nav = self.navigationController;
-    if (!nav) return;
-    [nav pushViewController:vc animated:YES];
-    JADiagAttach(vc, sec, self.myCamera, camSrc);
 
     // v2.9.8：官方 SD 回放页自带的时间轴/拖动条不再隐藏（用户要能自己拖）。
     // v2.8：画面右上角标出这一格的目标时间 —— 定位有没有生效靠这个角标和画面对照
