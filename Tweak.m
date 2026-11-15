@@ -701,6 +701,9 @@ static NSInteger JAGridDayEventCount(NSArray *evs, long long day) {
 
 // v1.15：当前活跃 RTC SD 播放器指针（纯 C 比较守卫，不向对象发消息）
 static id g_activeSDPlayer = nil;
+// v2.9.46：格子链由我们设过 JADevicePlatform 的 isSDPlayer 时置 YES ——
+// 离开播放页必须还原成 NO，否则主界面实时预览会被留在 SD 通道上。
+static BOOL g_forceSDPlayer = NO;
 static BOOL g_rtcHooked = NO;        // JANewRtcSDPlayViewController hook 已装
 static IMP g_orig_rtc_vda = NULL;    // 原 viewDidAppear: IMP
 static IMP g_orig_rtc_vdd = NULL;    // 原 viewDidDisappear: IMP（v1.30 返回停流）
@@ -894,11 +897,25 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
                         @try { camd = [cam valueForKey:@"sdSelectiontDay"]; } @catch (NSException *e) {}
                         @try { uid = [cam valueForKey:@"uid"]; } @catch (NSException *e) {}
                     }
-                    @try { ent = [self valueForKey:@"isEnterSDPlay"]; } @catch (NSException *e) {}
+                    // v2.9.46：v2.9.45 诊断证明 isEnterSDPlay 不是这个 VC 的字段（取到 null），
+                    // 改成读 JADevicePlatform 的 isSDPlayer —— 那才是决定走实时还是走 SD 回放的开关。
+                    Class dp3 = NSClassFromString(@"JADevicePlatform");
+                    if (dp3) {
+                        id sh3 = nil;
+                        SEL si3 = NSSelectorFromString(@"sharedInstance");
+                        if ([(id)dp3 respondsToSelector:si3]) {
+                            @try {
+                                sh3 = ((id(*)(id, SEL))objc_msgSend)((id)dp3, si3);
+                            } @catch (NSException *e) {}
+                        }
+                        if (sh3) {
+                            @try { ent = [sh3 valueForKey:@"isSDPlayer"]; } @catch (NSException *e) {}
+                        }
+                    }
                     NSInteger n = -1;
                     if ([arr isKindOfClass:[NSArray class]]) n = (NSInteger)arr.count;
                     NSString *txt = [NSString stringWithFormat:
-                        @"段=%ld  VC日=%@\n摄像日=%@\nUID=%@\n入SD=%@  目标=%@",
+                        @"段=%ld  VC日=%@\n摄像日=%@\nUID=%@\n平台SD=%@  目标=%@",
                         (long)n, vcd, camd, uid, ent, JAGridTimeText(sec)];
                     UILabel *lab = [[UILabel alloc] initWithFrame:CGRectZero];
                     lab.tag = 0x1A66;
@@ -1022,6 +1039,27 @@ static void ja_rtc_viewDidDisappear(id self, SEL _cmd) {
     if (g_orig_rtc_vdd) ((void(*)(id, SEL))g_orig_rtc_vdd)(self, _cmd);
     if (self != g_activeSDPlayer) return;
     g_activeSDPlayer = nil;  // 先清标记：后续 viewDidAppear/定位闭包不再执行
+    // v2.9.46：格子链进页面时是我们把 JADevicePlatform.isSDPlayer 置 YES 的，
+    // 离开必须还原成 NO，不然主界面的实时预览会被一直留在 SD 通道（画面会出问题）。
+    if (g_forceSDPlayer) {
+        g_forceSDPlayer = NO;
+        Class dpc2 = NSClassFromString(@"JADevicePlatform");
+        if (dpc2) {
+            id shared2 = nil;
+            SEL si2 = NSSelectorFromString(@"sharedInstance");
+            if ([(id)dpc2 respondsToSelector:si2]) {
+                @try {
+                    shared2 = ((id(*)(id, SEL))objc_msgSend)((id)dpc2, si2);
+                } @catch (NSException *e) {}
+            }
+            if (shared2) {
+                SEL sdp2 = NSSelectorFromString(@"setIsSDPlayer:");
+                if ([shared2 respondsToSelector:sdp2]) {
+                    ((void(*)(id, SEL, BOOL))objc_msgSend)(shared2, sdp2, NO);
+                }
+            }
+        }
+    }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         SEL st = NSSelectorFromString(@"stopSDPlay");
@@ -3438,6 +3476,19 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
             SEL sm = NSSelectorFromString(@"setMyCamera:");
             if ([shared respondsToSelector:sm]) {
                 ((void(*)(id, SEL, id))objc_msgSend)(shared, sm, self.myCamera);
+            }
+            // v2.9.46：真正缺的那一环 —— isSDPlayer。
+            // v2.9.45 的现场诊断给出：sdRecordFileArr 段=14（录像段拉到了，时间轴也画出颜色了），
+            // 但四个画面还是今日 13:03/13:06 的实时流，时间轴指示器停在 12:44:46 也不动。
+            // 官方播放页自己就有 didEnterLive（进入实时）这个分支 —— 说明它走到了「实时」而不是
+            // 「SD 回放」。设备上下文里决定走哪条流的就是这个 isSDPlayer 开关（JADevicePlatform
+            // 有 setIsSDPlayer: / setIsEnterDeviceList: / setIsBackground: 一组状态位）。
+            // 消息详情页进 SD 回放前官方已经把它置位了，我们自己写的格子页没置过 —— 于是设备
+            // 一直喂实时流。这里补一次，并在离开播放页时还原（见 ja_rtc_viewDidDisappear）。
+            SEL sdp = NSSelectorFromString(@"setIsSDPlayer:");
+            if ([shared respondsToSelector:sdp]) {
+                ((void(*)(id, SEL, BOOL))objc_msgSend)(shared, sdp, YES);
+                g_forceSDPlayer = YES;
             }
         }
     }
