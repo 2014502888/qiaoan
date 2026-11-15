@@ -871,13 +871,48 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
     }
 
     // 3) push
-    // v4.19.1：不立刻推。实测同一进程第 1 次点只回 22 条、第 2 次起回 360/367 条，
-    // 两次的 VC/CAM/VM/PLT 字段完全一致（tmax、today、notAdj、newReplay 都一样），
-    // 说明差别不在任何字段值上，而在"设备连接从直播态切到 SD 态"这件事还没做完，
-    // 页面就已经发请求了 —— 拿回来的是事件级列表。所以让准备先落地，再把页面推出去。
+    // v4.20：影子预热。这是换思路，不是再调字段。
+    // 已被日志证实的事实：同一进程第 1 次点只回 22 条（事件级），第 2/3 次回 360/367 条
+    // （录像段级），而两次的 VC/CAM/VM/PLT 字段完全相同。也就是说成功的那次不是"字段对了"，
+    // 而是"这个进程里已经有一个页面完整加载过一次了"。
+    // 所以这里先建一个不显示的影子页面，让它把整套加载跑完；等它拿到全天段，
+    // 把那份数组直接交给真正要显示的页面，再推出去。用户只会看到一次进入。
     long long secCap = g_rtcTargetSec;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+    Class sdCls = NSClassFromString(@"JANewRtcSDPlayViewController");
+    id shadow = nil;
+    if (sdCls) {
+        @try {
+            shadow = [[sdCls alloc] init];
+            JASet(shadow, @"myCamera", cam);
+            JASet(shadow, @"currentTimeStamp", @((double)secCap));
+            if (d0 > 0) {
+                JASet(shadow, @"sdSelectiontDay", @(d0));
+                JASet(shadow, @"todayMaxTimestamp", @((double)(d0 + 86400LL - 1)));
+            }
+            (void)[shadow valueForKey:@"view"];   // 触发 viewDidLoad -> setupData -> 发起加载
+            JALog(@"shadow warmup start cam=%p", (__bridge void *)cam);
+        } @catch (NSException *e) {
+            JALog(@"shadow warmup threw %@", e.name);
+            shadow = nil;
+        }
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
+        NSArray *segs = nil;
+        if (shadow && [shadow isKindOfClass:[NSObject class]]) {
+            id o = [JAVal(shadow, @"sdRecordFileArr") copy];
+            if ([o isKindOfClass:[NSArray class]]) segs = o;
+        }
+        JALog(@"shadow arr=%lu", (unsigned long)segs.count);
+        if (segs.count > 150) {
+            @try {
+                [vc setValue:segs forKey:@"sdRecordFileArr"];
+                JALog(@"shadow segs handed to real page: %lu", (unsigned long)segs.count);
+            } @catch (NSException *e) {
+                JALog(@"shadow handover threw %@", e.name);
+            }
+        }
         UINavigationController *nav = detailVC.navigationController;
         if (!nav) nav = JATopVC().navigationController;
         if (nav) {
