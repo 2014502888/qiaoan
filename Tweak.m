@@ -713,14 +713,24 @@ static NSString *JADiagText(UIViewController *vc, id cam, long long sec, NSStrin
     @try { tmax = [[vc valueForKey:@"todayMaxTimestamp"] doubleValue]; } @catch (NSException *e) {}
     @try { cts = [[vc valueForKey:@"currentTimeStamp"] doubleValue]; } @catch (NSException *e) {}
 
+    // ⑦ v4.10：MyCamera.eventList —— 官方 SD 页就是拿它当"录像段"用的。
+    // 为什么"先点一次查看录像、再点格子就正常"：前面那次进去把当天事件列表缓存进了
+    // camera 对象，后面同一份 camera 直接复用；冷启动直接点格子时它是空的 → 段=0。
+    long long evN = -1;
+    @try {
+        id el = [cam valueForKey:@"eventList"];
+        if ([el isKindOfClass:[NSArray class]]) evN = (long long)[(NSArray *)el count];
+        else if (el) evN = -2;
+    } @catch (NSException *e) { evN = -3; }
+
     long long day = JADayStartSec(@(sec));
     long long rel = sec - day;
     // v4.5：把 cam 的**对象指针**打出来 —— 两页一比，就知道是不是同一个实例。
     // 段数 269 vs 17 而其余字段全同，最可能就是"两份等值但不同的 MyCamera"，
     // 其中官方那份缓存着全天段列表，我们那份只拿到一小段。
     id vcCam = JAVal(vc, @"myCamera");
-    return [NSString stringWithFormat:@"段=%lu 入SD=%@ ce=%@\npb=%lu platSD=%d 卡态=%d 待直播=%d 已检=%d %@\ntmax=%.0f cts=%.0f 日=%lld 目标=%lld rel=%lld\ncam=%p vcam=%p src=%@\n首段=%@",
-            (unsigned long)segN, sdMode, ceTxt,
+    return [NSString stringWithFormat:@"段=%lu 入SD=%@ ce=%@ ev=%lld\npb=%lu platSD=%d 卡态=%d 待直播=%d 已检=%d %@\ntmax=%.0f cts=%.0f 日=%lld 目标=%lld rel=%lld\ncam=%p vcam=%p src=%@\n首段=%@",
+            (unsigned long)segN, sdMode, ceTxt, evN,
             (unsigned long)pbType, isSD ? 1 : 0,
             cardState, startLive ? 1 : 0, statusChecked ? 1 : 0, lmTxt,
             tmax, cts, day, sec, rel, (void *)cam, (void *)vcCam, src ? src : @"-", firstSeg];
@@ -799,6 +809,11 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
         // 读 myCamera.sdSelectiontDay → 加载该日事件列表
         if (d0 > 0 && cam) {
             JASet(cam, @"sdSelectiontDay", @(d0));
+        }
+        // v4.10：时间轴拉取上限。v4.9 把这段去掉了，结果官方一段都没拉到（段=0）——
+        // 说明它必须给，且要给到"当天最后一秒"，否则官方只拉到进入那一刻。
+        if (d0 > 0) {
+            JASet(vc, @"todayMaxTimestamp", @((double)(d0 + 86400LL - 1)));
         }
     }
 
@@ -3691,6 +3706,23 @@ static void JAGridToggleSpeedPanel(BOOL hide) {
     NSString *camSrc = nil;
     id gmCam = JAFindCameraFromGroupManager(ev0, &camSrc);
     if (gmCam) self.myCamera = gmCam;
+
+    // v4.10 —— 这就是用户说的"点格子时先读一次消息列表，把东西拿到手"。
+    // 官方 SD 页的录像段不是它自己现拉的，而是读 MyCamera.eventList（当天事件列表）：
+    // 走一次「消息 → 报警消息 → 监控 → 消息列表 → 查看录像」时，前面的列表页已经把这个
+    // 数组填好了，所以同一份 camera 再进就满屏红蓝段；冷启动直接点格子它是空的，
+    // 于是段落全无、时间轴只有蓝带、画面留在实时（v4.9 实测段=0）。
+    // 格子页本来就把当天全部事件攥在手里（封面就是它们拉的），这里直接灌进去。
+    @try {
+        NSMutableArray *evs = [NSMutableArray array];
+        for (NSDictionary *e0 in self.flat) {
+            id ev = e0[@"ev"];
+            if (ev) [evs addObject:ev];
+        }
+        if (evs.count > 0) {
+            JASet(self.myCamera, @"eventList", [evs copy]);
+        }
+    } @catch (NSException *e) {}
 
     id vc = JATryOpenSDReplayAt(self, ev0, self.myCamera, sec);
     if (!vc) return;
