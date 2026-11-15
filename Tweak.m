@@ -1343,30 +1343,74 @@ static void JATimeLineSyncToSec(id sdVC, long long sec) {
 // 造一个真实的「消息详情」页，直接调它 clickCloudRecordAction: 的**官方原实现**，
 // 让官方自己 new 出 SD 页、自己把段拉满；我们只把中间那层详情页从栈里摘掉，
 // 再在 SD 页 didAppear 时补一刀"定位到目标秒"（见 g_rtcOfficialMode 分支）。
+static BOOL g_detailNavPatched = NO;
+static id g_fakeNavHost = nil;
+static id g_fakeNav = nil;
+static IMP g_orig_detailNavImp = NULL;
+
+// v4.12.1：让"借用"的那个详情页返回我们要的导航栈，但它自己**不进栈** ——
+// 这样它的 viewDidLoad 永远不会跑（那里面要建整套 UI，还要按 pythonIndex 找
+// "上一条/下一条"，冷启动数据不齐就数组越界，v4.12.0 点格子闪退就是崩在这里）。
+// 我们只借它的 clickCloudRecordAction: 跑一遍官方链，别的都不要。
+static id ja_detail_navigationController(id self, SEL _cmd) {
+    if (g_fakeNavHost && self == g_fakeNavHost) return g_fakeNav;
+    if (g_orig_detailNavImp) {
+        return ((id (*)(id, SEL))g_orig_detailNavImp)(self, _cmd);
+    }
+    return nil;
+}
+
+static void JAPatchDetailNavigation(Class cls) {
+    if (g_detailNavPatched || !cls) return;
+    SEL sel = @selector(navigationController);
+    // 只在本类自己实现的 selector 上换 IMP；父类 UIViewController 的实现绝不能动，
+    // 否则会把全 App 的 navigationController 都劫持掉。
+    unsigned int cnt = 0;
+    Method *list = class_copyMethodList(cls, &cnt);
+    Method own = NULL;
+    for (unsigned int i = 0; i < cnt; i++) {
+        if (method_getName(list[i]) == sel) { own = list[i]; break; }
+    }
+    if (list) free(list);
+    if (own) {
+        g_orig_detailNavImp = method_getImplementation(own);
+        method_setImplementation(own, (IMP)ja_detail_navigationController);
+    } else {
+        class_addMethod(cls, sel, (IMP)ja_detail_navigationController, "@@:");
+    }
+    g_detailNavPatched = YES;
+}
+
 static id JATryOpenViaOfficialDetail(UIViewController *host, id warn, id cam,
                                      long long sec, NSArray *warnList) {
+    (void)warnList;   // 不塞"上一条/下一条"数组：那是闪退的源头，官方链不需要它
+    (void)sec;
     Class cls = NSClassFromString(@"JANewsEnWarnInfoDetailVC");
     if (!cls || !host || !warn) return nil;
     UINavigationController *nav = [host navigationController];
     if (!nav) return nil;
+    JAPatchDetailNavigation(cls);
+
     id dvc = nil;
     @try { dvc = [[cls alloc] init]; } @catch (NSException *e) { return nil; }
     if (!dvc) return nil;
-    // 只喂它 viewDidLoad / 官方 click 分支真正会读的那几个字段，别的都不塞
-    JASet(dvc, @"warnInfoEntityModelEx", warn);
-    if (warnList.count > 0) JASet(dvc, @"warnInfoListArr", warnList);
-    NSString *devId = JAGridDeviceId(cam);
-    if (devId.length > 0) JASet(dvc, @"deviceId", devId);
-    id pwd = JAVal(cam, @"viewPwd");
-    if (![pwd isKindOfClass:[NSString class]] || [(NSString *)pwd length] == 0) {
-        pwd = JAVal(cam, @"dev_pwd");
-    }
-    if ([pwd isKindOfClass:[NSString class]] && [(NSString *)pwd length] > 0) {
-        JASet(dvc, @"devicePwd", pwd);
-    }
+    // 只喂官方 click 分支真正会读的字段；不 push 它，所以不用管 UI 需要什么
+    @try {
+        JASet(dvc, @"warnInfoEntityModelEx", warn);
+        NSString *devId = JAGridDeviceId(cam);
+        if (devId.length > 0) JASet(dvc, @"deviceId", devId);
+        id pwd = JAVal(cam, @"viewPwd");
+        if (![pwd isKindOfClass:[NSString class]] || [(NSString *)pwd length] == 0) {
+            pwd = JAVal(cam, @"dev_pwd");
+        }
+        if ([pwd isKindOfClass:[NSString class]] && [(NSString *)pwd length] > 0) {
+            JASet(dvc, @"devicePwd", pwd);
+        }
+    } @catch (NSException *e) {}
 
     NSArray *before = [[nav viewControllers] copy];
-    [nav pushViewController:dvc animated:NO];
+    g_fakeNavHost = dvc;
+    g_fakeNav = nav;
     SEL click = NSSelectorFromString(@"clickCloudRecordAction:");
     @try {
         if (g_orig_clickCloudRecordAction) {
@@ -1375,19 +1419,16 @@ static id JATryOpenViaOfficialDetail(UIViewController *host, id warn, id cam,
             ((void(*)(id, SEL, id))objc_msgSend)(dvc, click, nil);
         }
     } @catch (NSException *e) {}
+    g_fakeNavHost = nil;
+    g_fakeNav = nil;
 
-    // 找官方这次新建的 SD 页（栈里新出现的、且不是刚才那个详情页）
+    // 官方这次 push 出来的就是 SD 回放页（它自己 new、自己拉段）
     id sdvc = nil;
     for (id v in [nav viewControllers]) {
-        if (v == dvc) continue;
         BOOL old = NO;
         for (id o in before) { if (o == v) { old = YES; break; } }
         if (!old) sdvc = v;
     }
-    // 把中间那层详情页摘掉，只留官方 SD 页（用户只该看到回放页，不该看到消息详情）
-    NSMutableArray *vcs = [[nav viewControllers] mutableCopy];
-    if ([vcs containsObject:dvc]) [vcs removeObject:dvc];
-    if (vcs.count > 0) [nav setViewControllers:vcs animated:NO];
     if (!sdvc) return nil;
     return sdvc;
 }
