@@ -871,59 +871,19 @@ static id JATryOpenSDReplayAt(UIViewController *detailVC, id warn, id cam, long 
     }
 
     // 3) push
-    // v4.20：影子预热。这是换思路，不是再调字段。
-    // 已被日志证实的事实：同一进程第 1 次点只回 22 条（事件级），第 2/3 次回 360/367 条
-    // （录像段级），而两次的 VC/CAM/VM/PLT 字段完全相同。也就是说成功的那次不是"字段对了"，
-    // 而是"这个进程里已经有一个页面完整加载过一次了"。
-    // 所以这里先建一个不显示的影子页面，让它把整套加载跑完；等它拿到全天段，
-    // 把那份数组直接交给真正要显示的页面，再推出去。用户只会看到一次进入。
+    // v4.20.1：影子预热实测也只得 22 条（数据不是靠"多建一个页面"就能提前拿到的），
+    // 撤掉。改为正常推页，由 viewDidAppear 那边等段数到齐再起播。
     long long secCap = g_rtcTargetSec;
-    Class sdCls = NSClassFromString(@"JANewRtcSDPlayViewController");
-    id shadow = nil;
-    if (sdCls) {
-        @try {
-            shadow = [[sdCls alloc] init];
-            JASet(shadow, @"myCamera", cam);
-            JASet(shadow, @"currentTimeStamp", @((double)secCap));
-            if (d0 > 0) {
-                JASet(shadow, @"sdSelectiontDay", @(d0));
-                JASet(shadow, @"todayMaxTimestamp", @((double)(d0 + 86400LL - 1)));
-            }
-            (void)[shadow valueForKey:@"view"];   // 触发 viewDidLoad -> setupData -> 发起加载
-            JALog(@"shadow warmup start cam=%p", (__bridge void *)cam);
-        } @catch (NSException *e) {
-            JALog(@"shadow warmup threw %@", e.name);
-            shadow = nil;
-        }
+    UINavigationController *nav = detailVC.navigationController;
+    if (!nav) nav = JATopVC().navigationController;
+    if (nav) {
+        g_activeSDPlayer = vc;  // 登记当前活跃 RTC SD 播放器（viewDidAppear hook 守卫用）
+        g_rtcOfficialMode = YES;
+        [nav pushViewController:vc animated:YES];
+        JADiagAttach(vc, secCap, cam, nil);
+    } else {
+        [UIApplication.sharedApplication.keyWindow.rootViewController presentViewController:vc animated:YES completion:nil];
     }
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        NSArray *segs = nil;
-        if (shadow && [shadow isKindOfClass:[NSObject class]]) {
-            id o = [JAVal(shadow, @"sdRecordFileArr") copy];
-            if ([o isKindOfClass:[NSArray class]]) segs = o;
-        }
-        JALog(@"shadow arr=%lu", (unsigned long)segs.count);
-        if (segs.count > 150) {
-            @try {
-                [vc setValue:segs forKey:@"sdRecordFileArr"];
-                JALog(@"shadow segs handed to real page: %lu", (unsigned long)segs.count);
-            } @catch (NSException *e) {
-                JALog(@"shadow handover threw %@", e.name);
-            }
-        }
-        UINavigationController *nav = detailVC.navigationController;
-        if (!nav) nav = JATopVC().navigationController;
-        if (nav) {
-            g_activeSDPlayer = vc;  // 登记当前活跃 RTC SD 播放器（viewDidAppear hook 守卫用）
-            g_rtcOfficialMode = YES;
-            [nav pushViewController:vc animated:YES];
-            JADiagAttach(vc, secCap, cam, nil);
-        } else {
-            [UIApplication.sharedApplication.keyWindow.rootViewController presentViewController:vc animated:YES completion:nil];
-        }
-    });
     return vc;
 }
 
@@ -979,6 +939,15 @@ static NSString *JASDArrDesc(id vc) {
         if ([arr count] > 0) cls = NSStringFromClass([(id)arr[0] class]);
         return [NSString stringWithFormat:@"%lu/%@", (unsigned long)[arr count], cls];
     } @catch (NSException *e) { return @"?"; }
+}
+
+// 当前页面持有的录像段条数（-1 表示还没拿到数组）
+static int JASDArrCount(id vc) {
+    @try {
+        id a = [vc valueForKey:@"sdRecordFileArr"];
+        if ([a isKindOfClass:[NSArray class]]) return (int)[(NSArray *)a count];
+    } @catch (NSException *e) {}
+    return -1;
 }
 
 static IMP g_orig_setupData = NULL;
@@ -1482,24 +1451,37 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
     // 绝不能再 stopSDPlay / switchToSDDay / 重拉段：那套是给"自造页救段"用的，
     // 在官方页上做会把刚拉好的 269 段直接冲成十几条。
     if (g_rtcOfficialMode) {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                       dispatch_get_main_queue(), ^{
+        // v4.20.1：实测第 1 次进页面 1 秒后 arr=22，而第 2 次进页面"一出生就有 360 条"。
+        // 说明数据不是拿不到，是到得晚：原逻辑 1.2 秒就起播，等于拿 22 条去开播，
+        // 时间轴自然只剩零星几段、拖了也不回放。改成等段数到齐（≥150）再起播，最多等 20 秒。
+        __block int tries2 = 0;
+        __block void (^poll2)(void);
+        poll2 = ^{
             if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
-            // v4.13.7：回归"只定位、绝不碰列表"。v4.13.6 那记 switchToSDDay 兜底把
-            // setupData 已经拉好的段清成了 0（段=0 首段=- 就是这么来的），这里全部撤掉。
-            // 官方页 tmax 实测是 日+86400（1794672000 → 1794758400）。
+            int n = JASDArrCount(self);
+            tries2++;
+            if (n < 150 && tries2 <= 40) {
+                if (tries2 == 1 || tries2 % 4 == 0) JALog(@"VDA wait arr=%d tries=%d", n, tries2);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), poll2);
+                return;
+            }
+            JALog(@"VDA data ready arr=%d tries=%d", n, tries2);
             long long d0x = JADayStartSec(@(sec));
             JASet(self, @"todayMaxTimestamp", @((double)(d0x + 86400LL)));
             SEL sp = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
             if ([self respondsToSelector:sp]) {
                 ((void (*)(id, SEL, long long))objc_msgSend)(self, sp, sec);
             }
+            JALog(@"VDA start sec=%lld arr=%d", sec, n);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
                 JATimeLineSyncToSec(self, sec);
             });
-        });
+        };
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), poll2);
         return;
     }
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
