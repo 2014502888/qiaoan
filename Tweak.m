@@ -1374,12 +1374,29 @@ static void ja_rtc_viewDidAppear(id self, SEL _cmd) {
             long long d0x = JADayStartSec(@(sec));
             JASet(self, @"todayMaxTimestamp", @((double)(d0x + 86400LL)));
             JASet(self, @"currentTimeStamp", @((double)sec));
-            SEL sp = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
-            if ([self respondsToSelector:sp]) {
-                ((void (*)(id, SEL, long long))objc_msgSend)(self, sp, sec);
+            // v4.17：起播前必须停掉 viewDidLoad 自动起的那路实时流。v1.21 的注释就写着
+            // "先停官方自动起的流（避免双流并存交替渲染），再建定位流"，但 v4.12 之后的
+            // 官方模式分支把这一步漏了 —— 表现为时间轴有颜色、能拖，画面却一直是实时。
+            SEL stp = NSSelectorFromString(@"stopSDPlay");
+            if ([self respondsToSelector:stp]) {
+                ((void (*)(id, SEL))objc_msgSend)(self, stp);
             }
-            JALog(@"VDA start sec=%lld tries=%d arr=%d", sec, tries, n);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+            // v4.17：起播入参改为"当天内的相对秒"。之前直接传绝对秒（1794741940），
+            // 若该接口按 0~86400 解释，就会落到范围外 → 判成"该时间点无录像"→ 回切实时。
+            long long rel = sec - d0x;
+            if (rel < 0) rel = 0;
+            if (rel > 86399) rel = 86399;
+            JALog(@"VDA start rel=%lld (sec=%lld day=%lld) tries=%d arr=%d", rel, sec, d0x, tries, n);
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
+                SEL sp = NSSelectorFromString(@"startSDPlayWithSelectTimeStamp:");
+                if ([self respondsToSelector:sp]) {
+                    ((void (*)(id, SEL, long long))objc_msgSend)(self, sp, rel);
+                }
+                JALog(@"VDA start sent");
+            });
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 if (self != g_activeSDPlayer || myGen != g_rtcVdaGen) return;
                 JATimeLineSyncToSec(self, sec);
