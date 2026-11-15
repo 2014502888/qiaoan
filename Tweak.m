@@ -964,21 +964,88 @@ static IMP g_orig_respSaved = NULL;
 static IMP g_orig_maxts = NULL;
 static IMP g_orig_switchday = NULL;
 
+// ===== v4.18 全量读数（只读，不改任何状态）=====
+// 目的：把相机 / 页面 / viewModel / 平台上的相关字段一次全打出来，官方页和格子页两条链
+// 各来一份，直接逐字段对比，找出到底哪一个不一样 —— 而不是再一版试一个字段。
+
+// 相机上所有 SD 相关数字字段
+static NSString *JADescCam(id cam) {
+    if (!cam) return @"cam=nil";
+    id evl = JAVal(cam, @"eventList");
+    unsigned long evn = [evl isKindOfClass:[NSArray class]] ? (unsigned long)[evl count] : 0UL;
+    return [NSString stringWithFormat:
+            @"cardStat=%lld day=%lld notAdj=%lld today=%lld supSD=%lld newReplay=%lld evList=%lu uid=%@",
+            [JAVal(cam, @"sdCardStatus") longLongValue],
+            [JAVal(cam, @"sdSelectiontDay") longLongValue],
+            [JAVal(cam, @"sdSelectionDayNotAdjust") longLongValue],
+            [JAVal(cam, @"sdTodayTimeStamp") longLongValue],
+            [JAVal(cam, @"isSupportSDReplay") longLongValue],
+            [JAVal(cam, @"isNewReplay") longLongValue],
+            evn,
+            JAVal(cam, @"uid") ?: @"-"];
+}
+
+// 页面自身字段
+static NSString *JADescVC(id vc) {
+    if (!vc) return @"vc=nil";
+    return [NSString stringWithFormat:
+            @"tmax=%.0f sdCardState=%lld cts=%.0f ce=%@ vm=%p arr=%@ timeLine=%p",
+            [JAVal(vc, @"todayMaxTimestamp") doubleValue],
+            [JAVal(vc, @"sdCardState") longLongValue],
+            [JAVal(vc, @"currentTimeStamp") doubleValue],
+            NSStringFromClass([JAVal(vc, @"currentEvent") class]) ?: @"-",
+            (__bridge void *)JAVal(vc, @"viewModel"),
+            JASDArrDesc(vc),
+            (__bridge void *)JAVal(vc, @"timeLineView")];
+}
+
+// viewModel 上的所有标量 ivar（直接按 ivar 名读，绕过不知道属性名的问题）
+static NSString *JADescVM(id vm) {
+    if (!vm) return @"vm=nil";
+    NSMutableString *ms = [NSMutableString stringWithCapacity:256];
+    unsigned int n = 0;
+    Ivar *ivs = class_copyIvarList(object_getClass(vm), &n);
+    for (unsigned int i = 0; i < n && i < 40; i++) {
+        const char *tn = ivar_getTypeEncoding(ivs[i]);
+        const char *nm = ivar_getName(ivs[i]);
+        if (!tn || !nm) continue;
+        char c = tn[0];
+        if (c != 'q' && c != 'Q' && c != 'i' && c != 'd' && c != 'f' && c != 'B' && c != 'c' && c != 's') continue;
+        NSString *key = [NSString stringWithUTF8String:nm];
+        if (![key hasPrefix:@"_"]) continue;
+        key = [key substringFromIndex:1];
+        id v = JAVal(vm, key);
+        if (v) [ms appendFormat:@"%@=%@ ", key, v];
+    }
+    if (ivs) free(ivs);
+    return ms.length ? ms : @"vm(no scalar)";
+}
+
+// 平台
+static NSString *JADescPlat(void) {
+    id p = JADevicePlatformShared();
+    if (!p) return @"plat=nil";
+    return [NSString stringWithFormat:@"pb=%lld isSD=%lld cam=%p ccur=%p",
+            [JAVal(p, @"playBackActionType") longLongValue],
+            [JAVal(p, @"isSDPlayer") longLongValue],
+            (__bridge void *)JAVal(p, @"myCamera"),
+            (__bridge void *)JAVal(p, @"currentCamera")];
+}
+
 // 官方页的核心装载入口：前后各看一次数组，就能知道到底是谁填的
 static void ja_rtc_setupData(id self, SEL _cmd) {
     id mc = JAVal(self, @"myCamera");
-    JALog(@"setupData> arr=%@ tmax=%.0f sdCard=%d myCam=%p camDay=%lld camToday=%lld cts=%.0f ce=%@",
-          JASDArrDesc(self), [JAVal(self, @"todayMaxTimestamp") doubleValue],
-          (int)[JAVal(self, @"sdCardState") integerValue], (__bridge void *)mc,
-          [JAVal(mc, @"sdSelectiontDay") longLongValue],
-          [JAVal(mc, @"sdTodayTimeStamp") longLongValue],
-          [JAVal(self, @"currentTimeStamp") doubleValue],
-          NSStringFromClass([JAVal(self, @"currentEvent") class]));
+    JALog(@"==== SD-DUMP-BEFORE ====");
+    JALog(@"VC  %@", JADescVC(self));
+    JALog(@"CAM %@", JADescCam(mc));
+    JALog(@"VM  %@", JADescVM(JAVal(self, @"viewModel")));
+    JALog(@"PLT %@", JADescPlat());
     if (g_orig_setupData) ((void (*)(id, SEL))g_orig_setupData)(self, _cmd);
-    JALog(@"setupData< arr=%@ tmax=%.0f camDay=%lld camToday=%lld", JASDArrDesc(self),
-          [JAVal(self, @"todayMaxTimestamp") doubleValue],
-          [JAVal(mc, @"sdSelectiontDay") longLongValue],
-          [JAVal(mc, @"sdTodayTimeStamp") longLongValue]);
+    JALog(@"==== SD-DUMP-AFTER ====");
+    JALog(@"VC  %@", JADescVC(self));
+    JALog(@"CAM %@", JADescCam(mc));
+    JALog(@"VM  %@", JADescVM(JAVal(self, @"viewModel")));
+    JALog(@"PLT %@", JADescPlat());
 }
 
 static void ja_rtc_redmark(id self, SEL _cmd) {
