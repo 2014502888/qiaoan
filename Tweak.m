@@ -1381,8 +1381,8 @@ static void JAPatchDetailNavigation(Class cls) {
     g_detailNavPatched = YES;
 }
 
-static id JATryOpenViaOfficialDetail(UIViewController *host, id warn, id cam,
-                                     long long sec, NSArray *warnList) {
+static id JAOpenViaOfficialDetailUnsafe(UIViewController *host, id warn, id cam,
+                                        long long sec, NSArray *warnList) {
     (void)warnList;   // 不塞"上一条/下一条"数组：那是闪退的源头，官方链不需要它
     (void)sec;
     Class cls = NSClassFromString(@"JANewsEnWarnInfoDetailVC");
@@ -1430,6 +1430,22 @@ static id JATryOpenViaOfficialDetail(UIViewController *host, id warn, id cam,
         if (!old) sdvc = v;
     }
     if (!sdvc) return nil;
+    return sdvc;
+}
+
+// v4.12.2：整段加异常兜底。官方 clickCloudRecordAction: 内部若抛 NSException
+// （v4.12.0 的崩溃报告就是 SIGABRT + 异常栈落在这个函数里），这里必须吃掉，
+// 绝不能让异常冒到主线程把 App 杀掉。兜底失败就返回 nil，调用方退回自造页。
+static id JATryOpenViaOfficialDetail(UIViewController *host, id warn, id cam,
+                                     long long sec, NSArray *warnList) {
+    id sdvc = nil;
+    @try {
+        sdvc = JAOpenViaOfficialDetailUnsafe(host, warn, cam, sec, warnList);
+    } @catch (NSException *e) {
+        sdvc = nil;
+    }
+    g_fakeNavHost = nil;
+    g_fakeNav = nil;
     return sdvc;
 }
 
